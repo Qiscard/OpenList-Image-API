@@ -5,15 +5,18 @@ import io
 import json
 import sys
 import tempfile
+import threading
 import unittest
 import zipfile
 from contextlib import redirect_stdout
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
+from urllib.request import urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from openlist_image_api import Application, admin_html, gallery_html  # noqa: E402
+from openlist_image_api import Application, admin_html, gallery_html, make_handler  # noqa: E402
 import openlist_tui  # noqa: E402
 
 
@@ -30,7 +33,7 @@ class BackupTests(unittest.TestCase):
         self.assertIn("directories", exported)
         self.assertNotIn("view_layout", exported)
         self.assertNotIn("delivery", exported)
-        self.assertNotIn("caption_mode", exported)
+        self.assertEqual(exported["caption_mode"], "path")
         self.assertNotIn("grid_gap", exported)
         self.assertNotIn("grid_scale", exported)
 
@@ -39,22 +42,36 @@ class AdminConfigurationTests(unittest.TestCase):
     def test_admin_config_only_exposes_global_server_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             application = Application(Path(temporary) / "config.json")
-            self.assertEqual(set(application.admin_config()), {"directories", "extensions"})
+            self.assertEqual(set(application.admin_config()), {"directories", "extensions", "caption_mode"})
+            self.assertEqual(set(application.visitor_config()), {"view_layout", "grid_gap", "caption_mode"})
+            self.assertNotIn("delivery", application.visitor_config())
+            self.assertNotIn("grid_scale", application.visitor_config())
+            updated = application.update_admin_config({"caption_mode": "name"})
+            self.assertEqual(updated["caption_mode"], "name")
+            self.assertEqual(application.visitor_config()["caption_mode"], "name")
             with self.assertRaises(ValueError):
                 application.update_admin_config({"view_layout": "grid"})
             application.url_executor.shutdown(wait=True)
 
 
 class WebUiMarkupTests(unittest.TestCase):
-    def test_gallery_uses_device_preferences_and_responsive_large_grid(self) -> None:
+    def test_gallery_uses_stable_waterfall_and_adaptive_three_column_grid(self) -> None:
         page = gallery_html()
         self.assertIn("requestImages(15)", page)
         self.assertIn("requestImages(5)", page)
         self.assertIn("singleImages", page)
         self.assertIn("document.documentElement.scrollHeight*.78", page)
         self.assertIn("openlist-image-preferences-v1", page)
-        self.assertIn("repeat(var(--grid-columns,4)", page)
-        self.assertIn("Math.max(3,Math.min(5,columns))", page)
+        self.assertIn("grid-template-columns:repeat(3,minmax(0,1fr))", page)
+        self.assertIn("grid-auto-flow:dense", page)
+        self.assertIn("grid-column:span 2", page)
+        self.assertIn("picture.naturalWidth/picture.naturalHeight>=1.45", page)
+        self.assertIn("column.className='waterfall-column'", page)
+        self.assertIn("columns[waterfallAppendIndex%columns.length].append(card)", page)
+        self.assertNotIn("columns:var(--grid-columns", page)
+        self.assertIn("preview.onclick=()=>openLightbox(image)", page)
+        self.assertIn("download.href=downloadUrl(image)", page)
+        self.assertNotIn("settings.delivery", page)
         self.assertIn("picture.fetchPriority='high'", page)
 
     def test_admin_separates_device_preferences_from_server_config(self) -> None:
@@ -64,8 +81,59 @@ class WebUiMarkupTests(unittest.TestCase):
         self.assertIn("只保存在当前浏览器", page)
         self.assertIn("/api/admin/config", page)
         self.assertIn("extensions:parsedExtensions()", page)
-        self.assertIn("const payload={directories:config.directories,extensions:parsedExtensions()}", page)
+        self.assertIn("caption_mode:document.querySelector('#caption').value", page)
+        self.assertNotIn("id=\"delivery\"", page)
+        self.assertNotIn("id=\"scale\"", page)
         self.assertIn("预计约", page)
+
+
+class DownloadTests(unittest.TestCase):
+    def test_download_streams_an_attachment_instead_of_redirecting(self) -> None:
+        body = b"image-content"
+
+        class UpstreamHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, message: str, *args: object) -> None:
+                del message, args
+
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+
+        class FakeApplication:
+            def indexed_image(self, path: str) -> dict[str, object]:
+                return {"path": path, "size": len(body)}
+
+            def resolve_images(self, images: list[dict[str, object]]) -> list[dict[str, object]]:
+                return [
+                    {
+                        **images[0],
+                        "url": f"http://127.0.0.1:{upstream.server_port}/image.jpg",
+                    }
+                ]
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(FakeApplication()))
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            with urlopen(f"http://127.0.0.1:{server.server_port}/download?path=/gallery/%E5%9B%BE%E7%89%87.jpg") as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.read(), body)
+                self.assertEqual(response.headers["Content-Type"], "image/jpeg")
+                self.assertIn("attachment", response.headers["Content-Disposition"])
+                self.assertIn("filename*=UTF-8''", response.headers["Content-Disposition"])
+                self.assertIsNone(response.headers.get("Location"))
+        finally:
+            server.shutdown()
+            server.server_close()
+            upstream.shutdown()
+            upstream.server_close()
 
 
 class TuiStatusTests(unittest.TestCase):

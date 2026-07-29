@@ -50,10 +50,7 @@ MAX_REQUEST_BODY = 64 * 1024
 URL_RESOLVE_WORKERS = 12
 DEVICE_PREFERENCE_DEFAULTS: dict[str, Any] = {
     "view_layout": DEFAULT_CONFIG["view_layout"],
-    "delivery": DEFAULT_CONFIG["delivery"],
-    "caption_mode": DEFAULT_CONFIG["caption_mode"],
     "grid_gap": DEFAULT_CONFIG["grid_gap"],
-    "grid_scale": DEFAULT_CONFIG["grid_scale"],
 }
 
 
@@ -376,16 +373,22 @@ class Application:
         return self.config
 
     def visitor_config(self) -> dict[str, Any]:
-        return DEVICE_PREFERENCE_DEFAULTS.copy()
+        config = DEVICE_PREFERENCE_DEFAULTS.copy()
+        config["caption_mode"] = self.config["caption_mode"]
+        return config
 
     def public_config(self) -> dict[str, Any]:
         return self.visitor_config()
 
     def admin_config(self) -> dict[str, Any]:
-        return {"directories": self.config["directories"], "extensions": self.config["extensions"]}
+        return {
+            "directories": self.config["directories"],
+            "extensions": self.config["extensions"],
+            "caption_mode": self.config["caption_mode"],
+        }
 
     def update_admin_config(self, payload: dict[str, Any]) -> dict[str, Any]:
-        allowed = {"directories", "extensions"}
+        allowed = {"directories", "extensions", "caption_mode"}
         if set(payload) - allowed:
             raise ValueError("unsupported configuration field")
         with self.config_lock:
@@ -405,6 +408,7 @@ class Application:
                 "openlist_api_url": self.config["openlist_api_url"],
                 "directories": self.config["directories"],
                 "extensions": self.config["extensions"],
+                "caption_mode": self.config["caption_mode"],
                 "url_cache_size": self.config["url_cache_size"],
                 "url_cache_ttl_seconds": self.config["url_cache_ttl_seconds"],
             },
@@ -523,6 +527,13 @@ def json_bytes(payload: dict[str, Any]) -> bytes:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
+def attachment_disposition(filename: str) -> str:
+    ascii_name = "".join(character if character.isascii() and (character.isalnum() or character in ".-_") else "_" for character in filename)
+    if not any(character.isalnum() for character in ascii_name):
+        ascii_name = "download"
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename, safe='')}"
+
+
 def gallery_html() -> str:
     return """<!doctype html>
 <html lang="zh-CN">
@@ -531,7 +542,7 @@ def gallery_html() -> str:
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>OpenList 图片浏览</title>
 <style>
-:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#10131a;color:#e7edf7;font:15px system-ui,sans-serif}header{position:sticky;z-index:2;top:0;display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:14px 18px;background:#10131af2;border-bottom:1px solid #293040}button,.button{background:#4b8cff;border:0;border-radius:7px;color:#fff;padding:9px 13px;cursor:pointer;text-decoration:none}button:disabled{opacity:.45;cursor:not-allowed}.meta{color:#a9b7cd;font-size:13px}.spacer{flex:1}.gallery{padding:18px}.gallery.grid{display:grid;grid-template-columns:repeat(var(--grid-columns,4),minmax(0,1fr));gap:var(--grid-gap,12px);align-items:start}.gallery.waterfall{columns:var(--grid-columns,4);column-gap:var(--grid-gap,12px)}.gallery.waterfall .card{display:inline-block;width:100%;margin:0 0 var(--grid-gap,12px)}.gallery.single{display:grid;min-height:calc(100vh - 80px);place-items:center}.gallery.single .card{max-width:min(96vw,1280px)}.card{break-inside:avoid;background:#171c27;border:1px solid #293040;border-radius:10px;overflow:hidden}.card img{width:100%;display:block;max-height:82vh;object-fit:contain;background:#080a0f}.gallery.grid .card img{aspect-ratio:4/3;max-height:none}.card footer{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:9px 11px}.caption{margin:0;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.download{color:#b7d1ff;white-space:nowrap}.hidden{display:none!important}a{color:inherit}#empty{padding:40px;text-align:center;color:#a9b7cd}@media(max-width:519px){header{padding:10px 12px}.gallery{padding:10px}}
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#10131a;color:#e7edf7;font:15px system-ui,sans-serif}header{position:sticky;z-index:2;top:0;display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:14px 18px;background:#10131af2;border-bottom:1px solid #293040}button,.button{background:#4b8cff;border:0;border-radius:7px;color:#fff;padding:9px 13px;cursor:pointer;text-decoration:none}button:disabled{opacity:.45;cursor:not-allowed}.meta{color:#a9b7cd;font-size:13px}.spacer{flex:1}.gallery{padding:18px}.gallery.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));grid-auto-flow:dense;gap:var(--grid-gap,12px);align-items:start}.gallery.grid .card.wide{grid-column:span 2}.gallery.waterfall{display:flex;align-items:flex-start;gap:var(--grid-gap,12px)}.waterfall-column{display:flex;min-width:0;flex:1;flex-direction:column;gap:var(--grid-gap,12px)}.gallery.single{display:grid;min-height:calc(100vh - 80px);place-items:center}.gallery.single .card{max-width:min(96vw,1280px)}.card{background:#171c27;border:1px solid #293040;border-radius:10px;overflow:hidden}.preview-button{display:block;width:100%;padding:0;border:0;border-radius:0;background:transparent}.card img{width:100%;display:block;max-height:82vh;object-fit:contain;background:#080a0f}.gallery.grid .card img{max-height:none}.card footer{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:9px 11px}.caption{margin:0;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.download{color:#b7d1ff;white-space:nowrap}.hidden{display:none!important}a{color:inherit}#empty{padding:40px;text-align:center;color:#a9b7cd}dialog{width:min(96vw,1500px);height:min(94vh,1000px);padding:0;border:1px solid #3a455b;border-radius:12px;background:#10131a;color:#e7edf7}dialog::backdrop{background:#000c}.lightbox-head,.lightbox-foot{display:flex;gap:12px;align-items:center;padding:10px 12px}.lightbox-head{justify-content:flex-end}.lightbox-foot{justify-content:space-between}.lightbox-image{display:block;width:100%;height:calc(94vh - 112px);object-fit:contain;background:#080a0f}.lightbox-caption{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}@media(max-width:900px){.gallery.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:560px){header{padding:10px 12px}.gallery{padding:10px}.gallery.grid{grid-template-columns:1fr}.gallery.grid .card.wide{grid-column:span 1}.lightbox-image{height:calc(94vh - 126px)}}
 </style>
 </head>
 <body>
@@ -545,6 +556,11 @@ def gallery_html() -> str:
   <a href="/admin">管理</a>
 </header>
 <main id="gallery" class="gallery"></main>
+<dialog id="lightbox">
+  <div class="lightbox-head"><button id="lightbox-close" type="button">关闭</button></div>
+  <img id="lightbox-image" class="lightbox-image" alt="">
+  <div class="lightbox-foot"><span id="lightbox-caption" class="lightbox-caption"></span><a id="lightbox-download" class="button" href="#">下载</a></div>
+</dialog>
 <script>
 const PREFERENCE_KEY='openlist-image-preferences-v1';
 const gallery=document.querySelector('#gallery');
@@ -552,20 +568,27 @@ const statusEl=document.querySelector('#status');
 const previousButton=document.querySelector('#previous');
 const nextButton=document.querySelector('#next');
 const refreshButton=document.querySelector('#refresh');
+const lightbox=document.querySelector('#lightbox');
+const lightboxImage=document.querySelector('#lightbox-image');
+const lightboxCaption=document.querySelector('#lightbox-caption');
+const lightboxDownload=document.querySelector('#lightbox-download');
 let settings=null;
 let singleImages=[];
 let singleIndex=0;
 let gridLoading=false;
 let singleLoading=false;
+let loadedCount=0;
+let cardSequence=0;
+let waterfallColumnCount=0;
+let waterfallAppendIndex=0;
 let resizeTimer=null;
 
 function normalizedPreferences(value,defaults){
-  const result={...defaults,...(value&&typeof value==='object'?value:{})};
+  const stored=value&&typeof value==='object'?value:{};
+  const result={view_layout:stored.view_layout,grid_gap:stored.grid_gap,caption_mode:defaults.caption_mode};
   if(!['single','grid','waterfall'].includes(result.view_layout)) result.view_layout=defaults.view_layout;
-  if(!['preview','download'].includes(result.delivery)) result.delivery=defaults.delivery;
-  if(!['path','name','hidden'].includes(result.caption_mode)) result.caption_mode=defaults.caption_mode;
-  result.grid_gap=Math.max(0,Math.min(48,Number(result.grid_gap)||0));
-  result.grid_scale=Math.max(75,Math.min(200,Number(result.grid_scale)||150));
+  if(!['path','name','hidden'].includes(result.caption_mode)) result.caption_mode='path';
+  result.grid_gap=Math.max(0,Math.min(48,Number(result.grid_gap??defaults.grid_gap)||0));
   return result;
 }
 
@@ -586,23 +609,33 @@ function captionFor(image){
 
 function downloadUrl(image){return '/download?path='+encodeURIComponent(image.path);}
 
+function openLightbox(image){
+  const caption=captionFor(image);
+  lightboxImage.src=image.url;
+  lightboxImage.alt=caption||'OpenList 图片';
+  lightboxCaption.textContent=caption;
+  lightboxCaption.classList.toggle('hidden',settings.caption_mode==='hidden');
+  lightboxDownload.href=downloadUrl(image);
+  lightbox.showModal();
+}
+
 function createCard(image,eager=false){
   const card=document.createElement('article');
   card.className='card';
-  const anchor=document.createElement('a');
-  anchor.href=settings.delivery==='download'?downloadUrl(image):image.url;
-  if(settings.delivery==='preview'){
-    anchor.target='_blank';
-    anchor.rel='noreferrer';
-  }
+  card.dataset.sequence=String(cardSequence++);
+  const preview=document.createElement('button');
+  preview.className='preview-button';
+  preview.type='button';
+  preview.onclick=()=>openLightbox(image);
   const picture=document.createElement('img');
-  picture.src=image.url;
   picture.loading=eager?'eager':'lazy';
   picture.decoding='async';
   if(eager) picture.fetchPriority='high';
   picture.alt=captionFor(image)||'OpenList 图片';
-  anchor.append(picture);
-  card.append(anchor);
+  picture.addEventListener('load',()=>card.classList.toggle('wide',picture.naturalWidth/picture.naturalHeight>=1.45),{once:true});
+  picture.src=image.url;
+  preview.append(picture);
+  card.append(preview);
   const footer=document.createElement('footer');
   const caption=document.createElement('p');
   caption.className='caption';
@@ -624,18 +657,33 @@ async function requestImages(count){
   return (await response.json()).images;
 }
 
-function preferredColumns(){
+function preferredWaterfallColumns(){
   const width=gallery.clientWidth||window.innerWidth;
-  let base=width>=1600?5:width>=1100?4:width>=760?3:width>=520?2:1;
-  let columns=Math.round(base*150/settings.grid_scale);
-  if(width>=760) columns=Math.max(3,Math.min(5,columns));
-  else columns=Math.max(1,Math.min(2,columns));
-  return columns;
+  return width>900?3:width>560?2:1;
+}
+
+function appendWaterfallCard(card){
+  const columns=[...gallery.children];
+  columns[waterfallAppendIndex%columns.length].append(card);
+  waterfallAppendIndex+=1;
+}
+
+function setupWaterfallColumns(){
+  const count=preferredWaterfallColumns();
+  const cards=[...gallery.querySelectorAll('.card')].sort((left,right)=>Number(left.dataset.sequence)-Number(right.dataset.sequence));
+  waterfallColumnCount=count;
+  waterfallAppendIndex=0;
+  gallery.replaceChildren(...Array.from({length:count},()=>{const column=document.createElement('div');column.className='waterfall-column';return column;}));
+  cards.forEach(appendWaterfallCard);
+}
+
+function appendCard(card){
+  if(settings.view_layout==='waterfall') appendWaterfallCard(card);
+  else gallery.append(card);
 }
 
 function applyGridStyle(){
   gallery.style.setProperty('--grid-gap',settings.grid_gap+'px');
-  gallery.style.setProperty('--grid-columns',String(preferredColumns()));
 }
 
 function renderSingle(){
@@ -687,10 +735,16 @@ async function loadGridBatch(reset){
   refreshButton.disabled=true;
   try{
     const images=await requestImages(15);
-    if(reset) gallery.replaceChildren();
-    const initial=gallery.childElementCount===0;
-    images.forEach((image,index)=>gallery.append(createCard(image,initial&&index<2)));
-    statusEl.textContent=(settings.view_layout==='grid'?'网格':'瀑布流')+'视图 · 已加载 '+gallery.childElementCount+' 张 · 本设备独立设置';
+    if(reset){
+      loadedCount=0;
+      cardSequence=0;
+      gallery.replaceChildren();
+      if(settings.view_layout==='waterfall') setupWaterfallColumns();
+    }
+    const initial=loadedCount===0;
+    images.forEach((image,index)=>appendCard(createCard(image,initial&&index<2)));
+    loadedCount+=images.length;
+    statusEl.textContent=(settings.view_layout==='grid'?'网格':'瀑布流')+'视图 · 已加载 '+loadedCount+' 张 · 本设备独立设置';
   }finally{
     gridLoading=false;
     refreshButton.disabled=false;
@@ -717,6 +771,9 @@ function showError(error){
 previousButton.onclick=previousSingle;
 nextButton.onclick=()=>nextSingle().catch(showError);
 refreshButton.onclick=()=>render().catch(showError);
+document.querySelector('#lightbox-close').onclick=()=>lightbox.close();
+lightbox.addEventListener('click',event=>{if(event.target===lightbox)lightbox.close();});
+window.addEventListener('keydown',event=>{if(event.key==='Escape'&&lightbox.open)lightbox.close();});
 window.addEventListener('scroll',()=>{
   if(settings&&settings.view_layout!=='single'&&window.scrollY+window.innerHeight>=document.documentElement.scrollHeight*.78){
     loadGridBatch(false).catch(showError);
@@ -724,7 +781,11 @@ window.addEventListener('scroll',()=>{
 },{passive:true});
 window.addEventListener('resize',()=>{
   clearTimeout(resizeTimer);
-  resizeTimer=setTimeout(()=>{if(settings)applyGridStyle();},120);
+  resizeTimer=setTimeout(()=>{
+    if(!settings)return;
+    applyGridStyle();
+    if(settings.view_layout==='waterfall'&&waterfallColumnCount!==preferredWaterfallColumns())setupWaterfallColumns();
+  },120);
 },{passive:true});
 loadSettings().then(value=>{settings=value;return render();}).catch(showError);
 </script>
@@ -751,14 +812,9 @@ def admin_html() -> str:
   <p class="note">这些选项只保存在当前浏览器，不会修改其他设备或其他浏览器的显示方式。</p>
   <div class="row">
     <label>视图<select id="layout"><option value="single">单张</option><option value="grid">网格</option><option value="waterfall">瀑布流</option></select></label>
-    <label>阅览<select id="delivery"><option value="preview">直接预览</option><option value="download">点击图片下载</option></select></label>
-    <label>图片文字<select id="caption"><option value="path">完整路径</option><option value="name">仅图片名称</option><option value="hidden">不展示</option></select></label>
-  </div>
-  <div class="row">
     <label>图片间距（0–48 px）<input id="gap" type="number" min="0" max="48"></label>
-    <label>网格图片比例（75–200%）<input id="scale" type="number" min="75" max="200"></label>
   </div>
-  <p class="note">比例越大图片越大；桌面网格会根据窗口宽度保持每行约 3–5 张。</p>
+  <p class="note">桌面网格固定每行 3 个位置，宽图会自动横跨 2 个位置；手机和平板会自动减少列数。</p>
   <div class="row actions"><button id="save-device" type="button">保存本设备偏好</button><button id="reset-device" class="secondary" type="button">恢复默认</button></div>
   <p class="message" id="visitor-message">正在读取默认设置…</p>
 </section>
@@ -777,6 +833,7 @@ def admin_html() -> str:
   <h3>已选目录</h3>
   <div id="selected" class="selected"></div>
   <label>图片扩展名（逗号或空格分隔）<textarea id="extensions"></textarea></label>
+  <label>图片文字<select id="caption"><option value="path">完整路径</option><option value="name">仅图片名称</option><option value="hidden">不展示</option></select></label>
   <div class="row actions"><button id="save-server" type="button">保存服务器配置</button><button id="rebuild" type="button">后台重建索引</button><button id="backup" type="button">下载配置备份</button></div>
 </section>
 <script>
@@ -788,27 +845,25 @@ const message=document.querySelector('#message');
 const visitorMessage=document.querySelector('#visitor-message');
 function auth(){return {'Content-Type':'application/json','X-OpenList-Admin-Token':document.querySelector('#token').value};}
 function normalizedPreferences(value,defaults){
-  const result={...defaults,...(value&&typeof value==='object'?value:{})};
+  const stored=value&&typeof value==='object'?value:{};
+  const result={view_layout:stored.view_layout,grid_gap:stored.grid_gap};
   if(!['single','grid','waterfall'].includes(result.view_layout)) result.view_layout=defaults.view_layout;
-  if(!['preview','download'].includes(result.delivery)) result.delivery=defaults.delivery;
-  if(!['path','name','hidden'].includes(result.caption_mode)) result.caption_mode=defaults.caption_mode;
-  result.grid_gap=Math.max(0,Math.min(48,Number(result.grid_gap)||0));
-  result.grid_scale=Math.max(75,Math.min(200,Number(result.grid_scale)||150));
+  result.grid_gap=Math.max(0,Math.min(48,Number(result.grid_gap??defaults.grid_gap)||0));
   return result;
 }
-function preferenceValues(){return {view_layout:document.querySelector('#layout').value,delivery:document.querySelector('#delivery').value,caption_mode:document.querySelector('#caption').value,grid_gap:Number(document.querySelector('#gap').value),grid_scale:Number(document.querySelector('#scale').value)};}
-function showPreferences(values){document.querySelector('#layout').value=values.view_layout;document.querySelector('#delivery').value=values.delivery;document.querySelector('#caption').value=values.caption_mode;document.querySelector('#gap').value=values.grid_gap;document.querySelector('#scale').value=values.grid_scale;}
+function preferenceValues(){return {view_layout:document.querySelector('#layout').value,grid_gap:Number(document.querySelector('#gap').value)};}
+function showPreferences(values){document.querySelector('#layout').value=values.view_layout;document.querySelector('#gap').value=values.grid_gap;}
 function readStoredPreferences(){try{return JSON.parse(localStorage.getItem(PREFERENCE_KEY)||'{}');}catch(error){localStorage.removeItem(PREFERENCE_KEY);return {};}}
 async function loadPreferences(){const response=await fetch('/api/public-config',{cache:'no-store'});if(!response.ok)throw new Error('无法读取默认设置');preferenceDefaults=await response.json();showPreferences(normalizedPreferences(readStoredPreferences(),preferenceDefaults));visitorMessage.textContent='已加载当前浏览器的独立偏好。';}
 function savePreferences(){const values=normalizedPreferences(preferenceValues(),preferenceDefaults);localStorage.setItem(PREFERENCE_KEY,JSON.stringify(values));showPreferences(values);visitorMessage.textContent='本设备偏好已保存；其他设备不会改变。';}
 function resetPreferences(){localStorage.removeItem(PREFERENCE_KEY);showPreferences(preferenceDefaults);visitorMessage.textContent='已恢复服务默认值。';}
 function showSelected(){const root=document.querySelector('#selected');root.replaceChildren(...config.directories.map(path=>{const item=document.createElement('div');item.textContent=path;return item;}));}
-function showAdmin(){document.querySelector('#extensions').value=config.extensions.join(', ');document.querySelector('#protected').classList.remove('hidden');showSelected();}
+function showAdmin(){document.querySelector('#extensions').value=config.extensions.join(', ');document.querySelector('#caption').value=config.caption_mode;document.querySelector('#protected').classList.remove('hidden');showSelected();}
 async function errorText(response,fallback){try{const data=await response.json();return data.error||fallback;}catch(error){return fallback;}}
 async function load(){const response=await fetch('/api/admin/config',{headers:auth(),cache:'no-store'});if(!response.ok)throw new Error(await errorText(response,'令牌无效或服务不可用'));config=await response.json();showAdmin();message.textContent='服务器配置已加载';}
 async function browse(){if(!config)throw new Error('请先加载服务器配置');const path=document.querySelector('#path').value;const response=await fetch('/api/admin/directories?path='+encodeURIComponent(path),{headers:auth(),cache:'no-store'});if(!response.ok)throw new Error(await errorText(response,'无法列出目录'));const data=await response.json();const root=document.querySelector('#directories');root.replaceChildren(...data.directories.map(item=>{const row=document.createElement('label');row.className='directory';const check=document.createElement('input');check.type='checkbox';check.checked=config.directories.includes(item.path);check.onchange=()=>{if(check.checked&&!config.directories.includes(item.path))config.directories.push(item.path);if(!check.checked)config.directories=config.directories.filter(value=>value!==item.path);showSelected();};row.append(check,document.createTextNode(' '+item.name+' ('+item.path+')'));return row;}));}
 function parsedExtensions(){return [...new Set(document.querySelector('#extensions').value.split(/[\\s,，]+/).filter(Boolean).map(value=>(value.startsWith('.')?value:'.'+value).toLowerCase()))];}
-async function saveServer(){if(!config)throw new Error('请先加载服务器配置');const payload={directories:config.directories,extensions:parsedExtensions()};const response=await fetch('/api/admin/config',{method:'PUT',headers:auth(),body:JSON.stringify(payload)});if(!response.ok)throw new Error(await errorText(response,'保存失败'));config=await response.json();showAdmin();message.textContent='全局服务器配置已保存；浏览器偏好未改变';}
+async function saveServer(){if(!config)throw new Error('请先加载服务器配置');const payload={directories:config.directories,extensions:parsedExtensions(),caption_mode:document.querySelector('#caption').value};const response=await fetch('/api/admin/config',{method:'PUT',headers:auth(),body:JSON.stringify(payload)});if(!response.ok)throw new Error(await errorText(response,'保存失败'));config=await response.json();showAdmin();message.textContent='全局服务器配置已保存；图片文字设置已应用到所有设备';}
 function formatSeconds(value){const seconds=Math.max(1,Math.round(Number(value)||0));return seconds<60?seconds+' 秒':Math.ceil(seconds/60)+' 分钟';}
 async function pollRebuild(){const response=await fetch('/api/status',{cache:'no-store'});if(!response.ok)return;if((await response.json()).refreshing){rebuildTimer=setTimeout(()=>pollRebuild().catch(report),2000);}else{message.textContent='索引后台重建完成';rebuildTimer=null;}}
 async function rebuild(){const statusResponse=await fetch('/api/status',{cache:'no-store'});const previous=statusResponse.ok?await statusResponse.json():{};const response=await fetch('/api/admin/rebuild',{method:'POST',headers:auth()});if(!response.ok)throw new Error(await errorText(response,'重建未启动'));const estimate=Number(previous.last_build_duration_seconds)||0;message.textContent='索引正在后台重建'+(estimate?'，预计约 '+formatSeconds(estimate):'，首次重建暂无预估时间');clearTimeout(rebuildTimer);rebuildTimer=setTimeout(()=>pollRebuild().catch(report),2000);}
@@ -829,7 +884,7 @@ loadPreferences().catch(error=>visitorMessage.textContent='浏览偏好加载失
 
 def make_handler(application: Application):
     class Handler(BaseHTTPRequestHandler):
-        server_version = "OpenListImageAPI/1.3"
+        server_version = "OpenListImageAPI/1.4"
         protocol_version = "HTTP/1.1"
 
         def setup(self) -> None:
@@ -864,11 +919,37 @@ def make_handler(application: Application):
         def _send_attachment(self, filename: str, body: bytes) -> None:
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/zip")
-            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Content-Disposition", attachment_disposition(filename))
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
+
+        def _proxy_download(self, image: dict[str, Any]) -> None:
+            url = application.resolve_images([image])[0]["url"]
+            request = Request(url, headers={"User-Agent": self.server_version})
+            try:
+                upstream = urlopen(request, timeout=60)
+            except (HTTPError, URLError, TimeoutError) as error:
+                raise RuntimeError("unable to download image from OpenList") from error
+            with upstream:
+                filename = Path(str(image["path"])).name or "image"
+                content_length = upstream.headers.get("Content-Length")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", upstream.headers.get("Content-Type", "application/octet-stream"))
+                self.send_header("Content-Disposition", attachment_disposition(filename))
+                self.send_header("Cache-Control", "no-store")
+                if content_length and content_length.isdigit():
+                    self.send_header("Content-Length", content_length)
+                else:
+                    self.send_header("Connection", "close")
+                    self.close_connection = True
+                self.end_headers()
+                try:
+                    while chunk := upstream.read(64 * 1024):
+                        self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    logging.info("Download client disconnected: %s", self.client_address[0])
 
         def _admin_required(self) -> bool:
             try:
@@ -906,12 +987,11 @@ def make_handler(application: Application):
                     if not images:
                         return self._send_json(HTTPStatus.NOT_FOUND, {"error": "no matching images"})
                     return self._send_json(HTTPStatus.OK, {"images": application.resolve_images(images)})
-                if parsed.path in {"/random", "/download"}:
-                    if parsed.path == "/download":
-                        path = params.get("path", [""])[0]
-                        images = [application.indexed_image(path)]
-                    else:
-                        images = application.choose_images(1, params.get("folder", [None])[0], None, None)
+                if parsed.path == "/download":
+                    image = application.indexed_image(params.get("path", [""])[0])
+                    return self._proxy_download(image)
+                if parsed.path == "/random":
+                    images = application.choose_images(1, params.get("folder", [None])[0], None, None)
                     if not images:
                         return self._send_json(HTTPStatus.NOT_FOUND, {"error": "no matching images"})
                     url = application.resolve_images(images)[0]["url"]
@@ -919,8 +999,6 @@ def make_handler(application: Application):
                     self.send_header("Location", url)
                     self.send_header("Content-Length", "0")
                     self.send_header("Cache-Control", "no-store")
-                    if parsed.path == "/download":
-                        self.send_header("Content-Disposition", "attachment")
                     self.end_headers()
                     return
                 if parsed.path == "/api/admin/config":
