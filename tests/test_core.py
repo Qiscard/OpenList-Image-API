@@ -8,7 +8,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from openlist_image_api import (  # noqa: E402
+    Application,
     IndexRepository,
+    UrlCache,
     is_loopback_openlist_url,
     normalize_directories,
     normalize_directory,
@@ -29,9 +31,11 @@ class ConfigurationTests(unittest.TestCase):
         self.assertFalse(is_loopback_openlist_url("https://example.invalid"))
         self.assertFalse(is_loopback_openlist_url("http://not-local.invalid:5244"))
 
-    def test_configuration_rejects_public_listener_and_remote_api(self) -> None:
+    def test_configuration_allows_nat_listener_and_rejects_remote_api(self) -> None:
+        self.assertEqual(validate_config({})["listen_host"], "0.0.0.0")
+        self.assertEqual(validate_config({"listen_host": "0.0.0.0"})["listen_host"], "0.0.0.0")
         with self.assertRaises(ValueError):
-            validate_config({"listen_host": "0.0.0.0"})
+            validate_config({"listen_host": "localhost"})
         with self.assertRaises(ValueError):
             validate_config({"openlist_api_url": "http://example.invalid:5244"})
 
@@ -40,9 +44,34 @@ class IndexRepositoryTests(unittest.TestCase):
     def test_index_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = IndexRepository(Path(temporary))
-            expected = {"images": [{"path": "/gallery/a.jpg", "size": 1}], "directories": ["/gallery"], "generated_at": 1, "errors": []}
+            expected = {
+                "images": [{"path": "/gallery/a.jpg", "size": 1}],
+                "directories": ["/gallery"],
+                "generated_at": 1,
+                "errors": [],
+            }
             repository.save(expected)
             self.assertEqual(repository.load(), expected)
+
+    def test_status_exposes_last_index_duration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            application = Application.__new__(Application)
+            application.config = {"view_layout": "single", "delivery": "preview"}
+            application.repository = IndexRepository(Path(temporary))
+            application.cache = UrlCache(0, 0)
+            application.refreshing = False
+            application.last_refresh_error = ""
+            application.repository.save(
+                {
+                    "images": [],
+                    "directories": [],
+                    "directory_count": 0,
+                    "generated_at": 1,
+                    "build_duration_seconds": 12.5,
+                    "errors": [],
+                }
+            )
+            self.assertEqual(application.status()["last_build_duration_seconds"], 12.5)
 
 
 if __name__ == "__main__":

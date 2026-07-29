@@ -31,8 +31,14 @@ class BackupTests(unittest.TestCase):
 
 class TuiStatusTests(unittest.TestCase):
     def test_activating_service_status_does_not_crash(self) -> None:
-        config = {"listen_port": 8790, "directories": []}
-        status = {"image_count": 0, "directory_count": 0, "refreshing": False, "last_refresh_error": ""}
+        config = {"listen_host": "0.0.0.0", "listen_port": 8790, "directories": []}
+        status = {
+            "image_count": 0,
+            "directory_count": 0,
+            "refreshing": False,
+            "last_refresh_error": "",
+            "last_build_duration_seconds": 0,
+        }
         output = io.StringIO()
         with (
             patch.object(openlist_tui, "read_config", return_value=config),
@@ -42,6 +48,23 @@ class TuiStatusTests(unittest.TestCase):
         ):
             openlist_tui.show_status()
         self.assertIn("图片 API 服务: activating", output.getvalue())
+        self.assertIn("可通过 NAT 转发访问", output.getvalue())
+
+
+class InstallerTests(unittest.TestCase):
+    def test_embedded_installer_uses_fixed_proxy_candidates(self) -> None:
+        installer = (Path(__file__).resolve().parents[1] / "install.sh").read_text(encoding="utf-8")
+        for proxy in (
+            "https://edgeone.gh-proxy.com",
+            "https://hk.gh-proxy.com",
+            "https://gh-proxy.com",
+            "https://gh.dpik.top",
+        ):
+            self.assertIn(proxy, installer)
+        self.assertIn("--retry 2 --retry-all-errors", installer)
+        self.assertIn("--install-openlist", installer)
+        self.assertNotIn("res.oplist.org", installer)
+        self.assertNotRegex(installer, r"\bdocker(?:-compose)?\s+(?:run|start|stop|rm|ps|pull|compose)\b")
 
 
 if __name__ == "__main__":

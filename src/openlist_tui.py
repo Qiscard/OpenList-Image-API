@@ -10,7 +10,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -29,10 +28,10 @@ CONFIG_PATH = Path("/etc/openlist-image-api/config.json")
 TOKEN_PATH = Path("/etc/openlist-image-api/openlist.token")
 ADMIN_TOKEN_PATH = Path("/etc/openlist-image-api/admin.token")
 APP_PATH = Path("/opt/openlist-image-api/openlist_image_api.py")
+APP_INSTALLER_PATH = Path("/opt/openlist-image-api/install.sh")
 SERVICE_NAME = "openlist-image-api"
 SERVICE_USER = "openlist-image"
 LEGACY_SERVICE_NAME = "openlist-random-image"
-OFFICIAL_INSTALLER_URL = "https://res.oplist.org/script/v4.sh"
 LEGACY_ARTIFACTS = (
     Path("/opt/openlist-random-image"),
     Path("/etc/openlist-random-image.json"),
@@ -45,6 +44,7 @@ LEGACY_ARTIFACTS = (
     Path("/tmp/index_build.log"),
 )
 LEGACY_NGINX_DIRS = (Path("/etc/nginx/conf.d"), Path("/www/server/panel/vhost/nginx"))
+REBUILD_PID_PATH = Path("/run/openlist-image-api/rebuild.pid")
 
 
 def require_root() -> None:
@@ -104,21 +104,17 @@ def set_openlist_token() -> None:
 
 def install_openlist() -> None:
     require_root()
-    answer = input("将运行 OpenList 官方安装脚本，继续？[y/N] ").strip().lower()
-    if answer != "y":
-        return
-    proxy = input("可选 GitHub 下载代理（直接回车使用官方默认）: ").strip()
-    if proxy and (not proxy.startswith("https://") or not proxy.endswith("/")):
-        raise ValueError("代理地址必须以 https:// 开头并以 / 结尾")
-    environment = os.environ.copy()
-    if proxy:
-        environment["GH_PROXY"] = proxy
-    with tempfile.TemporaryDirectory(prefix="openlist-installer-") as temporary:
-        script = Path(temporary) / "install-openlist-v4.sh"
-        print("正在下载官方 OpenList v4 安装脚本…")
-        urllib.request.urlretrieve(OFFICIAL_INSTALLER_URL, script)
-        run(["bash", str(script)], env=environment)
-    print("OpenList 安装脚本已执行。请在 OpenList 初始化完成后回到本菜单设置 token。")
+    if not APP_INSTALLER_PATH.is_file():
+        raise RuntimeError("内置安装器缺失，请重新运行本项目安装命令")
+    print("OpenList 下载方式：")
+    print("  1. 直连下载（默认）")
+    print("  2. 自动测速镜像并使用最快可用项")
+    choice = input("选择 [1-2]: ").strip() or "1"
+    modes = {"1": "direct", "2": "auto"}
+    if choice not in modes:
+        raise ValueError("无效的下载方式")
+    run(["bash", str(APP_INSTALLER_PATH), "--install-openlist", "--openlist-download", modes[choice]])
+    print("OpenList 内置安装流程已完成。请在 OpenList 初始化完成后回到本菜单设置 token。")
 
 
 def configure_port() -> None:
@@ -138,6 +134,22 @@ def configure_port() -> None:
     config["listen_port"] = port
     write_config(config)
     print("端口已保存；重启服务后生效。")
+
+
+def configure_listen_host() -> None:
+    require_root()
+    config = read_config()
+    print("图片 API 监听范围：")
+    print("  1. 全部网络接口（适用于公网或服务器商 NAT 转发）")
+    print("  2. 仅本机回环")
+    current = "1" if config["listen_host"] == "0.0.0.0" else "2"
+    choice = input(f"选择 [1-2] [{current}]: ").strip() or current
+    hosts = {"1": "0.0.0.0", "2": "127.0.0.1"}
+    if choice not in hosts:
+        raise ValueError("无效的监听范围")
+    config["listen_host"] = hosts[choice]
+    write_config(config)
+    print("监听范围已保存；重启服务后生效。")
 
 
 def configure_openlist_port() -> None:
@@ -311,13 +323,17 @@ def show_status() -> None:
     config = read_config()
     state = command_output(["systemctl", "is-active", SERVICE_NAME]) or "unknown"
     print(f"图片 API 服务: {state}")
-    print(f"图片 API 端口: {config['listen_port']}（仅监听本机）")
+    scope = "全部网络接口（可通过 NAT 转发访问）" if config["listen_host"] == "0.0.0.0" else "仅本机回环"
+    print(f"图片 API 端口: {config['listen_port']}（{scope}）")
     print(f"已配置目录: {len(config['directories'])}")
     try:
         status = request_status(config)
         print(f"已索引图片: {status['image_count']}")
         print(f"索引目录数: {status['directory_count']}")
         print(f"索引重建中: {'是' if status['refreshing'] else '否'}")
+        duration = float(status.get("last_build_duration_seconds") or 0)
+        if duration:
+            print(f"上次索引耗时: 约 {duration:.1f} 秒")
         if status["last_refresh_error"]:
             print(f"最近错误: {status['last_refresh_error']}")
     except Exception as error:
@@ -326,7 +342,46 @@ def show_status() -> None:
 
 def rebuild_index() -> None:
     require_root()
-    run([sys.executable, str(APP_PATH), "--config", str(CONFIG_PATH), "refresh"])
+    config = read_config()
+    if REBUILD_PID_PATH.exists():
+        try:
+            previous_pid = int(REBUILD_PID_PATH.read_text(encoding="utf-8").strip())
+            os.kill(previous_pid, 0)
+            raise RuntimeError("已有索引重建任务正在后台运行")
+        except ProcessLookupError:
+            REBUILD_PID_PATH.unlink(missing_ok=True)
+        except ValueError:
+            REBUILD_PID_PATH.unlink(missing_ok=True)
+    state_dir = Path(config["state_dir"])
+    state_dir.mkdir(parents=True, exist_ok=True)
+    log_path = state_dir / "rebuild.log"
+    log_path.touch(exist_ok=True)
+    make_service_owned(log_path)
+    REBUILD_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
+    refresh_command = [sys.executable, str(APP_PATH), "--config", str(CONFIG_PATH), "refresh"]
+    if not shutil.which("runuser"):
+        raise RuntimeError("缺少 runuser，无法以图片 API 服务用户安全重建索引")
+    with log_path.open("a", encoding="utf-8") as log_file:
+        process = subprocess.Popen(
+            ["runuser", "-u", SERVICE_USER, "--", *refresh_command],
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    REBUILD_PID_PATH.write_text(str(process.pid), encoding="utf-8")
+    estimate = 0.0
+    index_path = state_dir / "index.json"
+    if index_path.exists():
+        try:
+            estimate = float(json.loads(index_path.read_text(encoding="utf-8")).get("build_duration_seconds") or 0)
+        except (OSError, ValueError, json.JSONDecodeError):
+            estimate = 0.0
+    print(f"索引重建已在后台启动（PID: {process.pid}）。")
+    if estimate:
+        print(f"预计耗时约 {estimate:.1f} 秒（基于上次重建）。")
+    else:
+        print("首次重建暂无可用耗时估计；可在状态页查看后续耗时。")
+    print(f"日志: {log_path}")
 
 
 def print_admin_token() -> None:
@@ -349,12 +404,13 @@ def main_menu() -> None:
         "4": manage_directories,
         "5": configure_view,
         "6": configure_port,
-        "7": lambda: service_action("start"),
-        "8": lambda: service_action("restart"),
-        "9": rebuild_index,
-        "10": show_status,
-        "11": print_admin_token,
-        "12": cleanup_legacy_residuals,
+        "7": configure_listen_host,
+        "8": lambda: service_action("start"),
+        "9": lambda: service_action("restart"),
+        "10": rebuild_index,
+        "11": show_status,
+        "12": print_admin_token,
+        "13": cleanup_legacy_residuals,
     }
     while True:
         clear()
@@ -367,15 +423,16 @@ def main_menu() -> None:
         print("║  4. 选择图片目录（可多选）                    ║")
         print("║  5. 设置视图与阅览方式                        ║")
         print("║  6. 设置图片 API 端口                         ║")
-        print("║  7. 启动图片 API 服务                         ║")
-        print("║  8. 重启图片 API 服务                         ║")
-        print("║  9. 重建图片索引                              ║")
-        print("║ 10. 查看状态                                  ║")
-        print("║ 11. 显示 WebUI 管理令牌                       ║")
-        print("║ 12. 检测并清理旧 API 残留                     ║")
+        print("║  7. 设置 API 监听范围                         ║")
+        print("║  8. 启动图片 API 服务                         ║")
+        print("║  9. 重启图片 API 服务                         ║")
+        print("║ 10. 后台重建图片索引                          ║")
+        print("║ 11. 查看状态                                  ║")
+        print("║ 12. 显示 WebUI 管理令牌                       ║")
+        print("║ 13. 检测并清理旧 API 残留                     ║")
         print("║  0. 退出                                      ║")
         print("╚══════════════════════════════════════════════╝")
-        choice = input("选择 [0-12]: ").strip()
+        choice = input("选择 [0-13]: ").strip()
         if choice == "0":
             return
         action = actions.get(choice)

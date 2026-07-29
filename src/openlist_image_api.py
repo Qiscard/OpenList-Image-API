@@ -24,7 +24,7 @@ from urllib.parse import parse_qs, quote, urlparse
 from urllib.request import Request, urlopen
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "listen_host": "127.0.0.1",
+    "listen_host": "0.0.0.0",
     "listen_port": 8790,
     "openlist_api_url": "http://127.0.0.1:5244",
     "openlist_token_file": "/etc/openlist-image-api/openlist.token",
@@ -80,8 +80,8 @@ def is_loopback_openlist_url(value: Any) -> bool:
 def validate_config(candidate: dict[str, Any]) -> dict[str, Any]:
     config = DEFAULT_CONFIG.copy()
     config.update(candidate)
-    if config["listen_host"] != "127.0.0.1":
-        raise ValueError("listen_host must remain 127.0.0.1")
+    if config["listen_host"] not in {"127.0.0.1", "0.0.0.0"}:
+        raise ValueError("listen_host must be 127.0.0.1 or 0.0.0.0")
     if not isinstance(config["listen_port"], int) or not 1024 <= config["listen_port"] <= 65535:
         raise ValueError("listen_port must be between 1024 and 65535")
     if not is_loopback_openlist_url(config["openlist_api_url"]):
@@ -231,6 +231,7 @@ def join_virtual_path(parent: str, child: str) -> str:
 
 
 def build_index(config: dict[str, Any], repository: IndexRepository) -> dict[str, Any]:
+    started_at = time.time()
     client = OpenListClient(config)
     extensions = set(config["extensions"])
     queue: deque[str] = deque(config["directories"])
@@ -266,6 +267,7 @@ def build_index(config: dict[str, Any], repository: IndexRepository) -> dict[str
     index = {
         "version": 1,
         "generated_at": int(time.time()),
+        "build_duration_seconds": round(time.time() - started_at, 2),
         "directories": config["directories"],
         "directory_count": len(visited),
         "image_count": len(images),
@@ -403,6 +405,7 @@ class Application:
             "image_count": len(index.get("images", [])),
             "directory_count": int(index.get("directory_count") or 0),
             "generated_at": int(index.get("generated_at") or 0),
+            "last_build_duration_seconds": float(index.get("build_duration_seconds") or 0),
             "refreshing": self.refreshing,
             "last_refresh_error": self.last_refresh_error,
             "cache": self.cache.status(),
