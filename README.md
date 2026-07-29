@@ -15,13 +15,13 @@
 使用固定版本安装器（GitHub）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Qiscard/OpenList-Image-API/v1.0.1/install.sh | sudo bash -- --source github
+curl -fsSL https://raw.githubusercontent.com/Qiscard/OpenList-Image-API/v1.0.2/install.sh | sudo bash -s -- --source github
 ```
 
 使用固定版本安装器（Gitee）：
 
 ```bash
-curl -fsSL https://gitee.com/qiscard/OpenList-Image-API/raw/v1.0.1/install.sh | sudo bash -- --source gitee
+curl -fsSL https://gitee.com/qiscard/OpenList-Image-API/raw/v1.0.2/install.sh | sudo bash -s -- --source gitee
 ```
 
 `--source auto` 会优先使用 Gitee，失败时回退到 GitHub。安装器会创建图片 API 服务和全局管理命令，但不会自动安装 OpenList。首次运行 TUI 后，选择菜单中的“安装 / 部署 OpenList”即可执行官方命令。
@@ -94,7 +94,7 @@ python3 -m unittest discover -s tests -v
 sha256sum src/openlist_image_api.py src/openlist_tui.py VERSION > SHA256SUMS
 ```
 
-在创建 `v1.0.1` 标签前，将 `SHA256SUMS` 提交到仓库。后续版本需要同步更新 `VERSION`、`install.sh` 中的 `RELEASE_REF`、校验文件，并向 GitHub 与 Gitee 推送同名标签。
+在创建 `v1.0.2` 标签前，将 `SHA256SUMS` 提交到仓库。后续版本需要同步更新 `VERSION`、`install.sh` 中的 `RELEASE_REF`、校验文件，并向 GitHub 与 Gitee 推送同名标签。
 
 ## License
 
