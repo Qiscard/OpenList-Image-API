@@ -117,6 +117,33 @@ def install_openlist() -> None:
     print("OpenList 内置安装流程已完成。请在 OpenList 初始化完成后回到本菜单设置 token。")
 
 
+def update_application() -> None:
+    require_root()
+    if not APP_INSTALLER_PATH.is_file():
+        raise RuntimeError("内置安装器缺失，请重新运行本项目安装命令")
+    print("正在拉取最新脚本并更新图片 API；服务会恢复到更新前的启用和运行状态。")
+    run(["bash", str(APP_INSTALLER_PATH), "--update"])
+    print("更新完成。当前 TUI 会话仍使用旧代码；退出后重新运行即可使用新菜单。")
+
+
+def uninstall_application() -> None:
+    require_root()
+    if not APP_INSTALLER_PATH.is_file():
+        raise RuntimeError("内置安装器缺失，无法执行安全卸载")
+    print("卸载方式：")
+    print("  1. 仅卸载图片 API（服务、启动命令、脚本、配置和索引）")
+    print("  2. 完全卸载（图片 API 与本项目安装的 OpenList）")
+    choice = input("选择 [1-2]: ").strip()
+    scopes = {"1": "api", "2": "complete"}
+    if choice not in scopes:
+        raise ValueError("无效的卸载方式")
+    if input("此操作不可恢复，输入 YES 确认: ").strip() != "YES":
+        print("已取消卸载。")
+        return
+    run(["bash", str(APP_INSTALLER_PATH), "--uninstall", scopes[choice]])
+    print("卸载完成。")
+
+
 def configure_port() -> None:
     require_root()
     config = read_config()
@@ -411,6 +438,8 @@ def main_menu() -> None:
         "11": show_status,
         "12": print_admin_token,
         "13": cleanup_legacy_residuals,
+        "14": update_application,
+        "15": uninstall_application,
     }
     while True:
         clear()
@@ -430,9 +459,11 @@ def main_menu() -> None:
         print("║ 11. 查看状态                                  ║")
         print("║ 12. 显示 WebUI 管理令牌                       ║")
         print("║ 13. 检测并清理旧 API 残留                     ║")
+        print("║ 14. 更新图片 API                              ║")
+        print("║ 15. 卸载                                      ║")
         print("║  0. 退出                                      ║")
         print("╚══════════════════════════════════════════════╝")
-        choice = input("选择 [0-13]: ").strip()
+        choice = input("选择 [0-15]: ").strip()
         if choice == "0":
             return
         action = actions.get(choice)

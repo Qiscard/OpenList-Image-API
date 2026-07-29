@@ -33,12 +33,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "extensions": [".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".bmp"],
     "view_layout": "single",
     "delivery": "preview",
+    "caption_mode": "path",
+    "grid_gap": 12,
+    "grid_scale": 125,
     "url_cache_size": 200,
     "url_cache_ttl_seconds": 240,
     "admin_token_file": "/etc/openlist-image-api/admin.token",
 }
 ALLOWED_LAYOUTS = {"single", "grid", "waterfall"}
 ALLOWED_DELIVERY = {"preview", "download"}
+ALLOWED_CAPTION_MODES = {"path", "name", "hidden"}
 MAX_REQUEST_BODY = 64 * 1024
 
 
@@ -91,6 +95,12 @@ def validate_config(candidate: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("invalid view_layout")
     if config["delivery"] not in ALLOWED_DELIVERY:
         raise ValueError("invalid delivery")
+    if config["caption_mode"] not in ALLOWED_CAPTION_MODES:
+        raise ValueError("invalid caption_mode")
+    if not isinstance(config["grid_gap"], int) or not 0 <= config["grid_gap"] <= 48:
+        raise ValueError("grid_gap must be between 0 and 48")
+    if not isinstance(config["grid_scale"], int) or not 75 <= config["grid_scale"] <= 200:
+        raise ValueError("grid_scale must be between 75 and 200")
     if not isinstance(config["url_cache_size"], int) or not 0 <= config["url_cache_size"] <= 5000:
         raise ValueError("invalid url_cache_size")
     if not isinstance(config["url_cache_ttl_seconds"], int) or not 0 <= config["url_cache_ttl_seconds"] <= 3600:
@@ -328,19 +338,29 @@ class Application:
         self.cache = UrlCache(self.config["url_cache_size"], self.config["url_cache_ttl_seconds"])
         return self.config
 
+    def visitor_config(self) -> dict[str, int]:
+        return {"grid_gap": self.config["grid_gap"], "grid_scale": self.config["grid_scale"]}
+
     def public_config(self) -> dict[str, Any]:
-        return {"view_layout": self.config["view_layout"], "delivery": self.config["delivery"]}
+        return {
+            "view_layout": self.config["view_layout"],
+            "delivery": self.config["delivery"],
+            "caption_mode": self.config["caption_mode"],
+            **self.visitor_config(),
+        }
 
     def admin_config(self) -> dict[str, Any]:
         return {
             "directories": self.config["directories"],
             "view_layout": self.config["view_layout"],
             "delivery": self.config["delivery"],
+            "caption_mode": self.config["caption_mode"],
+            **self.visitor_config(),
             "extensions": self.config["extensions"],
         }
 
     def update_admin_config(self, payload: dict[str, Any]) -> dict[str, Any]:
-        allowed = {"directories", "view_layout", "delivery", "extensions"}
+        allowed = {"directories", "view_layout", "delivery", "caption_mode", "grid_gap", "grid_scale", "extensions"}
         if set(payload) - allowed:
             raise ValueError("unsupported configuration field")
         candidate = self.config.copy()
@@ -361,6 +381,9 @@ class Application:
                 "extensions": self.config["extensions"],
                 "view_layout": self.config["view_layout"],
                 "delivery": self.config["delivery"],
+                "caption_mode": self.config["caption_mode"],
+                "grid_gap": self.config["grid_gap"],
+                "grid_scale": self.config["grid_scale"],
                 "url_cache_size": self.config["url_cache_size"],
                 "url_cache_ttl_seconds": self.config["url_cache_ttl_seconds"],
             },
@@ -479,25 +502,228 @@ def json_bytes(payload: dict[str, Any]) -> bytes:
 
 
 def gallery_html() -> str:
-    return """<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>OpenList 图片浏览</title><style>
-body{margin:0;background:#10131a;color:#e7edf7;font:15px system-ui,sans-serif}header{display:flex;gap:12px;align-items:center;padding:18px;position:sticky;top:0;background:#10131ae8;border-bottom:1px solid #293040}button{background:#4b8cff;border:0;border-radius:7px;color:white;padding:9px 13px;cursor:pointer}.gallery{padding:18px;gap:15px}.single{display:grid;place-items:center}.single img{max-height:75vh;max-width:95vw}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr))}.waterfall{columns:4 220px}.card{break-inside:avoid;margin:0 0 15px;background:#171c27;border-radius:9px;overflow:hidden}.card img{width:100%;display:block}.card p{margin:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.meta{color:#a9b7cd;font-size:13px}.download{display:inline-block;margin:0 8px 10px;color:#b7d1ff}a{color:inherit}</style></head><body><header><strong>OpenList 图片浏览</strong><span class=\"meta\" id=\"status\"></span><button id=\"refresh\">刷新</button><a href=\"/admin\">管理</a></header><main id=\"gallery\" class=\"gallery\"></main><script>
-const gallery=document.querySelector('#gallery'),statusEl=document.querySelector('#status');
-async function load(){const status=await (await fetch('/api/status')).json();statusEl.textContent=`${status.image_count} 张图片`;gallery.className='gallery '+status.view_layout;const count=status.view_layout==='single'?1:status.view_layout==='grid'?12:24;const data=await (await fetch('/api/images/random?count='+count)).json();gallery.replaceChildren(...data.images.map(image=>{const card=document.createElement('article');card.className='card';const anchor=document.createElement('a');anchor.href=image.url;anchor.target='_blank';const img=document.createElement('img');img.src=image.url;img.loading='lazy';img.alt=image.path;anchor.append(img);card.append(anchor);const caption=document.createElement('p');caption.textContent=image.path;card.append(caption);if(status.delivery==='download'){const download=document.createElement('a');download.href='/download?path='+encodeURIComponent(image.path);download.className='download';download.textContent='下载';card.append(download)}return card;}));}
-document.querySelector('#refresh').onclick=load;load().catch(error=>statusEl.textContent='加载失败：'+error.message);
-</script></body></html>"""
+    return """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OpenList 图片浏览</title>
+<style>
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#10131a;color:#e7edf7;font:15px system-ui,sans-serif}header{position:sticky;z-index:2;top:0;display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:14px 18px;background:#10131af2;border-bottom:1px solid #293040}button,.button{background:#4b8cff;border:0;border-radius:7px;color:#fff;padding:9px 13px;cursor:pointer;text-decoration:none}button:disabled{opacity:.45;cursor:not-allowed}.meta{color:#a9b7cd;font-size:13px}.spacer{flex:1}.gallery{padding:18px}.gallery.grid{column-width:var(--grid-width,200px);column-gap:var(--grid-gap,12px)}.gallery.grid .card{display:inline-block;width:100%;margin:0 0 var(--grid-gap,12px)}.gallery.single{display:grid;min-height:calc(100vh - 80px);place-items:center}.gallery.single .card{max-width:min(96vw,1200px)}.card{break-inside:avoid;background:#171c27;border:1px solid #293040;border-radius:10px;overflow:hidden}.card img{width:100%;display:block;max-height:82vh;object-fit:contain;background:#080a0f}.card footer{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:9px 11px}.caption{margin:0;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.download{color:#b7d1ff;white-space:nowrap}.hidden{display:none!important}a{color:inherit}#empty{padding:40px;text-align:center;color:#a9b7cd}
+</style>
+</head>
+<body>
+<header>
+  <strong>OpenList 图片浏览</strong>
+  <span class="meta" id="status">正在加载…</span>
+  <span class="spacer"></span>
+  <button id="previous" class="hidden" type="button">← 上一张</button>
+  <button id="next" class="hidden" type="button">下一张 →</button>
+  <button id="refresh" type="button">刷新</button>
+  <a href="/admin">管理</a>
+</header>
+<main id="gallery" class="gallery"></main>
+<script>
+const gallery=document.querySelector('#gallery');
+const statusEl=document.querySelector('#status');
+const previousButton=document.querySelector('#previous');
+const nextButton=document.querySelector('#next');
+const refreshButton=document.querySelector('#refresh');
+let settings=null;
+let singleImages=[];
+let singleIndex=0;
+let gridLoading=false;
+let singleLoading=false;
+
+function captionFor(image){
+  if(settings.caption_mode==='hidden') return '';
+  if(settings.caption_mode==='name') return image.path.split('/').filter(Boolean).pop()||image.path;
+  return image.path;
+}
+
+function createCard(image){
+  const card=document.createElement('article');
+  card.className='card';
+  const anchor=document.createElement('a');
+  anchor.href=image.url;
+  anchor.target='_blank';
+  anchor.rel='noreferrer';
+  const picture=document.createElement('img');
+  picture.src=image.url;
+  picture.loading='lazy';
+  picture.alt=captionFor(image)||'OpenList 图片';
+  anchor.append(picture);
+  card.append(anchor);
+  const footer=document.createElement('footer');
+  const caption=document.createElement('p');
+  caption.className='caption';
+  caption.textContent=captionFor(image);
+  if(settings.caption_mode==='hidden') caption.classList.add('hidden');
+  footer.append(caption);
+  const download=document.createElement('a');
+  download.className='download';
+  download.href='/download?path='+encodeURIComponent(image.path);
+  download.textContent='下载';
+  footer.append(download);
+  card.append(footer);
+  return card;
+}
+
+async function requestImages(count){
+  const response=await fetch('/api/images/random?count='+count,{cache:'no-store'});
+  if(!response.ok) throw new Error('没有可用图片');
+  return (await response.json()).images;
+}
+
+function applyGridStyle(){
+  gallery.style.setProperty('--grid-gap',settings.grid_gap+'px');
+  gallery.style.setProperty('--grid-width',Math.round(160*settings.grid_scale/100)+'px');
+}
+
+function renderSingle(){
+  const image=singleImages[singleIndex];
+  gallery.className='gallery single';
+  gallery.replaceChildren();
+  if(!image){
+    const empty=document.createElement('p');
+    empty.id='empty';
+    empty.textContent='没有可用图片';
+    gallery.append(empty);
+    return;
+  }
+  gallery.append(createCard(image));
+  previousButton.disabled=singleIndex===0;
+  nextButton.disabled=singleIndex>=singleImages.length-1;
+  statusEl.textContent='图片视图 · 第 '+(singleIndex+1)+' 张 / 已缓存 '+singleImages.length+' 张';
+}
+
+async function loadSingleBatch(reset){
+  if(singleLoading) return;
+  singleLoading=true;
+  try{
+    const images=await requestImages(5);
+    if(reset){singleImages=images;singleIndex=0;}else{singleImages.push(...images);}
+    renderSingle();
+  }finally{singleLoading=false;}
+}
+
+function prefetchSingle(){
+  if(singleIndex>=3&&singleIndex>=singleImages.length-2) loadSingleBatch(false).catch(showError);
+}
+
+function showError(error){statusEl.textContent='加载失败：'+error.message;}
+
+async function appendGrid(reset){
+  if(gridLoading) return;
+  gridLoading=true;
+  try{
+    if(reset){gallery.className='gallery grid';gallery.replaceChildren();applyGridStyle();}
+    const images=await requestImages(25);
+    gallery.append(...images.map(createCard));
+    statusEl.textContent='网格视图 · 已加载 '+gallery.children.length+' 张图片';
+  }finally{gridLoading=false;}
+}
+
+async function loadView(){
+  const response=await fetch('/api/status',{cache:'no-store'});
+  if(!response.ok) throw new Error('无法获取服务状态');
+  settings=await response.json();
+  previousButton.classList.toggle('hidden',settings.view_layout!=='single');
+  nextButton.classList.toggle('hidden',settings.view_layout!=='single');
+  if(settings.view_layout==='single') await loadSingleBatch(true);
+  else await appendGrid(true);
+}
+
+previousButton.onclick=()=>{if(singleIndex>0){singleIndex--;renderSingle();}};
+nextButton.onclick=()=>{
+  if(singleIndex<singleImages.length-1){singleIndex++;renderSingle();prefetchSingle();}
+  else if(!singleLoading){loadSingleBatch(false).then(()=>{if(singleIndex<singleImages.length-1){singleIndex++;renderSingle();prefetchSingle();}}).catch(showError);}
+};
+refreshButton.onclick=()=>{singleImages=[];singleIndex=0;loadView().catch(showError);};
+window.addEventListener('scroll',()=>{
+  if(!settings||settings.view_layout==='single'||gridLoading) return;
+  const threshold=document.documentElement.scrollHeight*.8;
+  if(window.scrollY+window.innerHeight>=threshold) appendGrid(false).catch(showError);
+},{passive:true});
+loadView().catch(showError);
+</script>
+</body>
+</html>"""
 
 
 def admin_html() -> str:
-    return """<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>OpenList 图片管理</title><style>body{max-width:880px;margin:30px auto;padding:0 18px;background:#10131a;color:#e7edf7;font:15px system-ui,sans-serif}section{background:#171c27;border-radius:10px;padding:18px;margin:15px 0}input,select,button{padding:8px;border-radius:6px;border:1px solid #445069;background:#10131a;color:#e7edf7}button{background:#4b8cff;border:0;cursor:pointer}.row{display:flex;gap:8px;flex-wrap:wrap}.directory{display:block;padding:7px 0;border-bottom:1px solid #293040}.muted{color:#a9b7cd}</style></head><body><h1>OpenList 图片管理</h1><p class=\"muted\">输入管理令牌后才能读取或修改配置。</p><section><div class=\"row\"><input id=\"token\" type=\"password\" placeholder=\"管理令牌\"><button id=\"load\">加载配置</button></div></section><section><h2>图片目录（可多选）</h2><div class=\"row\"><input id=\"path\" value=\"/\" aria-label=\"目录\"><button id=\"browse\">浏览目录</button></div><div id=\"directories\"></div><h3>已选择</h3><div id=\"selected\"></div></section><section><h2>浏览方式</h2><div class=\"row\"><label>视图 <select id=\"layout\"><option value=\"single\">单张</option><option value=\"grid\">多张网格</option><option value=\"waterfall\">瀑布流</option></select></label><label>阅览 <select id=\"delivery\"><option value=\"preview\">直接预览</option><option value=\"download\">下载预览</option></select></label><button id=\"save\">保存配置</button><button id=\"rebuild\">重建索引</button><button id=\"backup\">下载配置备份</button></div><p id=\"message\" class=\"muted\"></p></section><script>
-let config={directories:[]};const message=document.querySelector('#message');const auth=()=>({'X-Admin-Token':document.querySelector('#token').value,'Content-Type':'application/json'});function showSelected(){const root=document.querySelector('#selected');root.replaceChildren(...config.directories.map(path=>{const row=document.createElement('div');row.className='directory';const remove=document.createElement('button');remove.textContent='移除';remove.onclick=()=>{config.directories=config.directories.filter(item=>item!==path);showSelected()};row.append(document.createTextNode(path+' '),remove);return row;}));}
-async function load(){const response=await fetch('/api/admin/config',{headers:auth()});if(!response.ok)throw new Error('令牌无效或服务不可用');config=await response.json();document.querySelector('#layout').value=config.view_layout;document.querySelector('#delivery').value=config.delivery;showSelected();message.textContent='配置已加载';}
-async function browse(){const path=document.querySelector('#path').value;const response=await fetch('/api/admin/directories?path='+encodeURIComponent(path),{headers:auth()});if(!response.ok)throw new Error('无法列出目录');const data=await response.json();const root=document.querySelector('#directories');root.replaceChildren(...data.directories.map(item=>{const row=document.createElement('label');row.className='directory';const check=document.createElement('input');check.type='checkbox';check.checked=config.directories.includes(item.path);check.onchange=()=>{if(check.checked&&!config.directories.includes(item.path))config.directories.push(item.path);if(!check.checked)config.directories=config.directories.filter(path=>path!==item.path);showSelected()};row.append(check,document.createTextNode(' '+item.name+' ('+item.path+')'));return row;}));}
-async function save(){const payload={directories:config.directories,view_layout:document.querySelector('#layout').value,delivery:document.querySelector('#delivery').value};const response=await fetch('/api/admin/config',{method:'PUT',headers:auth(),body:JSON.stringify(payload)});if(!response.ok)throw new Error('保存失败');config=await response.json();showSelected();message.textContent='已保存';}
+    return """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OpenList 图片管理</title>
+<style>
+:root{color-scheme:dark}body{max-width:920px;margin:30px auto;padding:0 18px;background:#10131a;color:#e7edf7;font:15px system-ui,sans-serif}section{background:#171c27;border:1px solid #293040;border-radius:10px;padding:18px;margin:15px 0}input,select,button{padding:8px;border-radius:6px;border:1px solid #445069;background:#10131a;color:#e7edf7}input:disabled{opacity:.65}button{background:#4b8cff;border:0;cursor:pointer}.row{display:flex;gap:12px;align-items:end;flex-wrap:wrap}.directory{display:block;padding:7px 0;border-bottom:1px solid #293040}.muted{color:#a9b7cd}.hidden{display:none!important}label{display:grid;gap:6px}.actions{margin-top:14px}
+</style>
+</head>
+<body>
+<h1>OpenList 图片管理</h1>
+<p class="muted">访客配置默认只读。输入 WebUI 管理令牌并加载后，可查看和修改完整配置。</p>
+<section>
+  <h2>访客配置</h2>
+  <div class="row">
+    <label>网格图片间距（像素）<input id="gap" type="number" min="0" max="48" disabled></label>
+    <label>网格图片展示比例（%）<input id="scale" type="number" min="75" max="200" disabled></label>
+  </div>
+  <p id="visitor-message" class="muted">正在加载访客配置…</p>
+</section>
+<section>
+  <div class="row"><label>WebUI 管理令牌<input id="token" type="password" placeholder="管理令牌"></label><button id="load" type="button">加载完整配置</button></div>
+  <p id="message" class="muted"></p>
+</section>
+<section id="protected" class="hidden">
+  <h2>图片目录（可多选）</h2>
+  <div class="row"><label>目录<input id="path" value="/" aria-label="目录"></label><button id="browse" type="button">浏览目录</button></div>
+  <div id="directories"></div>
+  <h3>已选择</h3>
+  <div id="selected"></div>
+  <h2>浏览方式</h2>
+  <div class="row">
+    <label>视图<select id="layout"><option value="single">图片视图</option><option value="grid">网格视图</option><option value="waterfall">瀑布流</option></select></label>
+    <label>阅览<select id="delivery"><option value="preview">直接预览</option><option value="download">下载预览</option></select></label>
+    <label>图片文字<select id="caption"><option value="path">完整地址</option><option value="name">仅图片名称</option><option value="hidden">不展示</option></select></label>
+  </div>
+  <div class="row actions"><button id="save" type="button">保存配置</button><button id="rebuild" type="button">重建索引</button><button id="backup" type="button">下载配置备份</button></div>
+</section>
+<script>
+let config=null;
+const message=document.querySelector('#message');
+const visitorMessage=document.querySelector('#visitor-message');
+function auth(){return {'Content-Type':'application/json','X-OpenList-Admin-Token':document.querySelector('#token').value};}
+function visitorValues(values){document.querySelector('#gap').value=values.grid_gap;document.querySelector('#scale').value=values.grid_scale;}
+function showSelected(){const root=document.querySelector('#selected');root.replaceChildren(...config.directories.map(path=>{const item=document.createElement('div');item.textContent=path;return item;}));}
+function showAdmin(){
+  document.querySelector('#layout').value=config.view_layout;
+  document.querySelector('#delivery').value=config.delivery;
+  document.querySelector('#caption').value=config.caption_mode;
+  visitorValues(config);
+  document.querySelector('#gap').disabled=false;
+  document.querySelector('#scale').disabled=false;
+  document.querySelector('#protected').classList.remove('hidden');
+  showSelected();
+}
+async function loadVisitor(){const response=await fetch('/api/public-config',{cache:'no-store'});if(!response.ok)throw new Error('无法读取访客配置');const values=await response.json();visitorValues(values);visitorMessage.textContent='访客可见样式：间距 '+values.grid_gap+' px，展示比例 '+values.grid_scale+'%。';}
+async function load(){const response=await fetch('/api/admin/config',{headers:auth()});if(!response.ok)throw new Error('令牌无效或服务不可用');config=await response.json();showAdmin();message.textContent='完整配置已加载';}
+async function browse(){if(!config)throw new Error('请先加载完整配置');const path=document.querySelector('#path').value;const response=await fetch('/api/admin/directories?path='+encodeURIComponent(path),{headers:auth()});if(!response.ok)throw new Error('无法列出目录');const data=await response.json();const root=document.querySelector('#directories');root.replaceChildren(...data.directories.map(item=>{const row=document.createElement('label');row.className='directory';const check=document.createElement('input');check.type='checkbox';check.checked=config.directories.includes(item.path);check.onchange=()=>{if(check.checked&&!config.directories.includes(item.path))config.directories.push(item.path);if(!check.checked)config.directories=config.directories.filter(value=>value!==item.path);showSelected();};row.append(check,document.createTextNode(' '+item.name+' ('+item.path+')'));return row;}));}
+async function save(){if(!config)throw new Error('请先加载完整配置');const payload={directories:config.directories,view_layout:document.querySelector('#layout').value,delivery:document.querySelector('#delivery').value,caption_mode:document.querySelector('#caption').value,grid_gap:Number(document.querySelector('#gap').value),grid_scale:Number(document.querySelector('#scale').value)};const response=await fetch('/api/admin/config',{method:'PUT',headers:auth(),body:JSON.stringify(payload)});if(!response.ok)throw new Error('保存失败');config=await response.json();showAdmin();visitorMessage.textContent='访客配置已更新。';message.textContent='已保存';}
 async function rebuild(){const response=await fetch('/api/admin/rebuild',{method:'POST',headers:auth()});if(!response.ok)throw new Error('重建未启动');message.textContent='索引正在后台重建';}
 async function backup(){const response=await fetch('/api/admin/backup',{headers:auth()});if(!response.ok)throw new Error('备份下载失败');const blob=await response.blob();const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download='openlist-image-api-backup.zip';link.click();setTimeout(()=>URL.revokeObjectURL(link.href),1000);message.textContent='配置备份已下载（不含 token）';}
-for(const [id,fn] of Object.entries({load,browse,save,rebuild,backup}))document.querySelector('#'+id).onclick=()=>fn().catch(error=>message.textContent=error.message);
-</script></body></html>"""
-
+function report(error){message.textContent='操作失败：'+error.message;}
+document.querySelector('#load').onclick=()=>load().catch(report);
+document.querySelector('#browse').onclick=()=>browse().catch(report);
+document.querySelector('#save').onclick=()=>save().catch(report);
+document.querySelector('#rebuild').onclick=()=>rebuild().catch(report);
+document.querySelector('#backup').onclick=()=>backup().catch(report);
+loadVisitor().catch(error=>visitorMessage.textContent='访客配置加载失败：'+error.message);
+</script>
+</body>
+</html>"""
 
 def make_handler(application: Application):
     class Handler(BaseHTTPRequestHandler):
@@ -556,6 +782,8 @@ def make_handler(application: Application):
                     return self._send_json(HTTPStatus.OK, {"status": "ok"})
                 if parsed.path == "/api/status":
                     return self._send_json(HTTPStatus.OK, application.status())
+                if parsed.path == "/api/public-config":
+                    return self._send_json(HTTPStatus.OK, application.visitor_config())
                 if parsed.path == "/api/images/random":
                     count = self._query_int(params, "count", 1)
                     images = application.choose_images(

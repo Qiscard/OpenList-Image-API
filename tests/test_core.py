@@ -31,11 +31,21 @@ class ConfigurationTests(unittest.TestCase):
         self.assertFalse(is_loopback_openlist_url("https://example.invalid"))
         self.assertFalse(is_loopback_openlist_url("http://not-local.invalid:5244"))
 
-    def test_configuration_allows_nat_listener_and_rejects_remote_api(self) -> None:
-        self.assertEqual(validate_config({})["listen_host"], "0.0.0.0")
+    def test_configuration_allows_nat_listener_and_validates_gallery_options(self) -> None:
+        defaults = validate_config({})
+        self.assertEqual(defaults["listen_host"], "0.0.0.0")
+        self.assertEqual(defaults["caption_mode"], "path")
+        self.assertEqual(defaults["grid_gap"], 12)
+        self.assertEqual(defaults["grid_scale"], 125)
         self.assertEqual(validate_config({"listen_host": "0.0.0.0"})["listen_host"], "0.0.0.0")
+        configured = validate_config({"caption_mode": "name", "grid_gap": 0, "grid_scale": 200})
+        self.assertEqual(configured["caption_mode"], "name")
         with self.assertRaises(ValueError):
             validate_config({"listen_host": "localhost"})
+        with self.assertRaises(ValueError):
+            validate_config({"caption_mode": "url"})
+        with self.assertRaises(ValueError):
+            validate_config({"grid_scale": 74})
         with self.assertRaises(ValueError):
             validate_config({"openlist_api_url": "http://example.invalid:5244"})
 
@@ -56,7 +66,13 @@ class IndexRepositoryTests(unittest.TestCase):
     def test_status_exposes_last_index_duration(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             application = Application.__new__(Application)
-            application.config = {"view_layout": "single", "delivery": "preview"}
+            application.config = {
+                "view_layout": "single",
+                "delivery": "preview",
+                "caption_mode": "path",
+                "grid_gap": 12,
+                "grid_scale": 125,
+            }
             application.repository = IndexRepository(Path(temporary))
             application.cache = UrlCache(0, 0)
             application.refreshing = False

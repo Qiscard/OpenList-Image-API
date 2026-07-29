@@ -4,7 +4,8 @@ set -Eeuo pipefail
 
 GITHUB_REPOSITORY="Qiscard/OpenList-Image-API"
 GITEE_REPOSITORY="qiscard/OpenList-Image-API"
-RELEASE_REF="v1.1.0"
+RELEASE_REF="v1.2.0"
+UPDATE_REF="main"
 APP_DIR="/opt/openlist-image-api"
 CONFIG_DIR="/etc/openlist-image-api"
 STATE_DIR="/var/lib/openlist-image-api"
@@ -84,6 +85,9 @@ create_default_config() {
   "extensions": [".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".bmp"],
   "view_layout": "single",
   "delivery": "preview",
+  "caption_mode": "path",
+  "grid_gap": 12,
+  "grid_scale": 125,
   "url_cache_size": 200,
   "url_cache_ttl_seconds": 240,
   "admin_token_file": "${CONFIG_DIR}/admin.token"
@@ -263,81 +267,16 @@ install_openlist_embedded() {
   log "OpenList runs as ${OPENLIST_SERVICE_NAME}. No Docker components are installed or managed."
 }
 
-uninstall() {
-  read -r -p "Remove this Image API installation and its local state? [y/N] " answer
-  [[ "${answer}" == "y" || "${answer}" == "Y" ]] || exit 0
-  systemctl disable --now "${SERVICE_NAME}" 2>/dev/null || true
-  rm -f "/etc/systemd/system/${SERVICE_NAME}.service" "/usr/local/bin/openlist-image-api"
-  rm -rf "${APP_DIR}" "${CONFIG_DIR}" "${STATE_DIR}"
-  systemctl daemon-reload
-  log "Image API removed. OpenList itself was not removed."
+set_download_ref() {
+  local reference="$1"
+  GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${reference}"
+  GITEE_RAW_BASE="https://gitee.com/${GITEE_REPOSITORY}/raw/${reference}"
 }
 
-usage() {
-  cat <<USAGE
-Usage: sudo bash install.sh [options]
-
-Options:
-  --source github|gitee|auto        Select this project's source (default: auto)
-  --install-openlist                Use the embedded, non-Docker OpenList installer
-  --openlist-download direct|auto   Direct download or benchmark proxy candidates (default: direct)
-  --uninstall                       Remove only this Image API installation
-USAGE
-}
-
-main() {
-  require_root
-  require_command curl
-  require_command python3
-  require_command sha256sum
-
-  local action="install"
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --source)
-        [[ $# -ge 2 ]] || fail "--source requires a value"
-        SOURCE="$2"
-        shift 2
-        ;;
-      --install-openlist)
-        action="install-openlist"
-        shift
-        ;;
-      --openlist-download)
-        [[ $# -ge 2 ]] || fail "--openlist-download requires a value"
-        OPENLIST_DOWNLOAD_MODE="$2"
-        shift 2
-        ;;
-      --uninstall)
-        action="uninstall"
-        shift
-        ;;
-      -h|--help)
-        usage
-        exit 0
-        ;;
-      *)
-        fail "unknown option: $1"
-        ;;
-    esac
-  done
-
-  case "${SOURCE}" in github|gitee|auto) ;; *) fail "--source must be github, gitee, or auto" ;; esac
-  case "${OPENLIST_DOWNLOAD_MODE}" in direct|auto) ;; *) fail "--openlist-download must be direct or auto" ;; esac
-  case "${action}" in
-    install-openlist)
-      install_openlist_embedded
-      exit 0
-      ;;
-    uninstall)
-      uninstall
-      exit 0
-      ;;
-  esac
-
-  local temporary
+install_image_api() {
+  local install_mode="$1"
+  local temporary was_enabled=0 was_active=0
   temporary="$(mktemp -d)"
-  trap 'rm -rf "${temporary}"' EXIT
   mkdir -p "${temporary}/src"
   download "SHA256SUMS" "${temporary}/SHA256SUMS"
   download "install.sh" "${temporary}/install.sh"
@@ -348,6 +287,14 @@ main() {
     cd "${temporary}"
     sha256sum --check --status SHA256SUMS
   ) || fail "download checksum verification failed"
+
+  if [[ "${install_mode}" == "update" ]]; then
+    systemctl is-enabled --quiet "${SERVICE_NAME}" && was_enabled=1 || true
+    systemctl is-active --quiet "${SERVICE_NAME}" && was_active=1 || true
+    if (( was_active )); then
+      systemctl stop "${SERVICE_NAME}"
+    fi
+  fi
 
   create_service_user
   install -d -m 0755 "${APP_DIR}" "${CONFIG_DIR}" "${STATE_DIR}"
@@ -364,12 +311,138 @@ main() {
   create_systemd_unit
   create_tui_command
   systemctl daemon-reload
-  systemctl enable --now "${SERVICE_NAME}"
 
-  log "installation complete from ${SOURCE} source"
-  log "run: sudo openlist-image-api"
-  log "the Image API listens on all network interfaces by default; WebUI administration still requires its token"
-  log "set the OpenList token and choose image directories in the TUI before rebuilding the index"
+  if [[ "${install_mode}" == "update" ]]; then
+    if (( was_enabled )); then
+      systemctl enable "${SERVICE_NAME}"
+    else
+      systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
+    fi
+    if (( was_active )); then
+      systemctl start "${SERVICE_NAME}"
+    else
+      systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+    fi
+    log "update complete from ${SOURCE}/${UPDATE_REF}; Image API service state restored"
+  else
+    systemctl enable --now "${SERVICE_NAME}"
+    log "installation complete from ${SOURCE} source"
+    log "run: sudo openlist-image-api"
+    log "the Image API listens on all network interfaces by default; WebUI administration still requires its token"
+    log "set the OpenList token and choose image directories in the TUI before rebuilding the index"
+  fi
+  rm -rf "${temporary}"
+}
+
+uninstall_image_api() {
+  systemctl disable --now "${SERVICE_NAME}" 2>/dev/null || true
+  rm -f "/etc/systemd/system/${SERVICE_NAME}.service" "/usr/local/bin/openlist-image-api"
+  rm -rf "${APP_DIR}" "${CONFIG_DIR}" "${STATE_DIR}"
+  if id -u "${SERVICE_USER}" >/dev/null 2>&1; then
+    userdel "${SERVICE_USER}" 2>/dev/null || true
+  fi
+  systemctl daemon-reload
+  log "Image API service, command, scripts, configuration, and local state removed."
+}
+
+uninstall() {
+  local scope="$1"
+  case "${scope}" in
+    api)
+      uninstall_image_api
+      ;;
+    complete)
+      uninstall_image_api
+      systemctl disable --now "${OPENLIST_SERVICE_NAME}" 2>/dev/null || true
+      rm -f "/etc/systemd/system/${OPENLIST_SERVICE_NAME}.service"
+      rm -rf "${OPENLIST_INSTALL_DIR}"
+      systemctl daemon-reload
+      log "OpenList and Image API services, scripts, configuration, and local state removed."
+      ;;
+    *)
+      fail "--uninstall must be api or complete"
+      ;;
+  esac
+}
+
+usage() {
+  cat <<USAGE
+Usage: sudo bash install.sh [options]
+
+Options:
+  --source github|gitee|auto        Select this project's source (default: auto)
+  --install-openlist                Use the embedded, non-Docker OpenList installer
+  --openlist-download direct|auto   Direct download or benchmark proxy candidates (default: direct)
+  --update                          Update Image API from the latest main branch and restore its prior service state
+  --uninstall api|complete          Remove only Image API, or remove both Image API and embedded OpenList
+USAGE
+}
+
+main() {
+  require_root
+
+  local action="install"
+  local uninstall_scope=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --source)
+        [[ $# -ge 2 ]] || fail "--source requires a value"
+        SOURCE="$2"
+        shift 2
+        ;;
+      --install-openlist)
+        action="install-openlist"
+        shift
+        ;;
+      --openlist-download)
+        [[ $# -ge 2 ]] || fail "--openlist-download requires a value"
+        OPENLIST_DOWNLOAD_MODE="$2"
+        shift 2
+        ;;
+      --update)
+        action="update"
+        shift
+        ;;
+      --uninstall)
+        [[ $# -ge 2 ]] || fail "--uninstall requires api or complete"
+        action="uninstall"
+        uninstall_scope="$2"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        fail "unknown option: $1"
+        ;;
+    esac
+  done
+
+  case "${SOURCE}" in github|gitee|auto) ;; *) fail "--source must be github, gitee, or auto" ;; esac
+  case "${OPENLIST_DOWNLOAD_MODE}" in direct|auto) ;; *) fail "--openlist-download must be direct or auto" ;; esac
+  case "${action}" in
+    install-openlist)
+      require_command curl
+      install_openlist_embedded
+      ;;
+    uninstall)
+      uninstall "${uninstall_scope}"
+      ;;
+    update)
+      require_command curl
+      require_command python3
+      require_command sha256sum
+      set_download_ref "${UPDATE_REF}"
+      install_image_api "update"
+      ;;
+    install)
+      require_command curl
+      require_command python3
+      require_command sha256sum
+      install_image_api "install"
+      ;;
+  esac
 }
 
 main "$@"

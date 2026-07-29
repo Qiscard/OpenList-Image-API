@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from openlist_image_api import Application  # noqa: E402
+from openlist_image_api import Application, admin_html, gallery_html  # noqa: E402
 import openlist_tui  # noqa: E402
 
 
@@ -27,6 +27,25 @@ class BackupTests(unittest.TestCase):
         self.assertNotIn("openlist_token_file", exported)
         self.assertNotIn("admin_token_file", exported)
         self.assertIn("directories", exported)
+        self.assertEqual(exported["grid_scale"], 125)
+
+
+class WebUiMarkupTests(unittest.TestCase):
+    def test_gallery_supports_incremental_grid_and_single_cache(self) -> None:
+        page = gallery_html()
+        self.assertIn("requestImages(25)", page)
+        self.assertIn("requestImages(5)", page)
+        self.assertIn("singleImages", page)
+        self.assertIn("document.documentElement.scrollHeight*.8", page)
+        self.assertIn("caption_mode", page)
+
+    def test_admin_starts_with_visitor_config_then_loads_admin_config(self) -> None:
+        page = admin_html()
+        self.assertIn("/api/public-config", page)
+        self.assertIn("grid_gap", page)
+        self.assertIn("grid_scale", page)
+        self.assertIn("/api/admin/config", page)
+        self.assertIn("caption_mode", page)
 
 
 class TuiStatusTests(unittest.TestCase):
@@ -51,6 +70,33 @@ class TuiStatusTests(unittest.TestCase):
         self.assertIn("可通过 NAT 转发访问", output.getvalue())
 
 
+class TuiManagementTests(unittest.TestCase):
+    def test_update_uses_embedded_installer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            installer = Path(temporary) / "install.sh"
+            installer.touch()
+            with (
+                patch.object(openlist_tui, "APP_INSTALLER_PATH", installer),
+                patch.object(openlist_tui, "require_root"),
+                patch.object(openlist_tui, "run") as run_command,
+            ):
+                openlist_tui.update_application()
+        run_command.assert_called_once_with(["bash", str(installer), "--update"])
+
+    def test_api_uninstall_uses_scoped_installer_action(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            installer = Path(temporary) / "install.sh"
+            installer.touch()
+            with (
+                patch.object(openlist_tui, "APP_INSTALLER_PATH", installer),
+                patch.object(openlist_tui, "require_root"),
+                patch("builtins.input", side_effect=["1", "YES"]),
+                patch.object(openlist_tui, "run") as run_command,
+            ):
+                openlist_tui.uninstall_application()
+        run_command.assert_called_once_with(["bash", str(installer), "--uninstall", "api"])
+
+
 class InstallerTests(unittest.TestCase):
     def test_embedded_installer_uses_fixed_proxy_candidates(self) -> None:
         installer = (Path(__file__).resolve().parents[1] / "install.sh").read_text(encoding="utf-8")
@@ -63,6 +109,9 @@ class InstallerTests(unittest.TestCase):
             self.assertIn(proxy, installer)
         self.assertIn("--retry 2 --retry-all-errors", installer)
         self.assertIn("--install-openlist", installer)
+        self.assertIn("--update", installer)
+        self.assertIn("--uninstall api|complete", installer)
+        self.assertIn("set_download_ref", installer)
         self.assertNotIn("res.oplist.org", installer)
         self.assertNotRegex(installer, r"\bdocker(?:-compose)?\s+(?:run|start|stop|rm|ps|pull|compose)\b")
 
