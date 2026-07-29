@@ -28,25 +28,44 @@ class BackupTests(unittest.TestCase):
         self.assertNotIn("openlist_token_file", exported)
         self.assertNotIn("admin_token_file", exported)
         self.assertIn("directories", exported)
-        self.assertEqual(exported["grid_scale"], 125)
+        self.assertNotIn("view_layout", exported)
+        self.assertNotIn("delivery", exported)
+        self.assertNotIn("caption_mode", exported)
+        self.assertNotIn("grid_gap", exported)
+        self.assertNotIn("grid_scale", exported)
+
+
+class AdminConfigurationTests(unittest.TestCase):
+    def test_admin_config_only_exposes_global_server_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            application = Application(Path(temporary) / "config.json")
+            self.assertEqual(set(application.admin_config()), {"directories", "extensions"})
+            with self.assertRaises(ValueError):
+                application.update_admin_config({"view_layout": "grid"})
+            application.url_executor.shutdown(wait=True)
 
 
 class WebUiMarkupTests(unittest.TestCase):
-    def test_gallery_supports_incremental_grid_and_single_cache(self) -> None:
+    def test_gallery_uses_device_preferences_and_responsive_large_grid(self) -> None:
         page = gallery_html()
-        self.assertIn("requestImages(25)", page)
+        self.assertIn("requestImages(15)", page)
         self.assertIn("requestImages(5)", page)
         self.assertIn("singleImages", page)
-        self.assertIn("document.documentElement.scrollHeight*.8", page)
-        self.assertIn("caption_mode", page)
+        self.assertIn("document.documentElement.scrollHeight*.78", page)
+        self.assertIn("openlist-image-preferences-v1", page)
+        self.assertIn("repeat(var(--grid-columns,4)", page)
+        self.assertIn("Math.max(3,Math.min(5,columns))", page)
+        self.assertIn("picture.fetchPriority='high'", page)
 
-    def test_admin_starts_with_visitor_config_then_loads_admin_config(self) -> None:
+    def test_admin_separates_device_preferences_from_server_config(self) -> None:
         page = admin_html()
         self.assertIn("/api/public-config", page)
-        self.assertIn("grid_gap", page)
-        self.assertIn("grid_scale", page)
+        self.assertIn("openlist-image-preferences-v1", page)
+        self.assertIn("只保存在当前浏览器", page)
         self.assertIn("/api/admin/config", page)
-        self.assertIn("caption_mode", page)
+        self.assertIn("extensions:parsedExtensions()", page)
+        self.assertIn("const payload={directories:config.directories,extensions:parsedExtensions()}", page)
+        self.assertIn("预计约", page)
 
 
 class TuiStatusTests(unittest.TestCase):
@@ -129,6 +148,9 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("--update", installer)
         self.assertIn("--uninstall api|complete", installer)
         self.assertIn("set_download_ref", installer)
+        self.assertIn('"url_cache_size": 1000', installer)
+        self.assertIn('"url_cache_ttl_seconds": 1800', installer)
+        self.assertIn("migrate_performance_defaults", installer)
         self.assertNotIn("res.oplist.org", installer)
         self.assertNotRegex(installer, r"\bdocker(?:-compose)?\s+(?:run|start|stop|rm|ps|pull|compose)\b")
 

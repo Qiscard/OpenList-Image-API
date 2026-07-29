@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hmac
 import io
 import json
@@ -11,10 +12,12 @@ import logging
 import os
 import random
 import secrets
+import socket
 import threading
 import time
 import zipfile
 from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -35,15 +38,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "delivery": "preview",
     "caption_mode": "path",
     "grid_gap": 12,
-    "grid_scale": 125,
-    "url_cache_size": 200,
-    "url_cache_ttl_seconds": 240,
+    "grid_scale": 150,
+    "url_cache_size": 1000,
+    "url_cache_ttl_seconds": 1800,
     "admin_token_file": "/etc/openlist-image-api/admin.token",
 }
 ALLOWED_LAYOUTS = {"single", "grid", "waterfall"}
 ALLOWED_DELIVERY = {"preview", "download"}
 ALLOWED_CAPTION_MODES = {"path", "name", "hidden"}
 MAX_REQUEST_BODY = 64 * 1024
+URL_RESOLVE_WORKERS = 12
+DEVICE_PREFERENCE_DEFAULTS: dict[str, Any] = {
+    "view_layout": DEFAULT_CONFIG["view_layout"],
+    "delivery": DEFAULT_CONFIG["delivery"],
+    "caption_mode": DEFAULT_CONFIG["caption_mode"],
+    "grid_gap": DEFAULT_CONFIG["grid_gap"],
+    "grid_scale": DEFAULT_CONFIG["grid_scale"],
+}
 
 
 def normalize_directory(value: str) -> str:
@@ -299,10 +310,11 @@ class UrlCache:
         self.ttl_seconds = ttl_seconds
         self._entries: OrderedDict[str, tuple[float, str]] = OrderedDict()
         self._lock = threading.Lock()
+        self._resolve_locks = [threading.Lock() for _ in range(64)]
         self.hits = 0
         self.misses = 0
 
-    def resolve(self, path: str, client: OpenListClient) -> str:
+    def _cached_url(self, path: str) -> str | None:
         now = time.monotonic()
         with self._lock:
             cached = self._entries.get(path)
@@ -312,15 +324,27 @@ class UrlCache:
                 return cached[1]
             if cached:
                 self._entries.pop(path, None)
-            self.misses += 1
-        url = client.resolve_file(path)
-        if self.max_size:
+        return None
+
+    def resolve(self, path: str, client: OpenListClient) -> str:
+        cached_url = self._cached_url(path)
+        if cached_url is not None:
+            return cached_url
+        resolve_lock = self._resolve_locks[hash(path) % len(self._resolve_locks)]
+        with resolve_lock:
+            cached_url = self._cached_url(path)
+            if cached_url is not None:
+                return cached_url
             with self._lock:
-                self._entries[path] = (now, url)
-                self._entries.move_to_end(path)
-                while len(self._entries) > self.max_size:
-                    self._entries.popitem(last=False)
-        return url
+                self.misses += 1
+            url = client.resolve_file(path)
+            if self.max_size:
+                with self._lock:
+                    self._entries[path] = (time.monotonic(), url)
+                    self._entries.move_to_end(path)
+                    while len(self._entries) > self.max_size:
+                        self._entries.popitem(last=False)
+            return url
 
     def status(self) -> dict[str, int]:
         with self._lock:
@@ -333,47 +357,44 @@ class Application:
         self.config = load_config(config_path)
         self.repository = IndexRepository(Path(self.config["state_dir"]))
         self.cache = UrlCache(self.config["url_cache_size"], self.config["url_cache_ttl_seconds"])
+        self.url_executor = ThreadPoolExecutor(max_workers=URL_RESOLVE_WORKERS, thread_name_prefix="openlist-url")
+        self.config_lock = threading.Lock()
         self.refresh_lock = threading.Lock()
         self.refreshing = False
         self.last_refresh_error = ""
 
     def reload_config(self) -> dict[str, Any]:
+        previous_config = self.config
         self.config = load_config(self.config_path)
         self.repository = IndexRepository(Path(self.config["state_dir"]))
-        self.cache = UrlCache(self.config["url_cache_size"], self.config["url_cache_ttl_seconds"])
+        cache_changed = any(
+            previous_config[key] != self.config[key]
+            for key in ("url_cache_size", "url_cache_ttl_seconds", "openlist_api_url", "openlist_token_file")
+        )
+        if cache_changed:
+            self.cache = UrlCache(self.config["url_cache_size"], self.config["url_cache_ttl_seconds"])
         return self.config
 
-    def visitor_config(self) -> dict[str, int]:
-        return {"grid_gap": self.config["grid_gap"], "grid_scale": self.config["grid_scale"]}
+    def visitor_config(self) -> dict[str, Any]:
+        return DEVICE_PREFERENCE_DEFAULTS.copy()
 
     def public_config(self) -> dict[str, Any]:
-        return {
-            "view_layout": self.config["view_layout"],
-            "delivery": self.config["delivery"],
-            "caption_mode": self.config["caption_mode"],
-            **self.visitor_config(),
-        }
+        return self.visitor_config()
 
     def admin_config(self) -> dict[str, Any]:
-        return {
-            "directories": self.config["directories"],
-            "view_layout": self.config["view_layout"],
-            "delivery": self.config["delivery"],
-            "caption_mode": self.config["caption_mode"],
-            **self.visitor_config(),
-            "extensions": self.config["extensions"],
-        }
+        return {"directories": self.config["directories"], "extensions": self.config["extensions"]}
 
     def update_admin_config(self, payload: dict[str, Any]) -> dict[str, Any]:
-        allowed = {"directories", "view_layout", "delivery", "caption_mode", "grid_gap", "grid_scale", "extensions"}
+        allowed = {"directories", "extensions"}
         if set(payload) - allowed:
             raise ValueError("unsupported configuration field")
-        candidate = self.config.copy()
-        candidate.update(payload)
-        validated = validate_config(candidate)
-        atomic_write_json(self.config_path, validated)
-        self.reload_config()
-        return self.admin_config()
+        with self.config_lock:
+            candidate = self.config.copy()
+            candidate.update(payload)
+            validated = validate_config(candidate)
+            atomic_write_json(self.config_path, validated)
+            self.reload_config()
+            return self.admin_config()
 
     def create_config_backup(self) -> bytes:
         backup = {
@@ -384,11 +405,6 @@ class Application:
                 "openlist_api_url": self.config["openlist_api_url"],
                 "directories": self.config["directories"],
                 "extensions": self.config["extensions"],
-                "view_layout": self.config["view_layout"],
-                "delivery": self.config["delivery"],
-                "caption_mode": self.config["caption_mode"],
-                "grid_gap": self.config["grid_gap"],
-                "grid_scale": self.config["grid_scale"],
                 "url_cache_size": self.config["url_cache_size"],
                 "url_cache_ttl_seconds": self.config["url_cache_ttl_seconds"],
             },
@@ -478,11 +494,12 @@ class Application:
 
     def resolve_images(self, images: list[dict[str, Any]]) -> list[dict[str, Any]]:
         client = OpenListClient(self.config)
-        results = []
-        for image in images:
+
+        def resolve(image: dict[str, Any]) -> dict[str, Any]:
             path = str(image["path"])
-            results.append({"path": path, "size": int(image.get("size") or 0), "url": self.cache.resolve(path, client)})
-        return results
+            return {"path": path, "size": int(image.get("size") or 0), "url": self.cache.resolve(path, client)}
+
+        return list(self.url_executor.map(resolve, images))
 
 
 def parse_size(value: str | None) -> int | None:
@@ -514,7 +531,7 @@ def gallery_html() -> str:
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>OpenList 图片浏览</title>
 <style>
-:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#10131a;color:#e7edf7;font:15px system-ui,sans-serif}header{position:sticky;z-index:2;top:0;display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:14px 18px;background:#10131af2;border-bottom:1px solid #293040}button,.button{background:#4b8cff;border:0;border-radius:7px;color:#fff;padding:9px 13px;cursor:pointer;text-decoration:none}button:disabled{opacity:.45;cursor:not-allowed}.meta{color:#a9b7cd;font-size:13px}.spacer{flex:1}.gallery{padding:18px}.gallery.grid{column-width:var(--grid-width,200px);column-gap:var(--grid-gap,12px)}.gallery.grid .card{display:inline-block;width:100%;margin:0 0 var(--grid-gap,12px)}.gallery.single{display:grid;min-height:calc(100vh - 80px);place-items:center}.gallery.single .card{max-width:min(96vw,1200px)}.card{break-inside:avoid;background:#171c27;border:1px solid #293040;border-radius:10px;overflow:hidden}.card img{width:100%;display:block;max-height:82vh;object-fit:contain;background:#080a0f}.card footer{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:9px 11px}.caption{margin:0;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.download{color:#b7d1ff;white-space:nowrap}.hidden{display:none!important}a{color:inherit}#empty{padding:40px;text-align:center;color:#a9b7cd}
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#10131a;color:#e7edf7;font:15px system-ui,sans-serif}header{position:sticky;z-index:2;top:0;display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:14px 18px;background:#10131af2;border-bottom:1px solid #293040}button,.button{background:#4b8cff;border:0;border-radius:7px;color:#fff;padding:9px 13px;cursor:pointer;text-decoration:none}button:disabled{opacity:.45;cursor:not-allowed}.meta{color:#a9b7cd;font-size:13px}.spacer{flex:1}.gallery{padding:18px}.gallery.grid{display:grid;grid-template-columns:repeat(var(--grid-columns,4),minmax(0,1fr));gap:var(--grid-gap,12px);align-items:start}.gallery.waterfall{columns:var(--grid-columns,4);column-gap:var(--grid-gap,12px)}.gallery.waterfall .card{display:inline-block;width:100%;margin:0 0 var(--grid-gap,12px)}.gallery.single{display:grid;min-height:calc(100vh - 80px);place-items:center}.gallery.single .card{max-width:min(96vw,1280px)}.card{break-inside:avoid;background:#171c27;border:1px solid #293040;border-radius:10px;overflow:hidden}.card img{width:100%;display:block;max-height:82vh;object-fit:contain;background:#080a0f}.gallery.grid .card img{aspect-ratio:4/3;max-height:none}.card footer{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:9px 11px}.caption{margin:0;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.download{color:#b7d1ff;white-space:nowrap}.hidden{display:none!important}a{color:inherit}#empty{padding:40px;text-align:center;color:#a9b7cd}@media(max-width:519px){header{padding:10px 12px}.gallery{padding:10px}}
 </style>
 </head>
 <body>
@@ -529,6 +546,7 @@ def gallery_html() -> str:
 </header>
 <main id="gallery" class="gallery"></main>
 <script>
+const PREFERENCE_KEY='openlist-image-preferences-v1';
 const gallery=document.querySelector('#gallery');
 const statusEl=document.querySelector('#status');
 const previousButton=document.querySelector('#previous');
@@ -539,6 +557,26 @@ let singleImages=[];
 let singleIndex=0;
 let gridLoading=false;
 let singleLoading=false;
+let resizeTimer=null;
+
+function normalizedPreferences(value,defaults){
+  const result={...defaults,...(value&&typeof value==='object'?value:{})};
+  if(!['single','grid','waterfall'].includes(result.view_layout)) result.view_layout=defaults.view_layout;
+  if(!['preview','download'].includes(result.delivery)) result.delivery=defaults.delivery;
+  if(!['path','name','hidden'].includes(result.caption_mode)) result.caption_mode=defaults.caption_mode;
+  result.grid_gap=Math.max(0,Math.min(48,Number(result.grid_gap)||0));
+  result.grid_scale=Math.max(75,Math.min(200,Number(result.grid_scale)||150));
+  return result;
+}
+
+async function loadSettings(){
+  const response=await fetch('/api/public-config',{cache:'no-store'});
+  if(!response.ok) throw new Error('无法读取浏览设置');
+  const defaults=await response.json();
+  let stored={};
+  try{stored=JSON.parse(localStorage.getItem(PREFERENCE_KEY)||'{}');}catch(error){localStorage.removeItem(PREFERENCE_KEY);}
+  return normalizedPreferences(stored,defaults);
+}
 
 function captionFor(image){
   if(settings.caption_mode==='hidden') return '';
@@ -546,16 +584,22 @@ function captionFor(image){
   return image.path;
 }
 
-function createCard(image){
+function downloadUrl(image){return '/download?path='+encodeURIComponent(image.path);}
+
+function createCard(image,eager=false){
   const card=document.createElement('article');
   card.className='card';
   const anchor=document.createElement('a');
-  anchor.href=image.url;
-  anchor.target='_blank';
-  anchor.rel='noreferrer';
+  anchor.href=settings.delivery==='download'?downloadUrl(image):image.url;
+  if(settings.delivery==='preview'){
+    anchor.target='_blank';
+    anchor.rel='noreferrer';
+  }
   const picture=document.createElement('img');
   picture.src=image.url;
-  picture.loading='lazy';
+  picture.loading=eager?'eager':'lazy';
+  picture.decoding='async';
+  if(eager) picture.fetchPriority='high';
   picture.alt=captionFor(image)||'OpenList 图片';
   anchor.append(picture);
   card.append(anchor);
@@ -567,7 +611,7 @@ function createCard(image){
   footer.append(caption);
   const download=document.createElement('a');
   download.className='download';
-  download.href='/download?path='+encodeURIComponent(image.path);
+  download.href=downloadUrl(image);
   download.textContent='下载';
   footer.append(download);
   card.append(footer);
@@ -580,9 +624,18 @@ async function requestImages(count){
   return (await response.json()).images;
 }
 
+function preferredColumns(){
+  const width=gallery.clientWidth||window.innerWidth;
+  let base=width>=1600?5:width>=1100?4:width>=760?3:width>=520?2:1;
+  let columns=Math.round(base*150/settings.grid_scale);
+  if(width>=760) columns=Math.max(3,Math.min(5,columns));
+  else columns=Math.max(1,Math.min(2,columns));
+  return columns;
+}
+
 function applyGridStyle(){
   gallery.style.setProperty('--grid-gap',settings.grid_gap+'px');
-  gallery.style.setProperty('--grid-width',Math.round(160*settings.grid_scale/100)+'px');
+  gallery.style.setProperty('--grid-columns',String(preferredColumns()));
 }
 
 function renderSingle(){
@@ -596,10 +649,10 @@ function renderSingle(){
     gallery.append(empty);
     return;
   }
-  gallery.append(createCard(image));
+  gallery.append(createCard(image,true));
   previousButton.disabled=singleIndex===0;
-  nextButton.disabled=singleIndex>=singleImages.length-1;
-  statusEl.textContent='图片视图 · 第 '+(singleIndex+1)+' 张 / 已缓存 '+singleImages.length+' 张';
+  nextButton.disabled=singleIndex>=singleImages.length-1&&singleLoading;
+  statusEl.textContent='单张视图 · 第 '+(singleIndex+1)+' 张 / 已缓存 '+singleImages.length+' 张';
 }
 
 async function loadSingleBatch(reset){
@@ -613,44 +666,67 @@ async function loadSingleBatch(reset){
 }
 
 function prefetchSingle(){
-  if(singleIndex>=3&&singleIndex>=singleImages.length-2) loadSingleBatch(false).catch(showError);
+  if(singleIndex>=singleImages.length-2) loadSingleBatch(false).catch(showError);
 }
 
-function showError(error){statusEl.textContent='加载失败：'+error.message;}
+async function nextSingle(){
+  if(singleIndex>=singleImages.length-2) await loadSingleBatch(false);
+  if(singleIndex<singleImages.length-1) singleIndex+=1;
+  renderSingle();
+  prefetchSingle();
+}
 
-async function appendGrid(reset){
+function previousSingle(){
+  if(singleIndex>0) singleIndex-=1;
+  renderSingle();
+}
+
+async function loadGridBatch(reset){
   if(gridLoading) return;
   gridLoading=true;
+  refreshButton.disabled=true;
   try{
-    if(reset){gallery.className='gallery grid';gallery.replaceChildren();applyGridStyle();}
-    const images=await requestImages(25);
-    gallery.append(...images.map(createCard));
-    statusEl.textContent='网格视图 · 已加载 '+gallery.children.length+' 张图片';
-  }finally{gridLoading=false;}
+    const images=await requestImages(15);
+    if(reset) gallery.replaceChildren();
+    const initial=gallery.childElementCount===0;
+    images.forEach((image,index)=>gallery.append(createCard(image,initial&&index<2)));
+    statusEl.textContent=(settings.view_layout==='grid'?'网格':'瀑布流')+'视图 · 已加载 '+gallery.childElementCount+' 张 · 本设备独立设置';
+  }finally{
+    gridLoading=false;
+    refreshButton.disabled=false;
+  }
 }
 
-async function loadView(){
-  const response=await fetch('/api/status',{cache:'no-store'});
-  if(!response.ok) throw new Error('无法获取服务状态');
-  settings=await response.json();
+async function render(){
   previousButton.classList.toggle('hidden',settings.view_layout!=='single');
   nextButton.classList.toggle('hidden',settings.view_layout!=='single');
-  if(settings.view_layout==='single') await loadSingleBatch(true);
-  else await appendGrid(true);
+  applyGridStyle();
+  if(settings.view_layout==='single'){
+    await loadSingleBatch(true);
+  }else{
+    gallery.className='gallery '+settings.view_layout;
+    await loadGridBatch(true);
+  }
 }
 
-previousButton.onclick=()=>{if(singleIndex>0){singleIndex--;renderSingle();}};
-nextButton.onclick=()=>{
-  if(singleIndex<singleImages.length-1){singleIndex++;renderSingle();prefetchSingle();}
-  else if(!singleLoading){loadSingleBatch(false).then(()=>{if(singleIndex<singleImages.length-1){singleIndex++;renderSingle();prefetchSingle();}}).catch(showError);}
-};
-refreshButton.onclick=()=>{singleImages=[];singleIndex=0;loadView().catch(showError);};
+function showError(error){
+  statusEl.textContent='加载失败：'+error.message;
+  refreshButton.disabled=false;
+}
+
+previousButton.onclick=previousSingle;
+nextButton.onclick=()=>nextSingle().catch(showError);
+refreshButton.onclick=()=>render().catch(showError);
 window.addEventListener('scroll',()=>{
-  if(!settings||settings.view_layout==='single'||gridLoading) return;
-  const threshold=document.documentElement.scrollHeight*.8;
-  if(window.scrollY+window.innerHeight>=threshold) appendGrid(false).catch(showError);
+  if(settings&&settings.view_layout!=='single'&&window.scrollY+window.innerHeight>=document.documentElement.scrollHeight*.78){
+    loadGridBatch(false).catch(showError);
+  }
 },{passive:true});
-loadView().catch(showError);
+window.addEventListener('resize',()=>{
+  clearTimeout(resizeTimer);
+  resizeTimer=setTimeout(()=>{if(settings)applyGridStyle();},120);
+},{passive:true});
+loadSettings().then(value=>{settings=value;return render();}).catch(showError);
 </script>
 </body>
 </html>"""
@@ -662,95 +738,128 @@ def admin_html() -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>OpenList 图片管理</title>
+<title>OpenList 图片 API 管理</title>
 <style>
-:root{color-scheme:dark}body{max-width:920px;margin:30px auto;padding:0 18px;background:#10131a;color:#e7edf7;font:15px system-ui,sans-serif}section{background:#171c27;border:1px solid #293040;border-radius:10px;padding:18px;margin:15px 0}input,select,button{padding:8px;border-radius:6px;border:1px solid #445069;background:#10131a;color:#e7edf7}input:disabled{opacity:.65}button{background:#4b8cff;border:0;cursor:pointer}.row{display:flex;gap:12px;align-items:end;flex-wrap:wrap}.directory{display:block;padding:7px 0;border-bottom:1px solid #293040}.muted{color:#a9b7cd}.hidden{display:none!important}label{display:grid;gap:6px}.actions{margin-top:14px}
+:root{color-scheme:dark}*{box-sizing:border-box}body{max-width:1040px;margin:auto;padding:22px;background:#10131a;color:#e7edf7;font:15px system-ui,sans-serif}section{margin-bottom:18px;padding:18px;background:#171c27;border:1px solid #293040;border-radius:10px}h1,h2{margin-top:0}label{display:grid;gap:6px;margin:10px 0;color:#cbd6e7}.row{display:flex;gap:12px;flex-wrap:wrap}.row>label{flex:1;min-width:180px}input,select,textarea,button{font:inherit}input,select,textarea{width:100%;padding:9px;border:1px solid #3a455b;border-radius:7px;background:#0d1119;color:#fff}textarea{min-height:80px;resize:vertical}button{padding:9px 13px;border:0;border-radius:7px;background:#4b8cff;color:#fff;cursor:pointer}button.secondary{background:#39445a}.actions{margin-top:14px}.note,.message{color:#a9b7cd}.directory{display:block}.selected{display:grid;gap:5px;margin-top:10px}.hidden{display:none}a{color:#b7d1ff}
 </style>
 </head>
 <body>
-<h1>OpenList 图片管理</h1>
-<p class="muted">访客配置默认只读。输入 WebUI 管理令牌并加载后，可查看和修改完整配置。</p>
+<h1>OpenList 图片 API 管理</h1>
+<p><a href="/gallery">返回图片浏览</a></p>
 <section>
-  <h2>访客配置</h2>
+  <h2>本设备浏览偏好</h2>
+  <p class="note">这些选项只保存在当前浏览器，不会修改其他设备或其他浏览器的显示方式。</p>
   <div class="row">
-    <label>网格图片间距（像素）<input id="gap" type="number" min="0" max="48" disabled></label>
-    <label>网格图片展示比例（%）<input id="scale" type="number" min="75" max="200" disabled></label>
+    <label>视图<select id="layout"><option value="single">单张</option><option value="grid">网格</option><option value="waterfall">瀑布流</option></select></label>
+    <label>阅览<select id="delivery"><option value="preview">直接预览</option><option value="download">点击图片下载</option></select></label>
+    <label>图片文字<select id="caption"><option value="path">完整路径</option><option value="name">仅图片名称</option><option value="hidden">不展示</option></select></label>
   </div>
-  <p id="visitor-message" class="muted">正在加载访客配置…</p>
+  <div class="row">
+    <label>图片间距（0–48 px）<input id="gap" type="number" min="0" max="48"></label>
+    <label>网格图片比例（75–200%）<input id="scale" type="number" min="75" max="200"></label>
+  </div>
+  <p class="note">比例越大图片越大；桌面网格会根据窗口宽度保持每行约 3–5 张。</p>
+  <div class="row actions"><button id="save-device" type="button">保存本设备偏好</button><button id="reset-device" class="secondary" type="button">恢复默认</button></div>
+  <p class="message" id="visitor-message">正在读取默认设置…</p>
 </section>
 <section>
-  <div class="row"><label>WebUI 管理令牌<input id="token" type="password" placeholder="管理令牌"></label><button id="load" type="button">加载完整配置</button></div>
-  <p id="message" class="muted"></p>
+  <h2>服务器管理认证</h2>
+  <label>WebUI 管理令牌<input id="token" type="password" autocomplete="current-password"></label>
+  <button id="load" type="button">加载服务器配置</button>
+  <p class="message" id="message">浏览偏好无需令牌；目录、扩展名、备份和索引操作需要令牌。</p>
 </section>
 <section id="protected" class="hidden">
-  <h2>图片目录（可多选）</h2>
-  <div class="row"><label>目录<input id="path" value="/" aria-label="目录"></label><button id="browse" type="button">浏览目录</button></div>
+  <h2>全局服务器配置</h2>
+  <p class="note">以下选项影响所有设备。并发浏览不会互相修改配置；若多名管理员同时保存，以最后一次保存为准。</p>
+  <label>浏览 OpenList 目录<input id="path" value="/"></label>
+  <button id="browse" type="button">列出子目录</button>
   <div id="directories"></div>
-  <h3>已选择</h3>
-  <div id="selected"></div>
-  <h2>浏览方式</h2>
-  <div class="row">
-    <label>视图<select id="layout"><option value="single">图片视图</option><option value="grid">网格视图</option><option value="waterfall">瀑布流</option></select></label>
-    <label>阅览<select id="delivery"><option value="preview">直接预览</option><option value="download">下载预览</option></select></label>
-    <label>图片文字<select id="caption"><option value="path">完整地址</option><option value="name">仅图片名称</option><option value="hidden">不展示</option></select></label>
-  </div>
-  <div class="row actions"><button id="save" type="button">保存配置</button><button id="rebuild" type="button">重建索引</button><button id="backup" type="button">下载配置备份</button></div>
+  <h3>已选目录</h3>
+  <div id="selected" class="selected"></div>
+  <label>图片扩展名（逗号或空格分隔）<textarea id="extensions"></textarea></label>
+  <div class="row actions"><button id="save-server" type="button">保存服务器配置</button><button id="rebuild" type="button">后台重建索引</button><button id="backup" type="button">下载配置备份</button></div>
 </section>
 <script>
+const PREFERENCE_KEY='openlist-image-preferences-v1';
 let config=null;
+let preferenceDefaults=null;
+let rebuildTimer=null;
 const message=document.querySelector('#message');
 const visitorMessage=document.querySelector('#visitor-message');
 function auth(){return {'Content-Type':'application/json','X-OpenList-Admin-Token':document.querySelector('#token').value};}
-function visitorValues(values){document.querySelector('#gap').value=values.grid_gap;document.querySelector('#scale').value=values.grid_scale;}
-function showSelected(){const root=document.querySelector('#selected');root.replaceChildren(...config.directories.map(path=>{const item=document.createElement('div');item.textContent=path;return item;}));}
-function showAdmin(){
-  document.querySelector('#layout').value=config.view_layout;
-  document.querySelector('#delivery').value=config.delivery;
-  document.querySelector('#caption').value=config.caption_mode;
-  visitorValues(config);
-  document.querySelector('#gap').disabled=false;
-  document.querySelector('#scale').disabled=false;
-  document.querySelector('#protected').classList.remove('hidden');
-  showSelected();
+function normalizedPreferences(value,defaults){
+  const result={...defaults,...(value&&typeof value==='object'?value:{})};
+  if(!['single','grid','waterfall'].includes(result.view_layout)) result.view_layout=defaults.view_layout;
+  if(!['preview','download'].includes(result.delivery)) result.delivery=defaults.delivery;
+  if(!['path','name','hidden'].includes(result.caption_mode)) result.caption_mode=defaults.caption_mode;
+  result.grid_gap=Math.max(0,Math.min(48,Number(result.grid_gap)||0));
+  result.grid_scale=Math.max(75,Math.min(200,Number(result.grid_scale)||150));
+  return result;
 }
-async function loadVisitor(){const response=await fetch('/api/public-config',{cache:'no-store'});if(!response.ok)throw new Error('无法读取访客配置');const values=await response.json();visitorValues(values);visitorMessage.textContent='访客可见样式：间距 '+values.grid_gap+' px，展示比例 '+values.grid_scale+'%。';}
-async function load(){const response=await fetch('/api/admin/config',{headers:auth()});if(!response.ok)throw new Error('令牌无效或服务不可用');config=await response.json();showAdmin();message.textContent='完整配置已加载';}
-async function browse(){if(!config)throw new Error('请先加载完整配置');const path=document.querySelector('#path').value;const response=await fetch('/api/admin/directories?path='+encodeURIComponent(path),{headers:auth()});if(!response.ok)throw new Error('无法列出目录');const data=await response.json();const root=document.querySelector('#directories');root.replaceChildren(...data.directories.map(item=>{const row=document.createElement('label');row.className='directory';const check=document.createElement('input');check.type='checkbox';check.checked=config.directories.includes(item.path);check.onchange=()=>{if(check.checked&&!config.directories.includes(item.path))config.directories.push(item.path);if(!check.checked)config.directories=config.directories.filter(value=>value!==item.path);showSelected();};row.append(check,document.createTextNode(' '+item.name+' ('+item.path+')'));return row;}));}
-async function save(){if(!config)throw new Error('请先加载完整配置');const payload={directories:config.directories,view_layout:document.querySelector('#layout').value,delivery:document.querySelector('#delivery').value,caption_mode:document.querySelector('#caption').value,grid_gap:Number(document.querySelector('#gap').value),grid_scale:Number(document.querySelector('#scale').value)};const response=await fetch('/api/admin/config',{method:'PUT',headers:auth(),body:JSON.stringify(payload)});if(!response.ok)throw new Error('保存失败');config=await response.json();showAdmin();visitorMessage.textContent='访客配置已更新。';message.textContent='已保存';}
-async function rebuild(){const response=await fetch('/api/admin/rebuild',{method:'POST',headers:auth()});if(!response.ok)throw new Error('重建未启动');message.textContent='索引正在后台重建';}
-async function backup(){const response=await fetch('/api/admin/backup',{headers:auth()});if(!response.ok)throw new Error('备份下载失败');const blob=await response.blob();const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download='openlist-image-api-backup.zip';link.click();setTimeout(()=>URL.revokeObjectURL(link.href),1000);message.textContent='配置备份已下载（不含 token）';}
+function preferenceValues(){return {view_layout:document.querySelector('#layout').value,delivery:document.querySelector('#delivery').value,caption_mode:document.querySelector('#caption').value,grid_gap:Number(document.querySelector('#gap').value),grid_scale:Number(document.querySelector('#scale').value)};}
+function showPreferences(values){document.querySelector('#layout').value=values.view_layout;document.querySelector('#delivery').value=values.delivery;document.querySelector('#caption').value=values.caption_mode;document.querySelector('#gap').value=values.grid_gap;document.querySelector('#scale').value=values.grid_scale;}
+function readStoredPreferences(){try{return JSON.parse(localStorage.getItem(PREFERENCE_KEY)||'{}');}catch(error){localStorage.removeItem(PREFERENCE_KEY);return {};}}
+async function loadPreferences(){const response=await fetch('/api/public-config',{cache:'no-store'});if(!response.ok)throw new Error('无法读取默认设置');preferenceDefaults=await response.json();showPreferences(normalizedPreferences(readStoredPreferences(),preferenceDefaults));visitorMessage.textContent='已加载当前浏览器的独立偏好。';}
+function savePreferences(){const values=normalizedPreferences(preferenceValues(),preferenceDefaults);localStorage.setItem(PREFERENCE_KEY,JSON.stringify(values));showPreferences(values);visitorMessage.textContent='本设备偏好已保存；其他设备不会改变。';}
+function resetPreferences(){localStorage.removeItem(PREFERENCE_KEY);showPreferences(preferenceDefaults);visitorMessage.textContent='已恢复服务默认值。';}
+function showSelected(){const root=document.querySelector('#selected');root.replaceChildren(...config.directories.map(path=>{const item=document.createElement('div');item.textContent=path;return item;}));}
+function showAdmin(){document.querySelector('#extensions').value=config.extensions.join(', ');document.querySelector('#protected').classList.remove('hidden');showSelected();}
+async function errorText(response,fallback){try{const data=await response.json();return data.error||fallback;}catch(error){return fallback;}}
+async function load(){const response=await fetch('/api/admin/config',{headers:auth(),cache:'no-store'});if(!response.ok)throw new Error(await errorText(response,'令牌无效或服务不可用'));config=await response.json();showAdmin();message.textContent='服务器配置已加载';}
+async function browse(){if(!config)throw new Error('请先加载服务器配置');const path=document.querySelector('#path').value;const response=await fetch('/api/admin/directories?path='+encodeURIComponent(path),{headers:auth(),cache:'no-store'});if(!response.ok)throw new Error(await errorText(response,'无法列出目录'));const data=await response.json();const root=document.querySelector('#directories');root.replaceChildren(...data.directories.map(item=>{const row=document.createElement('label');row.className='directory';const check=document.createElement('input');check.type='checkbox';check.checked=config.directories.includes(item.path);check.onchange=()=>{if(check.checked&&!config.directories.includes(item.path))config.directories.push(item.path);if(!check.checked)config.directories=config.directories.filter(value=>value!==item.path);showSelected();};row.append(check,document.createTextNode(' '+item.name+' ('+item.path+')'));return row;}));}
+function parsedExtensions(){return [...new Set(document.querySelector('#extensions').value.split(/[\\s,，]+/).filter(Boolean).map(value=>(value.startsWith('.')?value:'.'+value).toLowerCase()))];}
+async function saveServer(){if(!config)throw new Error('请先加载服务器配置');const payload={directories:config.directories,extensions:parsedExtensions()};const response=await fetch('/api/admin/config',{method:'PUT',headers:auth(),body:JSON.stringify(payload)});if(!response.ok)throw new Error(await errorText(response,'保存失败'));config=await response.json();showAdmin();message.textContent='全局服务器配置已保存；浏览器偏好未改变';}
+function formatSeconds(value){const seconds=Math.max(1,Math.round(Number(value)||0));return seconds<60?seconds+' 秒':Math.ceil(seconds/60)+' 分钟';}
+async function pollRebuild(){const response=await fetch('/api/status',{cache:'no-store'});if(!response.ok)return;if((await response.json()).refreshing){rebuildTimer=setTimeout(()=>pollRebuild().catch(report),2000);}else{message.textContent='索引后台重建完成';rebuildTimer=null;}}
+async function rebuild(){const statusResponse=await fetch('/api/status',{cache:'no-store'});const previous=statusResponse.ok?await statusResponse.json():{};const response=await fetch('/api/admin/rebuild',{method:'POST',headers:auth()});if(!response.ok)throw new Error(await errorText(response,'重建未启动'));const estimate=Number(previous.last_build_duration_seconds)||0;message.textContent='索引正在后台重建'+(estimate?'，预计约 '+formatSeconds(estimate):'，首次重建暂无预估时间');clearTimeout(rebuildTimer);rebuildTimer=setTimeout(()=>pollRebuild().catch(report),2000);}
+async function backup(){const response=await fetch('/api/admin/backup',{headers:auth()});if(!response.ok)throw new Error(await errorText(response,'备份下载失败'));const blob=await response.blob();const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download='openlist-image-api-backup.zip';link.click();setTimeout(()=>URL.revokeObjectURL(link.href),1000);message.textContent='配置备份已下载（不含 token）';}
 function report(error){message.textContent='操作失败：'+error.message;}
+document.querySelector('#save-device').onclick=()=>{try{savePreferences();}catch(error){visitorMessage.textContent='保存失败：'+error.message;}};
+document.querySelector('#reset-device').onclick=()=>{try{resetPreferences();}catch(error){visitorMessage.textContent='恢复失败：'+error.message;}};
 document.querySelector('#load').onclick=()=>load().catch(report);
 document.querySelector('#browse').onclick=()=>browse().catch(report);
-document.querySelector('#save').onclick=()=>save().catch(report);
+document.querySelector('#save-server').onclick=()=>saveServer().catch(report);
 document.querySelector('#rebuild').onclick=()=>rebuild().catch(report);
 document.querySelector('#backup').onclick=()=>backup().catch(report);
-loadVisitor().catch(error=>visitorMessage.textContent='访客配置加载失败：'+error.message);
+loadPreferences().catch(error=>visitorMessage.textContent='浏览偏好加载失败：'+error.message);
 </script>
 </body>
 </html>"""
 
+
 def make_handler(application: Application):
     class Handler(BaseHTTPRequestHandler):
-        server_version = "OpenListImageAPI/1.0"
+        server_version = "OpenListImageAPI/1.3"
+        protocol_version = "HTTP/1.1"
+
+        def setup(self) -> None:
+            super().setup()
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+        def _send_body(self, status: int, body: bytes, content_type: str, cache_control: str) -> None:
+            compressed = "gzip" in self.headers.get("Accept-Encoding", "").lower() and len(body) >= 1024
+            if compressed:
+                body = gzip.compress(body, compresslevel=5)
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", cache_control)
+            self.send_header("Vary", "Accept-Encoding")
+            if compressed:
+                self.send_header("Content-Encoding", "gzip")
+            self.end_headers()
+            self.wfile.write(body)
 
         def _send_json(self, status: int, payload: dict[str, Any]) -> None:
-            body = json_bytes(payload)
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_body(status, json_bytes(payload), "application/json; charset=utf-8", "no-store")
 
         def _send_html(self, html: str) -> None:
-            body = html.encode("utf-8")
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_body(
+                HTTPStatus.OK,
+                html.encode("utf-8"),
+                "text/html; charset=utf-8",
+                "public, max-age=60, stale-while-revalidate=300",
+            )
 
         def _send_attachment(self, filename: str, body: bytes) -> None:
             self.send_response(HTTPStatus.OK)
@@ -808,6 +917,7 @@ def make_handler(application: Application):
                     url = application.resolve_images(images)[0]["url"]
                     self.send_response(HTTPStatus.FOUND)
                     self.send_header("Location", url)
+                    self.send_header("Content-Length", "0")
                     self.send_header("Cache-Control", "no-store")
                     if parsed.path == "/download":
                         self.send_header("Content-Disposition", "attachment")
@@ -865,9 +975,15 @@ def make_handler(application: Application):
     return Handler
 
 
+class ConcurrentHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 128
+    allow_reuse_address = True
+
+
 def command_serve(config_path: Path) -> None:
     application = Application(config_path)
-    server = ThreadingHTTPServer((application.config["listen_host"], application.config["listen_port"]), make_handler(application))
+    server = ConcurrentHTTPServer((application.config["listen_host"], application.config["listen_port"]), make_handler(application))
     logging.info("Listening on %s:%d", application.config["listen_host"], application.config["listen_port"])
     try:
         server.serve_forever()

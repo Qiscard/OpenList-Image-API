@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 GITHUB_REPOSITORY="Qiscard/OpenList-Image-API"
 GITEE_REPOSITORY="qiscard/OpenList-Image-API"
-RELEASE_REF="v1.2.1"
+RELEASE_REF="v1.3.0"
 UPDATE_REF="main"
 APP_DIR="/opt/openlist-image-api"
 CONFIG_DIR="/etc/openlist-image-api"
@@ -87,9 +87,9 @@ create_default_config() {
   "delivery": "preview",
   "caption_mode": "path",
   "grid_gap": 12,
-  "grid_scale": 125,
-  "url_cache_size": 200,
-  "url_cache_ttl_seconds": 240,
+  "grid_scale": 150,
+  "url_cache_size": 1000,
+  "url_cache_ttl_seconds": 1800,
   "admin_token_file": "${CONFIG_DIR}/admin.token"
 }
 EOF
@@ -108,6 +108,31 @@ if data.get("listen_host") == "127.0.0.1":
     data["listen_host"] = "0.0.0.0"
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print("[openlist-image-api] migrated listen_host to 0.0.0.0 for NAT/public access")
+PY
+}
+
+migrate_performance_defaults() {
+  [[ -f "${CONFIG_DIR}/config.json" ]] || return
+  python3 - "${CONFIG_DIR}/config.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+data = json.loads(path.read_text(encoding="utf-8"))
+legacy_defaults = {
+    "grid_scale": (125, 150),
+    "url_cache_size": (200, 1000),
+    "url_cache_ttl_seconds": (240, 1800),
+}
+changed = []
+for key, (old_value, new_value) in legacy_defaults.items():
+    if data.get(key) == old_value:
+        data[key] = new_value
+        changed.append(key)
+if changed:
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print("[openlist-image-api] migrated performance defaults: " + ", ".join(changed))
 PY
 }
 
@@ -304,6 +329,7 @@ install_image_api() {
   install -m 0644 "${temporary}/VERSION" "${APP_DIR}/VERSION"
   create_default_config
   migrate_listen_host
+  migrate_performance_defaults
   create_admin_token
   chown -R "${SERVICE_USER}:${SERVICE_USER}" "${CONFIG_DIR}" "${STATE_DIR}"
   chmod 0700 "${CONFIG_DIR}"
