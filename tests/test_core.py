@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from openlist_image_api import (  # noqa: E402
     Application,
+    admin_token_from_headers,
     IndexRepository,
     UrlCache,
     is_loopback_openlist_url,
@@ -30,6 +31,11 @@ class ConfigurationTests(unittest.TestCase):
         self.assertTrue(is_loopback_openlist_url("http://localhost:5244"))
         self.assertFalse(is_loopback_openlist_url("https://example.invalid"))
         self.assertFalse(is_loopback_openlist_url("http://not-local.invalid:5244"))
+
+    def test_admin_token_header_accepts_webui_and_legacy_names(self) -> None:
+        self.assertEqual(admin_token_from_headers({"X-OpenList-Admin-Token": "webui-token"}), "webui-token")
+        self.assertEqual(admin_token_from_headers({"X-Admin-Token": "legacy-token"}), "legacy-token")
+        self.assertIsNone(admin_token_from_headers({"X-OpenList-Admin-Token": ""}))
 
     def test_configuration_allows_nat_listener_and_validates_gallery_options(self) -> None:
         defaults = validate_config({})

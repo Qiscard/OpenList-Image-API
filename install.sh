@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 GITHUB_REPOSITORY="Qiscard/OpenList-Image-API"
 GITEE_REPOSITORY="qiscard/OpenList-Image-API"
-RELEASE_REF="v1.2.0"
+RELEASE_REF="v1.2.1"
 UPDATE_REF="main"
 APP_DIR="/opt/openlist-image-api"
 CONFIG_DIR="/etc/openlist-image-api"

@@ -16,13 +16,13 @@
 使用固定版本安装器（GitHub）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Qiscard/OpenList-Image-API/v1.2.0/install.sh | sudo bash -s -- --source github
+curl -fsSL https://raw.githubusercontent.com/Qiscard/OpenList-Image-API/v1.2.1/install.sh | sudo bash -s -- --source github
 ```
 
 使用固定版本安装器（Gitee）：
 
 ```bash
-curl -fsSL https://gitee.com/qiscard/OpenList-Image-API/raw/v1.2.0/install.sh | sudo bash -s -- --source gitee
+curl -fsSL https://gitee.com/qiscard/OpenList-Image-API/raw/v1.2.1/install.sh | sudo bash -s -- --source gitee
 ```
 
 `--source auto` 会优先使用 Gitee，失败时回退到 GitHub。安装器会校验固定标签中的 `install.sh`、两个 Python 文件和版本文件的 SHA-256，然后创建图片 API 服务与全局管理命令。
@@ -37,19 +37,13 @@ sudo openlist-image-api
 
 1. 安装/部署 OpenList：选择直连下载（默认）或自动测速镜像。
 2. 保存 OpenList API token（仅保存在本机受限文件中）。
-3. 设置 OpenList 本地 API 端口。
-4. 浏览并多选 OpenList 虚拟目录。
-5. 设置 WebUI 视图与阅览方式。
-6. 设置图片 API 端口，并在保存前检查端口占用。
-7. 设置 API 监听范围：全部网络接口或仅本机回环。
-8. 启动图片 API 服务。
-9. 重启图片 API 服务。
-10. 在后台重建图片索引，基于上次记录显示预计耗时。
-11. 查看服务、索引、监听范围和最近重建耗时。
-12. 显示 WebUI 管理令牌。
-13. 检测并停用、清理旧随机图片 API 残留。
-14. 更新图片 API：拉取 `main` 分支中的最新安装脚本与程序，校验 SHA-256 后恢复更新前的服务启用/运行状态。
-15. 卸载：可选择仅删除图片 API，或完全删除图片 API 与本项目安装的 OpenList。
+3. 设置图片 API 端口，并在保存前检查端口占用。
+4. 图片 API 服务管理：设置监听范围、启动、停止或重启服务。
+5. 在后台重建图片索引，基于上次记录显示预计耗时。
+6. 查看服务、索引、监听范围、最近重建耗时和 WebUI 管理令牌。
+7. 维护工具：更新图片 API、卸载，或清理旧 API 残留与运行缓存。
+
+图片目录、视图、阅览方式、图片文字、网格间距和展示比例统一在 WebUI 中配置。WebUI 的管理令牌就是 TUI 菜单 6 显示的令牌，可直接粘贴到 `/admin` 页面加载完整配置。
 
 OpenList 的镜像测速候选为：
 

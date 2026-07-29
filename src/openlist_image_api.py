@@ -156,6 +156,11 @@ def write_secret(path: Path, value: str) -> None:
     os.replace(temporary, path)
 
 
+def admin_token_from_headers(headers: Any) -> str | None:
+    token = headers.get("X-OpenList-Admin-Token") or headers.get("X-Admin-Token")
+    return token if isinstance(token, str) and token else None
+
+
 class OpenListClient:
     def __init__(self, config: dict[str, Any]):
         self.base_url = config["openlist_api_url"].rstrip("/")
@@ -758,7 +763,7 @@ def make_handler(application: Application):
 
         def _admin_required(self) -> bool:
             try:
-                allowed = application.is_admin(self.headers.get("X-Admin-Token"))
+                allowed = application.is_admin(admin_token_from_headers(self.headers))
             except RuntimeError:
                 allowed = False
             if not allowed:

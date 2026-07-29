@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import io
 import json
 import sys
@@ -95,6 +96,22 @@ class TuiManagementTests(unittest.TestCase):
             ):
                 openlist_tui.uninstall_application()
         run_command.assert_called_once_with(["bash", str(installer), "--uninstall", "api"])
+
+    def test_service_management_can_stop_image_api(self) -> None:
+        with (
+            patch.object(openlist_tui, "require_root"),
+            patch("builtins.input", side_effect=["3", "", "0"]),
+            patch.object(openlist_tui, "run") as run_command,
+        ):
+            openlist_tui.service_management()
+        run_command.assert_called_once_with(["systemctl", "stop", openlist_tui.SERVICE_NAME])
+
+    def test_main_menu_uses_grouped_actions(self) -> None:
+        menu_source = inspect.getsource(openlist_tui.main_menu)
+        self.assertIn('"4": service_management', menu_source)
+        self.assertIn('"6": show_status_with_admin_token', menu_source)
+        self.assertIn('"7": maintenance_menu', menu_source)
+        self.assertNotIn('"12": print_admin_token', menu_source)
 
 
 class InstallerTests(unittest.TestCase):
