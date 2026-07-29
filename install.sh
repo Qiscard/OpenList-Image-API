@@ -2,14 +2,18 @@
 # OpenList Image API bootstrap installer. Run as root on a systemd-based Linux host.
 set -Eeuo pipefail
 
-REPOSITORY="Qiscard/OpenList-Image-API"
-RELEASE_REF="v1.0.0"
+GITHUB_REPOSITORY="Qiscard/OpenList-Image-API"
+GITEE_REPOSITORY="qiscard/OpenList-Image-API"
+RELEASE_REF="v1.0.1"
 APP_DIR="/opt/openlist-image-api"
 CONFIG_DIR="/etc/openlist-image-api"
 STATE_DIR="/var/lib/openlist-image-api"
 SERVICE_USER="openlist-image"
 SERVICE_NAME="openlist-image-api"
-RAW_BASE="https://raw.githubusercontent.com/${REPOSITORY}/${RELEASE_REF}"
+SOURCE="auto"
+OPENLIST_GH_PROXY=""
+GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${RELEASE_REF}"
+GITEE_RAW_BASE="https://gitee.com/${GITEE_REPOSITORY}/raw/${RELEASE_REF}"
 
 log() { printf '[openlist-image-api] %s\n' "$*"; }
 fail() { printf '[openlist-image-api] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -22,11 +26,34 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
 }
 
+fetch_from() {
+  local base="$1"
+  local remote_path="$2"
+  local local_path="$3"
+  curl --fail --location --silent --show-error --retry 2 --connect-timeout 15 \
+    "${base}/${remote_path}" --output "${local_path}"
+}
+
 download() {
   local remote_path="$1"
   local local_path="$2"
-  curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
-    "${RAW_BASE}/${remote_path}" --output "${local_path}"
+  case "${SOURCE}" in
+    github)
+      fetch_from "${GITHUB_RAW_BASE}" "${remote_path}" "${local_path}"
+      ;;
+    gitee)
+      fetch_from "${GITEE_RAW_BASE}" "${remote_path}" "${local_path}"
+      ;;
+    auto)
+      if ! fetch_from "${GITEE_RAW_BASE}" "${remote_path}" "${local_path}"; then
+        log "Gitee source unavailable; falling back to GitHub"
+        fetch_from "${GITHUB_RAW_BASE}" "${remote_path}" "${local_path}"
+      fi
+      ;;
+    *)
+      fail "invalid source: ${SOURCE}"
+      ;;
+  esac
 }
 
 create_service_user() {
@@ -107,7 +134,12 @@ install_openlist() {
   log "downloading the official OpenList v4 installer"
   curl --fail --location --silent --show-error --retry 3 \
     "https://res.oplist.org/script/v4.sh" --output "${temporary}/install-openlist-v4.sh"
-  bash "${temporary}/install-openlist-v4.sh"
+  if [[ -n "${OPENLIST_GH_PROXY}" ]]; then
+    [[ "${OPENLIST_GH_PROXY}" == https://*/ ]] || fail "OpenList GitHub proxy must use https and end with /"
+    GH_PROXY="${OPENLIST_GH_PROXY}" bash "${temporary}/install-openlist-v4.sh"
+  else
+    bash "${temporary}/install-openlist-v4.sh"
+  fi
 }
 
 uninstall() {
@@ -120,28 +152,64 @@ uninstall() {
   log "Image API removed. OpenList itself was not removed."
 }
 
+usage() {
+  cat <<USAGE
+Usage: sudo bash install.sh [options]
+
+Options:
+  --source github|gitee|auto  Select the source for this project (default: auto)
+  --install-openlist          Run the official OpenList v4 installer
+  --openlist-proxy URL        GitHub proxy passed to the official OpenList installer
+  --uninstall                 Remove only this Image API installation
+USAGE
+}
+
 main() {
   require_root
   require_command curl
   require_command python3
   require_command sha256sum
 
-  case "${1:-}" in
-    --install-openlist)
+  local action="install"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --source)
+        [[ $# -ge 2 ]] || fail "--source requires a value"
+        SOURCE="$2"
+        shift 2
+        ;;
+      --install-openlist)
+        action="install-openlist"
+        shift
+        ;;
+      --openlist-proxy)
+        [[ $# -ge 2 ]] || fail "--openlist-proxy requires a URL"
+        OPENLIST_GH_PROXY="$2"
+        shift 2
+        ;;
+      --uninstall)
+        action="uninstall"
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        fail "unknown option: $1"
+        ;;
+    esac
+  done
+
+  case "${SOURCE}" in github|gitee|auto) ;; *) fail "--source must be github, gitee, or auto" ;; esac
+  case "${action}" in
+    install-openlist)
       install_openlist
       exit 0
       ;;
-    --uninstall)
+    uninstall)
       uninstall
       exit 0
-      ;;
-    ""|--install)
-      ;;
-    *)
-      cat <<USAGE
-Usage: sudo bash install.sh [--install | --install-openlist | --uninstall]
-USAGE
-      exit 2
       ;;
   esac
 
@@ -173,7 +241,7 @@ USAGE
   systemctl daemon-reload
   systemctl enable --now "${SERVICE_NAME}"
 
-  log "installation complete"
+  log "installation complete from ${SOURCE} source"
   log "run: sudo openlist-image-api"
   log "the API and WebUI listen on the local machine by default"
   log "set the OpenList token and choose image directories in the TUI before rebuilding the index"

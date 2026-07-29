@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hmac
+import io
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ import random
 import secrets
 import threading
 import time
+import zipfile
 from collections import OrderedDict, deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -346,6 +348,26 @@ class Application:
         self.reload_config()
         return self.admin_config()
 
+    def create_config_backup(self) -> bytes:
+        backup = {
+            "schema_version": 1,
+            "exported_at": int(time.time()),
+            "config": {
+                "listen_port": self.config["listen_port"],
+                "openlist_api_url": self.config["openlist_api_url"],
+                "directories": self.config["directories"],
+                "extensions": self.config["extensions"],
+                "view_layout": self.config["view_layout"],
+                "delivery": self.config["delivery"],
+                "url_cache_size": self.config["url_cache_size"],
+                "url_cache_ttl_seconds": self.config["url_cache_ttl_seconds"],
+            },
+        }
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("openlist-image-api-config.json", json.dumps(backup, ensure_ascii=False, indent=2) + "\n")
+        return output.getvalue()
+
     def is_admin(self, supplied_token: str | None) -> bool:
         if not supplied_token:
             return False
@@ -463,13 +485,14 @@ document.querySelector('#refresh').onclick=load;load().catch(error=>statusEl.tex
 
 
 def admin_html() -> str:
-    return """<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>OpenList 图片管理</title><style>body{max-width:880px;margin:30px auto;padding:0 18px;background:#10131a;color:#e7edf7;font:15px system-ui,sans-serif}section{background:#171c27;border-radius:10px;padding:18px;margin:15px 0}input,select,button{padding:8px;border-radius:6px;border:1px solid #445069;background:#10131a;color:#e7edf7}button{background:#4b8cff;border:0;cursor:pointer}.row{display:flex;gap:8px;flex-wrap:wrap}.directory{display:block;padding:7px 0;border-bottom:1px solid #293040}.muted{color:#a9b7cd}</style></head><body><h1>OpenList 图片管理</h1><p class=\"muted\">输入管理令牌后才能读取或修改配置。</p><section><div class=\"row\"><input id=\"token\" type=\"password\" placeholder=\"管理令牌\"><button id=\"load\">加载配置</button></div></section><section><h2>图片目录（可多选）</h2><div class=\"row\"><input id=\"path\" value=\"/\" aria-label=\"目录\"><button id=\"browse\">浏览目录</button></div><div id=\"directories\"></div><h3>已选择</h3><div id=\"selected\"></div></section><section><h2>浏览方式</h2><div class=\"row\"><label>视图 <select id=\"layout\"><option value=\"single\">单张</option><option value=\"grid\">多张网格</option><option value=\"waterfall\">瀑布流</option></select></label><label>阅览 <select id=\"delivery\"><option value=\"preview\">直接预览</option><option value=\"download\">下载预览</option></select></label><button id=\"save\">保存配置</button><button id=\"rebuild\">重建索引</button></div><p id=\"message\" class=\"muted\"></p></section><script>
+    return """<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>OpenList 图片管理</title><style>body{max-width:880px;margin:30px auto;padding:0 18px;background:#10131a;color:#e7edf7;font:15px system-ui,sans-serif}section{background:#171c27;border-radius:10px;padding:18px;margin:15px 0}input,select,button{padding:8px;border-radius:6px;border:1px solid #445069;background:#10131a;color:#e7edf7}button{background:#4b8cff;border:0;cursor:pointer}.row{display:flex;gap:8px;flex-wrap:wrap}.directory{display:block;padding:7px 0;border-bottom:1px solid #293040}.muted{color:#a9b7cd}</style></head><body><h1>OpenList 图片管理</h1><p class=\"muted\">输入管理令牌后才能读取或修改配置。</p><section><div class=\"row\"><input id=\"token\" type=\"password\" placeholder=\"管理令牌\"><button id=\"load\">加载配置</button></div></section><section><h2>图片目录（可多选）</h2><div class=\"row\"><input id=\"path\" value=\"/\" aria-label=\"目录\"><button id=\"browse\">浏览目录</button></div><div id=\"directories\"></div><h3>已选择</h3><div id=\"selected\"></div></section><section><h2>浏览方式</h2><div class=\"row\"><label>视图 <select id=\"layout\"><option value=\"single\">单张</option><option value=\"grid\">多张网格</option><option value=\"waterfall\">瀑布流</option></select></label><label>阅览 <select id=\"delivery\"><option value=\"preview\">直接预览</option><option value=\"download\">下载预览</option></select></label><button id=\"save\">保存配置</button><button id=\"rebuild\">重建索引</button><button id=\"backup\">下载配置备份</button></div><p id=\"message\" class=\"muted\"></p></section><script>
 let config={directories:[]};const message=document.querySelector('#message');const auth=()=>({'X-Admin-Token':document.querySelector('#token').value,'Content-Type':'application/json'});function showSelected(){const root=document.querySelector('#selected');root.replaceChildren(...config.directories.map(path=>{const row=document.createElement('div');row.className='directory';const remove=document.createElement('button');remove.textContent='移除';remove.onclick=()=>{config.directories=config.directories.filter(item=>item!==path);showSelected()};row.append(document.createTextNode(path+' '),remove);return row;}));}
 async function load(){const response=await fetch('/api/admin/config',{headers:auth()});if(!response.ok)throw new Error('令牌无效或服务不可用');config=await response.json();document.querySelector('#layout').value=config.view_layout;document.querySelector('#delivery').value=config.delivery;showSelected();message.textContent='配置已加载';}
 async function browse(){const path=document.querySelector('#path').value;const response=await fetch('/api/admin/directories?path='+encodeURIComponent(path),{headers:auth()});if(!response.ok)throw new Error('无法列出目录');const data=await response.json();const root=document.querySelector('#directories');root.replaceChildren(...data.directories.map(item=>{const row=document.createElement('label');row.className='directory';const check=document.createElement('input');check.type='checkbox';check.checked=config.directories.includes(item.path);check.onchange=()=>{if(check.checked&&!config.directories.includes(item.path))config.directories.push(item.path);if(!check.checked)config.directories=config.directories.filter(path=>path!==item.path);showSelected()};row.append(check,document.createTextNode(' '+item.name+' ('+item.path+')'));return row;}));}
 async function save(){const payload={directories:config.directories,view_layout:document.querySelector('#layout').value,delivery:document.querySelector('#delivery').value};const response=await fetch('/api/admin/config',{method:'PUT',headers:auth(),body:JSON.stringify(payload)});if(!response.ok)throw new Error('保存失败');config=await response.json();showSelected();message.textContent='已保存';}
 async function rebuild(){const response=await fetch('/api/admin/rebuild',{method:'POST',headers:auth()});if(!response.ok)throw new Error('重建未启动');message.textContent='索引正在后台重建';}
-for(const [id,fn] of Object.entries({load,browse,save,rebuild}))document.querySelector('#'+id).onclick=()=>fn().catch(error=>message.textContent=error.message);
+async function backup(){const response=await fetch('/api/admin/backup',{headers:auth()});if(!response.ok)throw new Error('备份下载失败');const blob=await response.blob();const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download='openlist-image-api-backup.zip';link.click();setTimeout(()=>URL.revokeObjectURL(link.href),1000);message.textContent='配置备份已下载（不含 token）';}
+for(const [id,fn] of Object.entries({load,browse,save,rebuild,backup}))document.querySelector('#'+id).onclick=()=>fn().catch(error=>message.textContent=error.message);
 </script></body></html>"""
 
 
@@ -490,6 +513,15 @@ def make_handler(application: Application):
             body = html.encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_attachment(self, filename: str, body: bytes) -> None:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
@@ -548,6 +580,10 @@ def make_handler(application: Application):
                 if parsed.path == "/api/admin/config":
                     if self._admin_required():
                         return self._send_json(HTTPStatus.OK, application.admin_config())
+                    return
+                if parsed.path == "/api/admin/backup":
+                    if self._admin_required():
+                        return self._send_attachment("openlist-image-api-backup.zip", application.create_config_backup())
                     return
                 if parsed.path == "/api/admin/directories":
                     if not self._admin_required():
