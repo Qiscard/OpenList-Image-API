@@ -145,13 +145,8 @@ class IndexRepositoryTests(unittest.TestCase):
     def test_status_exposes_last_index_duration(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             application = Application.__new__(Application)
-            application.config = {
-                "view_layout": "single",
-                "delivery": "preview",
-                "caption_mode": "path",
-                "grid_gap": 12,
-                "grid_scale": 125,
-            }
+            application.config = validate_config({})
+            application.config["grid_scale"] = 125
             application.repository = IndexRepository(Path(temporary))
             application.cache = UrlCache(0, 0)
             application.refreshing = False

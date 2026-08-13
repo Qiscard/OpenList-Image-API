@@ -42,8 +42,33 @@ class AdminConfigurationTests(unittest.TestCase):
     def test_admin_config_only_exposes_global_server_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             application = Application(Path(temporary) / "config.json")
-            self.assertEqual(set(application.admin_config()), {"directories", "extensions", "caption_mode"})
-            self.assertEqual(set(application.visitor_config()), {"view_layout", "grid_gap", "caption_mode"})
+            self.assertEqual(
+                set(application.admin_config()),
+                {
+                    "directories",
+                    "caption_mode",
+                    "directory_display_enabled",
+                    "directory_display_depth",
+                    "announcement_enabled",
+                    "announcement_title",
+                    "announcement_content",
+                    "announcement_required_seconds",
+                    "announcement_version",
+                    "maintenance_enabled",
+                },
+            )
+            self.assertEqual(
+                set(application.visitor_config()),
+                {
+                    "view_layout",
+                    "grid_gap",
+                    "caption_mode",
+                    "directory_display_enabled",
+                    "directory_display_depth",
+                    "announcement",
+                    "maintenance_enabled",
+                },
+            )
             self.assertNotIn("delivery", application.visitor_config())
             self.assertNotIn("grid_scale", application.visitor_config())
             updated = application.update_admin_config({"caption_mode": "name"})
@@ -53,38 +78,58 @@ class AdminConfigurationTests(unittest.TestCase):
                 application.update_admin_config({"view_layout": "grid"})
             application.url_executor.shutdown(wait=True)
 
+    def test_announcement_version_bumps_on_content_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            application = Application(Path(temporary) / "config.json")
+            baseline = application.admin_config()["announcement_version"]
+            application.update_admin_config({"announcement_content": "新版公告"})
+            self.assertEqual(application.admin_config()["announcement_version"], baseline + 1)
+            application.update_admin_config({"caption_mode": "name"})
+            self.assertEqual(application.admin_config()["announcement_version"], baseline + 1)
+            application.url_executor.shutdown(wait=True)
+
 
 class WebUiMarkupTests(unittest.TestCase):
-    def test_gallery_uses_stable_waterfall_and_adaptive_three_column_grid(self) -> None:
+    def test_gallery_uses_slideshow_and_stable_waterfall(self) -> None:
         page = gallery_html()
         self.assertIn("requestImages(15)", page)
-        self.assertIn("requestImages(5)", page)
-        self.assertIn("singleImages", page)
+        self.assertIn("SLIDE_PRELOAD_COUNT=3", page)
+        self.assertIn("loadSlideshow", page)
         self.assertIn("document.documentElement.scrollHeight*.78", page)
-        self.assertIn("openlist-image-preferences-v1", page)
-        self.assertIn("grid-template-columns:repeat(3,minmax(0,1fr))", page)
+        self.assertIn("openlist-image-preferences-v2", page)
+        self.assertIn("openlist-image-announcement-v2-", page)
+        self.assertIn("grid-template-columns:repeat(3", page)
         self.assertIn("grid-auto-flow:dense", page)
         self.assertIn("grid-column:span 2", page)
-        self.assertIn("picture.naturalWidth/picture.naturalHeight>=1.45", page)
-        self.assertIn("column.className='waterfall-column'", page)
-        self.assertIn("columns[waterfallAppendIndex%columns.length].append(card)", page)
-        self.assertNotIn("columns:var(--grid-columns", page)
+        self.assertIn("naturalHeight>=1.45", page)
+        self.assertIn("waterfall-column", page)
+        self.assertIn("waterfallAppendIndex%columns.length", page)
         self.assertIn("preview.onclick=()=>openLightbox(image)", page)
-        self.assertIn("download.href=downloadUrl(image)", page)
-        self.assertNotIn("settings.delivery", page)
         self.assertIn("picture.fetchPriority='high'", page)
-
-    def test_admin_separates_device_preferences_from_server_config(self) -> None:
-        page = admin_html()
         self.assertIn("/api/public-config", page)
-        self.assertIn("openlist-image-preferences-v1", page)
-        self.assertIn("只保存在当前浏览器", page)
+        self.assertIn("设置仅保存在当前浏览器", page)
+        self.assertNotIn("settings.delivery", page)
+        self.assertNotIn("download.href=downloadUrl", page)
+        self.assertNotIn("openlist-image-preferences-v1", page)
+        self.assertNotIn("singleImages", page)
+
+    def test_admin_exposes_announcement_maintenance_and_directory_controls(self) -> None:
+        page = admin_html()
         self.assertIn("/api/admin/config", page)
-        self.assertIn("extensions:parsedExtensions()", page)
-        self.assertIn("caption_mode:document.querySelector('#caption').value", page)
+        self.assertIn("#default-caption", page)
+        self.assertIn("#directory-display-enabled", page)
+        self.assertIn("#directory-display-depth", page)
+        self.assertIn("#announcement-enabled", page)
+        self.assertIn("#announcement-title", page)
+        self.assertIn("#announcement-content", page)
+        self.assertIn("#announcement-required-seconds", page)
+        self.assertIn("#maintenance-enabled", page)
+        self.assertIn("refresh-directory-cache", page)
+        self.assertIn("预计约", page)
         self.assertNotIn("id=\"delivery\"", page)
         self.assertNotIn("id=\"scale\"", page)
-        self.assertIn("预计约", page)
+        self.assertNotIn("extensions:parsedExtensions()", page)
+        self.assertNotIn("id=\"caption\"", page)
 
 
 class DownloadTests(unittest.TestCase):
@@ -107,6 +152,11 @@ class DownloadTests(unittest.TestCase):
         upstream_thread.start()
 
         class FakeApplication:
+            config = {"maintenance_enabled": False}
+
+            def is_admin(self, supplied_token: object) -> bool:
+                return True
+
             def indexed_image(self, path: str) -> dict[str, object]:
                 return {"path": path, "size": len(body)}
 
