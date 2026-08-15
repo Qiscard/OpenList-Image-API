@@ -47,7 +47,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(defaults["caption_mode"], "path")
         self.assertEqual(defaults["grid_gap"], 12)
         self.assertEqual(defaults["grid_scale"], 150)
-        self.assertEqual(defaults["url_cache_size"], 1000)
+        self.assertEqual(defaults["url_cache_size"], 0)
         self.assertEqual(defaults["url_cache_ttl_seconds"], 1800)
         self.assertEqual(validate_config({"listen_host": "0.0.0.0"})["listen_host"], "0.0.0.0")
         configured = validate_config({"caption_mode": "name", "grid_gap": 0, "grid_scale": 200})
@@ -69,11 +69,11 @@ class UrlCacheConcurrencyTests(unittest.TestCase):
                 self.calls = 0
                 self.lock = threading.Lock()
 
-            def resolve_file(self, path: str) -> str:
+            def resolve_file(self, path: str) -> tuple[str, str]:
                 with self.lock:
                     self.calls += 1
                 time.sleep(0.05)
-                return "https://example.invalid" + path
+                return "https://example.invalid" + path, "https://example.invalid/thumb" + path
 
         client = Client()
         cache = UrlCache(100, 60)
@@ -83,6 +83,81 @@ class UrlCacheConcurrencyTests(unittest.TestCase):
         self.assertEqual(len(set(urls)), 1)
         self.assertEqual(cache.status()["misses"], 1)
 
+    def test_disabled_cache_still_singleflights_same_path(self) -> None:
+        class Client:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.lock = threading.Lock()
+
+            def resolve_file(self, path: str) -> tuple[str, str]:
+                with self.lock:
+                    self.calls += 1
+                time.sleep(0.05)
+                return "https://example.invalid" + path, "https://example.invalid/thumb" + path
+
+        client = Client()
+        cache = UrlCache(0, 60)
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            urls = list(executor.map(lambda _: cache.resolve("/gallery/a.jpg", client), range(8)))
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(len(set(urls)), 1)
+        self.assertEqual(cache.status()["size"], 0)
+        self.assertEqual(cache.status()["misses"], 1)
+
+    def test_concurrent_refresh_shares_one_openlist_lookup(self) -> None:
+        class Client:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.lock = threading.Lock()
+
+            def resolve_file(self, path: str) -> tuple[str, str]:
+                with self.lock:
+                    self.calls += 1
+                time.sleep(0.05)
+                return "https://example.invalid" + path, "https://example.invalid/thumb" + path
+
+        client = Client()
+        cache = UrlCache(8, 60)
+        cache.resolve("/gallery/a.jpg", client)
+        self.assertEqual(client.calls, 1)
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            urls = list(executor.map(lambda _: cache.resolve("/gallery/a.jpg", client, refresh=True), range(6)))
+        self.assertEqual(client.calls, 2)
+        self.assertEqual(len(set(urls)), 1)
+
+    def test_prefetch_and_download_url_share_inflight(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+
+        class Client:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.lock = threading.Lock()
+
+            def resolve_file(self, path: str) -> tuple[str, str]:
+                with self.lock:
+                    self.calls += 1
+                started.set()
+                release.wait(1)
+                return "https://example.invalid" + path, "https://example.invalid/thumb" + path
+
+        client = Client()
+        cache = UrlCache(0, 60)
+        results: list[tuple[str, str]] = []
+
+        def prefetch() -> None:
+            results.append(cache.resolve("/gallery/a.jpg", client))
+
+        worker = threading.Thread(target=prefetch)
+        worker.start()
+        self.assertTrue(started.wait(1))
+        results.append(cache.resolve("/gallery/a.jpg", client))
+        release.set()
+        worker.join(1)
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0], results[1])
+
     def test_batch_url_resolution_runs_in_parallel(self) -> None:
         class SlowCache:
             def __init__(self) -> None:
@@ -90,7 +165,7 @@ class UrlCacheConcurrencyTests(unittest.TestCase):
                 self.maximum = 0
                 self.lock = threading.Lock()
 
-            def resolve(self, path: str, client: object) -> str:
+            def resolve(self, path: str, client: object) -> tuple[str, str]:
                 del client
                 with self.lock:
                     self.active += 1
@@ -98,7 +173,7 @@ class UrlCacheConcurrencyTests(unittest.TestCase):
                 time.sleep(0.04)
                 with self.lock:
                     self.active -= 1
-                return "https://example.invalid" + path
+                return "https://example.invalid" + path, "https://example.invalid/thumb" + path
 
         application = Application.__new__(Application)
         application.config = {

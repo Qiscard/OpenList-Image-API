@@ -49,12 +49,20 @@ class AdminConfigurationTests(unittest.TestCase):
                     "caption_mode",
                     "directory_display_enabled",
                     "directory_display_depth",
+                    "theme",
                     "announcement_enabled",
                     "announcement_title",
                     "announcement_content",
                     "announcement_required_seconds",
                     "announcement_version",
                     "maintenance_enabled",
+                    "tagging_enabled",
+                    "tagging_scope",
+                    "tagging_categories",
+                    "tagging_allow_custom",
+                    "tagging_sort_default",
+                    "filter_enabled",
+                    "log_level",
                 },
             )
             self.assertEqual(
@@ -65,8 +73,11 @@ class AdminConfigurationTests(unittest.TestCase):
                     "caption_mode",
                     "directory_display_enabled",
                     "directory_display_depth",
+                    "theme",
                     "announcement",
                     "maintenance_enabled",
+                    "filter_enabled",
+                    "tagging",
                 },
             )
             self.assertNotIn("delivery", application.visitor_config())
@@ -92,10 +103,12 @@ class AdminConfigurationTests(unittest.TestCase):
 class WebUiMarkupTests(unittest.TestCase):
     def test_gallery_uses_slideshow_and_stable_waterfall(self) -> None:
         page = gallery_html()
-        self.assertIn("requestImages(15)", page)
+        self.assertIn("requestImages(WATERFALL_BATCH_SIZE)", page)
+        self.assertIn("WATERFALL_BATCH_SIZE=20", page)
         self.assertIn("SLIDE_PRELOAD_COUNT=3", page)
+        self.assertIn("SLIDE_INITIAL_LOAD=6", page)
         self.assertIn("loadSlideshow", page)
-        self.assertIn("document.documentElement.scrollHeight*.78", page)
+        self.assertIn("document.documentElement.scrollHeight*.6", page)
         self.assertIn("openlist-image-preferences-v2", page)
         self.assertIn("openlist-image-announcement-v2-", page)
         self.assertIn("grid-template-columns:repeat(3", page)
