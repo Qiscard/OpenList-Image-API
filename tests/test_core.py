@@ -190,6 +190,68 @@ class UrlCacheConcurrencyTests(unittest.TestCase):
         self.assertEqual(len(resolved), 8)
         self.assertGreater(application.cache.maximum, 1)
 
+    def test_indexed_images_scans_index_once(self) -> None:
+        class CountingRepository:
+            def __init__(self) -> None:
+                self.loads = 0
+
+            def load(self) -> dict[str, object]:
+                self.loads += 1
+                return {
+                    "images": [
+                        {"path": f"/gallery/{index}.jpg", "size": index}
+                        for index in range(8)
+                    ]
+                }
+
+        application = Application.__new__(Application)
+        application.repository = CountingRepository()
+        resolved = application.indexed_images(
+            ["/gallery/1.jpg", "/gallery/3.jpg", "/missing.jpg", "/gallery/3.jpg", "../bad"]
+        )
+        self.assertEqual(application.repository.loads, 1)
+        self.assertEqual(
+            [image["path"] for image in resolved],
+            ["/gallery/1.jpg", "/gallery/3.jpg", "/missing.jpg"],
+        )
+        self.assertTrue(resolved[2]["_missing"])
+        self.assertEqual(application.indexed_image("/gallery/1.jpg")["size"], 1)
+        with self.assertRaises(ValueError):
+            application.indexed_image("/missing.jpg")
+
+    def test_resolve_download_urls_truncates_and_keeps_missing_paths(self) -> None:
+        class FakeCache:
+            def resolve(self, path: str, client: object, refresh: bool = False) -> tuple[str, str]:
+                del client, refresh
+                if path.endswith("/fail.jpg"):
+                    raise RuntimeError("openlist unavailable")
+                return "https://example.invalid" + path, "https://example.invalid/thumb" + path
+
+        class FakeRepository:
+            def load(self) -> dict[str, object]:
+                return {"images": [{"path": "/gallery/ok.jpg", "size": 12}]}
+
+        application = Application.__new__(Application)
+        application.config = {
+            "openlist_api_url": "http://127.0.0.1:5244",
+            "openlist_token_file": "/tmp/openlist.token",
+        }
+        application.repository = FakeRepository()
+        application.cache = FakeCache()
+        application.url_executor = ThreadPoolExecutor(max_workers=4)
+        try:
+            paths = [f"/gallery/{index}.jpg" for index in range(51)] + ["/gallery/fail.jpg", "/gallery/ok.jpg"]
+            resolved = application.resolve_download_urls(paths)
+            self.assertEqual(len(resolved), 50)
+            self.assertTrue(all("url" in item or "error" in item for item in resolved))
+            missing = application.resolve_download_urls(["/gallery/missing.jpg", "/gallery/fail.jpg", "/gallery/ok.jpg"])
+            self.assertEqual(missing[0]["path"], "/gallery/missing.jpg")
+            self.assertIn("url", missing[0])
+            self.assertEqual(missing[1]["error"], "unable to resolve image URL")
+            self.assertEqual(missing[2]["url"], "https://example.invalid/gallery/ok.jpg")
+        finally:
+            application.url_executor.shutdown(wait=True)
+
     def test_non_cache_config_reload_preserves_url_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config_path = Path(temporary) / "config.json"

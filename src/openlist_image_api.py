@@ -1062,13 +1062,45 @@ class Application:
         return [random.choice(images) for _ in range(count)]
 
     def indexed_image(self, path: str) -> dict[str, Any]:
-        normalized = normalize_directory(path)
+        matches = self.indexed_images([path])
+        if not matches or matches[0].get("_missing"):
+            raise ValueError("image is not in the current index")
+        return {key: value for key, value in matches[0].items() if key != "_missing"}
+
+    def indexed_images(self, paths: list[str]) -> list[dict[str, Any]]:
+        wanted: list[str] = []
+        seen: set[str] = set()
+        for raw_path in paths:
+            try:
+                path = normalize_directory(str(raw_path))
+            except ValueError:
+                continue
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            wanted.append(path)
+        if not wanted:
+            return []
+        lookup: dict[str, dict[str, Any]] = {}
+        remaining = set(wanted)
         for image in self.repository.load().get("images", []):
-            if image.get("path") == normalized:
-                return image
-        raise ValueError("image is not in the current index")
+            path = str(image.get("path", ""))
+            if path in remaining:
+                lookup[path] = image
+                remaining.remove(path)
+                if not remaining:
+                    break
+        resolved = []
+        for path in wanted:
+            if path in lookup:
+                resolved.append(lookup[path])
+            else:
+                resolved.append({"path": path, "size": 0, "_missing": True})
+        return resolved
 
     def resolve_images(self, images: list[dict[str, Any]], refresh: bool = False, include_tags: bool = False) -> list[dict[str, Any]]:
+        if not images:
+            return []
         client = OpenListClient(self.config)
         paths = [str(image["path"]) for image in images]
         tag_stats = self.tags.stats(paths) if include_tags else {}
@@ -1082,11 +1114,30 @@ class Application:
                 result["tags"] = tag_stats.get(path, {"likes": 0, "dislikes": 0, "categories": []})
             return result
 
-        results = list(self.url_executor.map(resolve, images))
+        results = [resolve(images[0])] if len(images) == 1 else list(self.url_executor.map(resolve, images))
         cache_hits = getattr(self.cache, "hits", 0)
         cache_misses = getattr(self.cache, "misses", 0)
         logging.debug("resolve_images: %d images in %.3fs (cache hits=%d misses=%d)", len(images), time.time() - started_at, cache_hits, cache_misses)
         return results
+
+    def resolve_download_urls(self, paths: list[str], refresh: bool = False) -> list[dict[str, Any]]:
+        images = self.indexed_images(paths[:50])
+        if not images:
+            return []
+        client = OpenListClient(self.config)
+
+        def resolve_one(image: dict[str, Any]) -> dict[str, Any]:
+            path = str(image["path"])
+            try:
+                url, thumb = self.cache.resolve(path, client, refresh=refresh)
+            except Exception:
+                logging.warning("Failed to resolve download URL for %s", path)
+                return {"path": path, "error": "unable to resolve image URL"}
+            return {"path": path, "url": url, "thumbnail": thumb or ""}
+
+        if len(images) == 1:
+            return [resolve_one(images[0])]
+        return list(self.url_executor.map(resolve_one, images))
 
     def resolve_images_lazy(self, images: list[dict[str, Any]], include_tags: bool = False) -> list[dict[str, Any]]:
         paths = [str(image["path"]) for image in images]
@@ -1328,10 +1379,12 @@ let tagCategoriesCache={};
 let slideHistorySequence=0;
 let waterfallLoading=false;
 let waterfallExhausted=false;
+let waterfallPrefetch=[];
+let waterfallPrefetching=false;
+let waterfallPrefetchToken=0;
 let loadedCount=0;
 let cardSequence=0;
 let waterfallColumnCount=0;
-let waterfallAppendIndex=0;
 let resizeTimer=null;
 const slidePreloads=new Map();
 const activePointers=new Map();
@@ -1506,14 +1559,43 @@ async function fetchJsonWithRetry(url,options={},attempts=3){
   throw lastError||new Error('请求失败');
 }
 
-async function refreshImageUrl(image,force=true){
-  const fresh=force?'&fresh=1':'';
-  const data=await fetchJsonWithRetry('/api/download-url?path='+encodeURIComponent(image.path)+fresh,{headers:adminHeaders()},2);
+function applyResolvedUrl(image,data){
+  if(!data||data.error||!data.url) return image;
   image.url=data.url;
   if(data.thumbnail) image.thumbnail=data.thumbnail;
   image._resolvedAt=Date.now();
   image.needs_url=false;
   return image;
+}
+
+async function refreshImageUrls(images,force=false){
+  const pending=images.filter(image=>image&&image.path&&(force||image.needs_url||!image.url||Date.now()-(image._resolvedAt||0)>URL_REFRESH_AGE_MS));
+  if(!pending.length) return images;
+  const data=await fetchJsonWithRetry('/api/download-url',{
+    method:'POST',
+    headers:{'Content-Type':'application/json',...adminHeaders()},
+    body:JSON.stringify({paths:pending.map(image=>image.path),fresh:!!force})
+  },2);
+  const lookup=new Map((data.images||[]).map(item=>[item.path,item]));
+  const failed=[];
+  for(const image of pending){
+    const resolved=lookup.get(image.path);
+    if(resolved&&resolved.url&&!resolved.error){
+      applyResolvedUrl(image,resolved);
+    }else{
+      failed.push(image);
+    }
+  }
+  if(failed.length){
+    await Promise.all(failed.map(image=>refreshImageUrl(image,force).catch(()=>{})));
+  }
+  return images;
+}
+
+async function refreshImageUrl(image,force=true){
+  const fresh=force?'&fresh=1':'';
+  const data=await fetchJsonWithRetry('/api/download-url?path='+encodeURIComponent(image.path)+fresh,{headers:adminHeaders()},2);
+  return applyResolvedUrl(image,data);
 }
 
 async function ensureFreshImage(image){
@@ -1662,12 +1744,20 @@ function createCard(image,eager=false){
   picture.alt='';
   picture.addEventListener('load',()=>card.classList.toggle('wide',picture.naturalWidth/picture.naturalHeight>=1.45),{once:true});
   attachImageRecovery(picture,image);
-  if(image.needs_url||!image.url){
-    card._ready=ensureFreshImage(image).then(()=>{picture.src=image.thumbnail||image.url;}).catch(()=>{});
-  }else{
-    picture.src=image.thumbnail||image.url;
-    card._ready=Promise.resolve();
-  }
+  const applySrc=()=>{
+    if(picture.dataset.srcApplied==='1') return card._ready||Promise.resolve();
+    picture.dataset.srcApplied='1';
+    if(image.needs_url||!image.url){
+      card._ready=ensureFreshImage(image).then(()=>{picture.src=image.thumbnail||image.url;}).catch(()=>{});
+    }else{
+      picture.src=image.thumbnail||image.url;
+      card._ready=Promise.resolve();
+    }
+    return card._ready;
+  };
+  card._applySrc=applySrc;
+  if(eager) applySrc();
+  else card._ready=Promise.resolve();
   preview.append(picture);
   card.append(preview);
   if(taggingConfig&&taggingConfig.enabled&&image.tags&&settings.show_tags_enabled){
@@ -1831,19 +1921,70 @@ function preferredWaterfallColumns(){
   return width>900?3:2;
 }
 
+function waterfallGap(){
+  return Number(settings&&settings.grid_gap)||12;
+}
+
+function estimatedCardHeight(card){
+  const picture=card.querySelector('img');
+  const columns=Math.max(1,waterfallColumnCount||preferredWaterfallColumns());
+  const columnWidth=Math.max(1,((gallery.clientWidth||window.innerWidth)-(columns-1)*waterfallGap())/columns);
+  if(picture&&picture.naturalWidth&&picture.naturalHeight) return columnWidth*picture.naturalHeight/picture.naturalWidth+waterfallGap();
+  return 180+waterfallGap();
+}
+
+function columnEstimateHeight(column){
+  return [...column.children].reduce((sum,card)=>sum+estimatedCardHeight(card),0);
+}
+
+function shortestWaterfallColumn(){
+  const columns=[...gallery.querySelectorAll('.waterfall-column')];
+  if(!columns.length) return null;
+  return columns.reduce((shortest,column)=>columnEstimateHeight(column)<columnEstimateHeight(shortest)?column:shortest);
+}
+
+function revealWaterfallCard(card,priority){
+  waterfallRevealObserver.unobserve(card);
+  const picture=card.querySelector('img');
+  if(!picture) return;
+  if(priority==='high'){picture.loading='eager';picture.fetchPriority='high';}
+  else if(priority==='auto'){picture.loading='eager';picture.fetchPriority='auto';}
+  if(card._applySrc) card._applySrc();
+}
+
+const waterfallRevealObserver=new IntersectionObserver((entries)=>{
+  entries.forEach(entry=>{
+    if(!entry.isIntersecting) return;
+    revealWaterfallCard(entry.target);
+  });
+},{rootMargin:'100% 0px',threshold:0.01});
+
+function prioritizeWaterfallImages(cards){
+  const limit=window.innerHeight*1.25;
+  const items=[...(cards||gallery.querySelectorAll('.card'))].map(card=>{
+    const rect=card.getBoundingClientRect();
+    return {card,top:rect.top,left:rect.left};
+  }).sort((left,right)=>left.top-right.top||left.left-right.left);
+  items.forEach((item,index)=>{
+    const picture=item.card.querySelector('img');
+    if(picture&&picture.dataset.srcApplied==='1') return;
+    if(item.top<limit) revealWaterfallCard(item.card,index<6?'high':'auto');
+    else waterfallRevealObserver.observe(item.card);
+  });
+}
+
 function appendWaterfallCard(card){
-  const columns=[...gallery.children];
-  columns[waterfallAppendIndex%columns.length].append(card);
-  waterfallAppendIndex+=1;
+  const column=shortestWaterfallColumn();
+  if(column) column.append(card);
 }
 
 function setupWaterfallColumns(){
   const count=preferredWaterfallColumns();
   const cards=[...gallery.querySelectorAll('.card')].sort((left,right)=>Number(left.dataset.sequence)-Number(right.dataset.sequence));
   waterfallColumnCount=count;
-  waterfallAppendIndex=0;
   gallery.replaceChildren(...Array.from({length:count},()=>{const column=document.createElement('div');column.className='waterfall-column';return column;}));
   cards.forEach(appendWaterfallCard);
+  prioritizeWaterfallImages(cards);
 }
 
 function applyGridStyle(){
@@ -1905,8 +2046,8 @@ async function appendSlideImages(count){
 async function ensureSlideBuffer(){
   const remaining=slideImages.length-slideIndex-1;
   if(remaining<SLIDE_PRELOAD_COUNT&&!slideExhausted) await appendSlideImages(SLIDE_PRELOAD_COUNT-remaining);
-  const buffered=slideImages.slice(slideIndex+1,slideIndex+1+SLIDE_PRELOAD_COUNT);
-  await Promise.allSettled(buffered.map(ensureFreshImage));
+  const upcoming=slideImages.slice(slideIndex,slideIndex+1+SLIDE_PRELOAD_COUNT);
+  await refreshImageUrls(upcoming,false).catch(()=>{});
   preloadUpcomingSlides();
 }
 
@@ -2018,21 +2159,50 @@ function previousSlide(){
   renderSlideshow();
 }
 
+function clearWaterfallPrefetch(){
+  waterfallPrefetch=[];
+  waterfallPrefetching=false;
+  waterfallPrefetchToken+=1;
+}
+
+async function prefetchNextWaterfallBatch(){
+  if(waterfallPrefetching||waterfallExhausted||waterfallPrefetch.length) return;
+  const token=waterfallPrefetchToken;
+  waterfallPrefetching=true;
+  try{
+    const images=await requestImages(WATERFALL_BATCH_SIZE);
+    if(token!==waterfallPrefetchToken) return;
+    if(!images.length){
+      waterfallExhausted=true;
+      return;
+    }
+    await refreshImageUrls(images,false).catch(()=>{});
+    if(token!==waterfallPrefetchToken) return;
+    waterfallPrefetch=images;
+  }catch(error){
+    if(token===waterfallPrefetchToken) waterfallPrefetch=[];
+  }finally{
+    if(token===waterfallPrefetchToken) waterfallPrefetching=false;
+  }
+}
+
 async function loadWaterfallBatch(reset){
   if(waterfallLoading) return;
   if(!reset&&waterfallExhausted) return;
   waterfallLoading=true;
   refreshButton.disabled=true;
   try{
-    const images=await requestImages(WATERFALL_BATCH_SIZE);
     if(reset){
+      clearWaterfallPrefetch();
+      waterfallRevealObserver.disconnect();
       loadedCount=0;
       cardSequence=0;
       waterfallExhausted=false;
       gallery.replaceChildren();
       setupWaterfallColumns();
     }
-    const initial=loadedCount===0;
+    let images=waterfallPrefetch.length?waterfallPrefetch.splice(0,waterfallPrefetch.length):await requestImages(WATERFALL_BATCH_SIZE);
+    await refreshImageUrls(images,false).catch(()=>{});
     if(!images.length){
       waterfallExhausted=true;
       if(loadedCount===0){
@@ -2046,12 +2216,14 @@ async function loadWaterfallBatch(reset){
         statusEl.textContent='瀑布流 · 已加载 '+loadedCount+' 张（已全部加载）';
       }
     }else{
-      const cards=images.map((image,index)=>createCard(image,initial&&index<2));
+      const cards=images.map(image=>createCard(image));
       cards.forEach(appendWaterfallCard);
+      prioritizeWaterfallImages(cards);
       loadedCount+=images.length;
       if(images.length<WATERFALL_BATCH_SIZE) waterfallExhausted=true;
       statusEl.textContent='瀑布流 · 已加载 '+loadedCount+' 张';
       await Promise.allSettled(cards.map(card=>card._ready||Promise.resolve()));
+      prefetchNextWaterfallBatch();
     }
   }catch(error){
     if(loadedCount===0){
@@ -2781,6 +2953,8 @@ def make_handler(application: Application):
 
         def do_POST(self) -> None:
             path = urlparse(self.path).path
+            if path == "/api/download-url":
+                return self._handle_download_urls()
             if path == "/api/tagging/vote":
                 return self._handle_tag_vote()
             if not self._admin_required():
@@ -2824,6 +2998,34 @@ def make_handler(application: Application):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
             except Exception:
                 logging.exception("Unhandled POST error")
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal server error"})
+
+        def _handle_download_urls(self) -> None:
+            if self._maintenance_access_required():
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= MAX_REQUEST_BODY:
+                    return self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid request body size"})
+                payload = json.loads(self.rfile.read(length))
+                if not isinstance(payload, dict):
+                    return self._send_json(HTTPStatus.BAD_REQUEST, {"error": "request body must be an object"})
+                raw_paths = payload.get("paths")
+                if not isinstance(raw_paths, list):
+                    return self._send_json(HTTPStatus.BAD_REQUEST, {"error": "paths must be an array"})
+                paths = [path for path in raw_paths if isinstance(path, str) and path]
+                if not paths:
+                    return self._send_json(HTTPStatus.OK, {"images": []})
+                refresh = payload.get("fresh")
+                if isinstance(refresh, str):
+                    refresh = refresh.lower() in {"1", "true", "yes"}
+                else:
+                    refresh = bool(refresh)
+                return self._send_json(HTTPStatus.OK, {"images": application.resolve_download_urls(paths, refresh=refresh)})
+            except (ValueError, RuntimeError, json.JSONDecodeError) as error:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            except Exception:
+                logging.exception("Unhandled download-url POST error")
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal server error"})
 
         def _handle_tag_vote(self) -> None:

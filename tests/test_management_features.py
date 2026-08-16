@@ -12,7 +12,7 @@ from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -109,6 +109,10 @@ class WebUiMarkupTests(unittest.TestCase):
         self.assertIn("SLIDE_INITIAL_LOAD=6", page)
         self.assertIn("loadSlideshow", page)
         self.assertIn("document.documentElement.scrollHeight*.6", page)
+        self.assertIn("refreshImageUrls(images,false)", page)
+        self.assertIn("prefetchNextWaterfallBatch()", page)
+        self.assertIn("method:'POST'", page)
+        self.assertIn("body:JSON.stringify({paths:pending.map(image=>image.path),fresh:!!force})", page)
         self.assertIn("openlist-image-preferences-v2", page)
         self.assertIn("openlist-image-announcement-v2-", page)
         self.assertIn("grid-template-columns:repeat(3", page)
@@ -116,7 +120,9 @@ class WebUiMarkupTests(unittest.TestCase):
         self.assertIn("grid-column:span 2", page)
         self.assertIn("naturalHeight>=1.45", page)
         self.assertIn("waterfall-column", page)
-        self.assertIn("waterfallAppendIndex%columns.length", page)
+        self.assertIn("shortestWaterfallColumn", page)
+        self.assertIn("prioritizeWaterfallImages", page)
+        self.assertIn("waterfallRevealObserver", page)
         self.assertIn("preview.onclick=()=>openLightbox(image)", page)
         self.assertIn("picture.fetchPriority='high'", page)
         self.assertIn("/api/public-config", page)
@@ -197,6 +203,55 @@ class DownloadTests(unittest.TestCase):
             server.server_close()
             upstream.shutdown()
             upstream.server_close()
+
+    def test_download_url_post_resolves_multiple_paths(self) -> None:
+        class FakeApplication:
+            config = {"maintenance_enabled": False}
+
+            def is_admin(self, supplied_token: object) -> bool:
+                del supplied_token
+                return True
+
+            def indexed_image(self, path: str) -> dict[str, object]:
+                return {"path": path, "size": 1}
+
+            def resolve_images(self, images: list[dict[str, object]], refresh: bool = False) -> list[dict[str, object]]:
+                del refresh
+                return [{"path": images[0]["path"], "url": "https://example.invalid" + str(images[0]["path"]), "thumbnail": ""}]
+
+            def resolve_download_urls(self, paths: list[str], refresh: bool = False) -> list[dict[str, object]]:
+                del refresh
+                return [
+                    {"path": path, "url": "https://example.invalid" + path, "thumbnail": "https://example.invalid/thumb" + path}
+                    for path in paths
+                ]
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(FakeApplication()))
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            request = Request(
+                f"http://127.0.0.1:{server.server_port}/api/download-url",
+                data=json.dumps({"paths": ["/gallery/a.jpg", "/gallery/b.jpg"], "fresh": False}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(request) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(response.status, 200)
+            self.assertEqual(
+                payload["images"],
+                [
+                    {"path": "/gallery/a.jpg", "url": "https://example.invalid/gallery/a.jpg", "thumbnail": "https://example.invalid/thumb/gallery/a.jpg"},
+                    {"path": "/gallery/b.jpg", "url": "https://example.invalid/gallery/b.jpg", "thumbnail": "https://example.invalid/thumb/gallery/b.jpg"},
+                ],
+            )
+            with urlopen(f"http://127.0.0.1:{server.server_port}/api/download-url?path=/gallery/a.jpg") as response:
+                single = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(single["url"], "https://example.invalid/gallery/a.jpg")
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 class TuiStatusTests(unittest.TestCase):
