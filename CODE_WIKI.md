@@ -339,7 +339,7 @@ CI 在 `push`/`pull_request` 触发，依次执行：`py_compile`、`unittest di
 
 [openlist_image_api.py:1488-1571](file:///e:/Other/Github/OpenList-Image-API/src/openlist_image_api.py#L1488-L1571)
 
-返回管理页 HTML：令牌输入、目录多选浏览器、图片文字/目录展示/公告/维护模式表单、目录缓存刷新、索引重建轮询、配置备份与恢复。所有管理请求附带 `X-OpenList-Admin-Token`。
+返回管理页 HTML：令牌输入、目录多选浏览器（实时读取 OpenList）、图片文字/目录展示/公告/维护模式表单、索引重建轮询、配置备份与恢复。所有管理请求附带 `X-OpenList-Admin-Token`。
 
 ### 5.8 TUI 关键函数
 
@@ -385,12 +385,11 @@ CI 在 `push`/`pull_request` 触发，依次执行：`py_compile`、`unittest di
 | POST | `/api/tagging/vote` | — | 提交点赞/踩或分类投票 |
 | GET | `/api/admin/config` | 管理令牌 | 读取可编辑服务器配置 |
 | GET | `/api/admin/backup` | 管理令牌 | 下载配置 ZIP |
-| GET | `/api/admin/directories?path=…` | 管理令牌 | 列出目录缓存子目录 |
+| GET | `/api/admin/directories?path=…` | 管理令牌 | 实时列出 OpenList 中该路径的子目录 |
 | GET | `/api/admin/logs?lines=…` | 管理令牌 | 读取最近 journalctl 服务日志 |
 | GET | `/api/admin/tagging/trash` | 管理令牌 | 查看垃圾桶标签下的图片 |
 | PUT | `/api/admin/config` | 管理令牌 | 保存全局服务器配置 |
-| POST | `/api/admin/rebuild` | 管理令牌 | 启动后台索引重建 |
-| POST | `/api/admin/directories/refresh` | 管理令牌 | 后台刷新目录缓存，`path=` 时只重建该目录 |
+| POST | `/api/admin/rebuild` | 管理令牌 | 启动后台图片索引重建 |
 | POST | `/api/admin/backup` | 管理令牌 | 上传 ZIP 恢复配置 |
 | POST | `/api/admin/tagging/reset?path=…` | 管理令牌 | 重置指定图片或全部标签数据 |
 | POST | `/api/admin/tagging/trash/delete` | 管理令牌 | 删除选中的垃圾桶图片 |
@@ -455,7 +454,7 @@ POST /api/admin/rebuild（或 TUI 菜单 5）
 - 输入管理令牌后 `GET /api/admin/config` 加载配置。
 - 目录多选：`GET /api/admin/directories` 浏览缓存，单击进入、双击添加。
 - 保存：`PUT /api/admin/config`；公告字段变化自动递增版本。
-- 目录缓存刷新：`POST /api/admin/directories/refresh`，`path=` 时只重建该目录，随后轮询 `/api/status`。
+- 目录多选：`GET /api/admin/directories` 实时读取 OpenList 目录树（不再依赖本地缓存），单击进入、双击添加。
 - 索引重建：`POST /api/admin/rebuild`，基于 `last_build_duration_seconds` 给出预估并轮询。
 - 标签配置：启用开关、投票范围、分类标签编辑、筛选开关；可重置单图或全部标签数据。
 - 垃圾桶：`GET /api/admin/tagging/trash` 查看待删除图片，`POST /api/admin/tagging/trash/delete` 删除选中图片。

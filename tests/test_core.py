@@ -8,11 +8,13 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from openlist_image_api import (  # noqa: E402
     Application,
+    OpenListClient,
     admin_token_from_headers,
     IndexRepository,
     UrlCache,
@@ -267,6 +269,35 @@ class UrlCacheConcurrencyTests(unittest.TestCase):
 
 
 class IndexRepositoryTests(unittest.TestCase):
+    def test_list_directories_reads_openlist_live(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            application = Application.__new__(Application)
+            application.config = validate_config({"directories": ["/gallery/sub"]})
+            application.repository = IndexRepository(Path(temporary))
+            entries = [
+                {"name": "b-folder", "is_dir": True},
+                {"name": "a-folder", "is_dir": True},
+                {"name": "image.jpg", "is_dir": False, "size": 10},
+                {"name": "nested", "is_dir": True},
+            ]
+            with mock.patch.object(OpenListClient, "list_directory", return_value=entries):
+                result = application.list_directories("/gallery")
+            self.assertEqual(
+                result,
+                [
+                    {"name": "a-folder", "path": "/gallery/a-folder"},
+                    {"name": "b-folder", "path": "/gallery/b-folder"},
+                    {"name": "nested", "path": "/gallery/nested"},
+                ],
+            )
+
+    def test_root_listing_falls_back_to_configured_directories_when_openlist_fails(self) -> None:
+        application = Application.__new__(Application)
+        application.config = validate_config({"directories": ["/gallery/sub"]})
+        with mock.patch.object(OpenListClient, "list_directory", side_effect=RuntimeError("down")):
+            result = application.list_directories("/")
+        self.assertEqual(result, [{"name": "sub", "path": "/gallery/sub"}])
+
     def test_index_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = IndexRepository(Path(temporary))

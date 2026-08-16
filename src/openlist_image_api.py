@@ -332,7 +332,7 @@ class IndexRepository:
         with self._lock:
             if not self.path.exists():
                 self._cache = None
-                return {"images": [], "directories": [], "directory_index": {}, "generated_at": 0, "directory_generated_at": 0, "errors": []}
+                return {"images": [], "directories": [], "generated_at": 0, "errors": []}
             try:
                 mtime = self.path.stat().st_mtime
                 if self._cache is not None and mtime == self._cache_mtime:
@@ -534,7 +534,6 @@ def build_index(config: dict[str, Any], repository: IndexRepository) -> dict[str
     queue: deque[str] = deque(config["directories"])
     visited: set[str] = set()
     images: list[dict[str, Any]] = []
-    directory_index: dict[str, list[dict[str, str]]] = {}
     errors: list[dict[str, str]] = []
 
     while queue:
@@ -548,14 +547,12 @@ def build_index(config: dict[str, Any], repository: IndexRepository) -> dict[str
             logging.warning("Skipping directory %s: %s", current, error)
             errors.append({"directory": current, "error": str(error)})
             continue
-        children: list[dict[str, str]] = []
         for entry in entries:
             name = str(entry.get("name") or "")
             if not name or "/" in name or "\\" in name:
                 continue
             path = join_virtual_path(current, name)
             if entry.get("is_dir"):
-                children.append({"name": name, "path": path})
                 queue.append(path)
             elif Path(name).suffix.lower() in extensions:
                 try:
@@ -563,15 +560,12 @@ def build_index(config: dict[str, Any], repository: IndexRepository) -> dict[str
                 except (TypeError, ValueError):
                     size = 0
                 images.append({"path": path, "size": size})
-        directory_index[current] = sorted(children, key=lambda item: item["name"].casefold())
 
     index = {
         "version": 2,
         "generated_at": int(time.time()),
-        "directory_generated_at": int(time.time()),
         "build_duration_seconds": round(time.time() - started_at, 2),
         "directories": config["directories"],
-        "directory_index": directory_index,
         "directory_count": len(visited),
         "image_count": len(images),
         "errors": errors,
@@ -579,40 +573,6 @@ def build_index(config: dict[str, Any], repository: IndexRepository) -> dict[str
     }
     repository.save(index)
     return index
-
-
-def build_directory_index(config: dict[str, Any]) -> dict[str, Any]:
-    client = OpenListClient(config)
-    queue: deque[str] = deque(config["directories"])
-    visited: set[str] = set()
-    directory_index: dict[str, list[dict[str, str]]] = {}
-    errors: list[dict[str, str]] = []
-    while queue:
-        current = queue.popleft()
-        if current in visited:
-            continue
-        visited.add(current)
-        try:
-            entries = client.list_directory(current)
-        except RuntimeError as error:
-            logging.warning("Skipping directory %s: %s", current, error)
-            errors.append({"directory": current, "error": str(error)})
-            continue
-        children: list[dict[str, str]] = []
-        for entry in entries:
-            name = str(entry.get("name") or "")
-            if not entry.get("is_dir") or not name or "/" in name or "\\" in name:
-                continue
-            path = join_virtual_path(current, name)
-            children.append({"name": name, "path": path})
-            queue.append(path)
-        directory_index[current] = sorted(children, key=lambda item: item["name"].casefold())
-    return {
-        "directory_index": directory_index,
-        "directory_count": len(visited),
-        "directory_generated_at": int(time.time()),
-        "directory_errors": errors,
-    }
 
 
 class _InflightResolve:
@@ -933,51 +893,6 @@ class Application:
         threading.Thread(target=worker, name="openlist-index-rebuild", daemon=True).start()
         return True
 
-    def start_directory_refresh(self) -> bool:
-        if not self.refresh_lock.acquire(blocking=False):
-            return False
-        self.refreshing = True
-
-        def worker() -> None:
-            try:
-                index = self.repository.load()
-                index.update(build_directory_index(self.config))
-                self.repository.save(index)
-                self.last_refresh_error = ""
-            except Exception as error:  # logged and visible through status
-                logging.exception("Directory cache refresh failed")
-                self.last_refresh_error = str(error)
-            finally:
-                self.refreshing = False
-                self.refresh_lock.release()
-
-        threading.Thread(target=worker, name="openlist-directory-refresh", daemon=True).start()
-        return True
-
-    def refresh_single_directory(self, path: str) -> dict[str, Any]:
-        directory = normalize_directory(path)
-        client = OpenListClient(self.config)
-        children: list[dict[str, str]] = []
-        new_paths: list[str] = []
-        for entry in client.list_directory(directory):
-            name = str(entry.get("name") or "")
-            if not entry.get("is_dir") or not name or "/" in name or "\\" in name:
-                continue
-            child_path = join_virtual_path(directory, name)
-            children.append({"name": name, "path": child_path})
-            new_paths.append(child_path)
-        children.sort(key=lambda item: item["name"].casefold())
-        index = self.repository.load()
-        directory_index = index.setdefault("directory_index", {})
-        old_children = {item.get("path") for item in directory_index.get(directory, []) if isinstance(item, dict)}
-        directory_index[directory] = children
-        for old_path in old_children:
-            if old_path not in new_paths:
-                directory_index.pop(old_path, None)
-        index["directory_generated_at"] = int(time.time())
-        self.repository.save(index)
-        return {"path": directory, "count": len(children), "directories": children}
-
     def status(self) -> dict[str, Any]:
         try:
             index = self.repository.load()
@@ -988,7 +903,6 @@ class Application:
             "image_count": len(index.get("images", [])),
             "directory_count": int(index.get("directory_count") or 0),
             "generated_at": int(index.get("generated_at") or 0),
-            "directory_generated_at": int(index.get("directory_generated_at") or 0),
             "last_build_duration_seconds": float(index.get("build_duration_seconds") or 0),
             "refreshing": self.refreshing,
             "last_refresh_error": self.last_refresh_error,
@@ -997,39 +911,28 @@ class Application:
         }
 
     def list_directories(self, path: str) -> list[dict[str, Any]]:
+        """List subdirectories of a virtual path live from OpenList."""
         directory = normalize_directory(path)
-        index = self.repository.load()
-        directory_index = index.get("directory_index")
-        if isinstance(directory_index, dict):
-            entries = directory_index.get(directory)
-            if isinstance(entries, list):
-                result = [item for item in entries if isinstance(item, dict) and isinstance(item.get("name"), str) and isinstance(item.get("path"), str)]
-                if result or directory != "/":
-                    return [self._enrich_directory(item, directory_index) for item in result]
-        if directory == "/":
-            try:
-                client = OpenListClient(self.config)
-                children: list[dict[str, Any]] = []
-                for entry in client.list_directory("/"):
-                    name = str(entry.get("name") or "")
-                    if not entry.get("is_dir") or not name or "/" in name or "\\" in name:
-                        continue
-                    child_path = "/" + name
-                    has_children = False
-                    if isinstance(directory_index, dict):
-                        has_children = bool(directory_index.get(child_path))
-                    children.append({"name": name, "path": child_path, "has_children": has_children})
-                return sorted(children, key=lambda item: item["name"].casefold())
-            except Exception:
-                roots = [{"name": item.rsplit("/", 1)[-1] or "/", "path": item} for item in self.config["directories"]]
-                return sorted([self._enrich_directory(item, directory_index if isinstance(directory_index, dict) else {}) for item in roots], key=lambda item: item["name"].casefold())
-        return []
-
-    @staticmethod
-    def _enrich_directory(item: dict[str, str], directory_index: dict[str, Any]) -> dict[str, Any]:
-        if "has_children" not in item:
-            item["has_children"] = bool(directory_index.get(item.get("path", "")))
-        return item
+        try:
+            entries = OpenListClient(self.config).list_directory(directory)
+        except Exception as error:
+            if directory != "/":
+                raise RuntimeError(f"unable to list directory {directory}: {error}") from error
+            roots = [{"name": item.rsplit("/", 1)[-1] or "/", "path": item} for item in self.config["directories"]]
+            return sorted(roots, key=lambda item: item["name"].casefold())
+        children: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for entry in entries:
+            name = str(entry.get("name") or "")
+            if not entry.get("is_dir") or not name or "/" in name or "\\" in name:
+                continue
+            child_path = join_virtual_path(directory, name)
+            if child_path in seen:
+                continue
+            seen.add(child_path)
+            children.append({"name": name, "path": child_path})
+        children.sort(key=lambda item: item["name"].casefold())
+        return children
 
     def choose_images(self, count: int, folder: str | None, min_size: int | None, max_size: int | None, tags: list[str] | None = None, filter_mode: str = "union") -> list[dict[str, Any]]:
         index = self.repository.load()
@@ -1261,6 +1164,17 @@ def gallery_html() -> str:
 </style>
 <style>
 .slide-history-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:7px}.slide-history-title{color:#a9b7cd;font-size:13px}.slide-history-latest{padding:6px 10px;background:#39445a;font-size:13px}
+#theme-fab{position:fixed;right:18px;bottom:18px;z-index:60;width:46px;height:46px;padding:0;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:20px;background:#171c27;border:1px solid #3a455b;color:#cdd6e8;cursor:pointer;box-shadow:0 6px 18px rgba(0,0,0,.35);transition:transform .15s ease,box-shadow .15s ease,border-color .15s ease}
+#theme-fab:hover{transform:translateY(-2px);box-shadow:0 10px 24px rgba(0,0,0,.45);border-color:#4b8cff}
+body.has-slide-history #theme-fab{bottom:132px}
+body.theme-light #theme-fab{background:#fff;border-color:#c8d1e0;color:#3a4252;box-shadow:0 6px 18px rgba(30,40,60,.18)}
+.card{transition:transform .18s ease,box-shadow .18s ease,border-color .18s ease}
+@media(hover:hover){.card:hover{transform:translateY(-3px);box-shadow:0 12px 28px rgba(0,0,0,.4);border-color:#4b8cff}}
+.preview-button{cursor:zoom-in}
+::-webkit-scrollbar{width:9px;height:9px}::-webkit-scrollbar-thumb{background:#39445a;border-radius:6px}::-webkit-scrollbar-thumb:hover{background:#4b5b78}::-webkit-scrollbar-track{background:transparent}
+body.theme-light ::-webkit-scrollbar-thumb{background:#c8d1e0}
+@media(max-width:760px){header{padding:10px 56px 10px 12px}header .spacer{display:none}header>button,header>a{display:none}#header-menu-toggle{display:block}}
+@media(max-width:560px){#theme-fab{right:12px;bottom:12px}body.has-slide-history #theme-fab{bottom:112px}.preferences{left:8px;right:8px;width:auto;top:auto;bottom:12px;transform:none;max-height:84vh;overflow:auto}.lightbox-foot{flex-wrap:wrap}.lightbox-meta{flex:1 1 100%}}
 </style>
 <style>
 .tag-bar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:8px 18px;border-bottom:1px solid #293040;background:#10131a;max-width:100%}.tag-bar-label{color:#a9b7cd;font-size:13px;margin-right:4px}.tag-chip{display:inline-flex;align-items:center;gap:4px;padding:4px 10px;border:1px solid #3a455b;border-radius:16px;background:#171c27;color:#cdd6e8;font-size:12px;cursor:pointer;transition:all .15s ease;user-select:none}.tag-chip:hover{border-color:#4b8cff;transform:translateY(-1px)}.tag-chip.active{background:#4b8cff;border-color:#4b8cff;color:#fff}.tag-chip-count{opacity:.7;font-size:11px}.tag-clear{padding:4px 10px;border:1px solid #3a455b;border-radius:16px;background:transparent;color:#a9b7cd;font-size:12px;cursor:pointer}.tag-clear:hover{color:#fff;border-color:#ff6b6b}.card-tags{position:absolute;bottom:0;left:0;right:0;display:flex;flex-wrap:wrap;gap:5px;padding:7px 10px;background:linear-gradient(transparent,rgba(0,0,0,.65));transition:opacity .2s ease;max-height:72px;overflow:hidden}@media(hover:hover){.card-tags{opacity:0}.card:hover .card-tags{opacity:1}.card.has-active-tag .card-tags{opacity:1}}.tag-vote{display:inline-flex;align-items:center;gap:4px;padding:4px 8px;border:1px solid #3a455b;border-radius:6px;background:rgba(255,255,255,.1);color:#fff;font-size:12px;cursor:pointer;transition:all .15s ease;user-select:none}.tag-vote:hover{border-color:#4b8cff;background:rgba(255,255,255,.16);transform:translateY(-1px)}.tag-vote.active{background:#ff4d6d;border-color:#ff4d6d;color:#fff}.tag-vote:disabled{opacity:.5;cursor:wait;transform:none}.tag-category{display:inline-flex;align-items:center;gap:3px;padding:4px 8px;border:1px solid #3a455b;border-radius:6px;background:rgba(255,255,255,.1);color:#fff;font-size:11px;cursor:pointer;transition:all .15s ease;user-select:none}.tag-category:hover{border-color:#4b8cff;background:rgba(255,255,255,.16);transform:translateY(-1px)}.tag-category.active{background:#4b8cff;border-color:#4b8cff;color:#fff}.tag-category.tag-trash{border-color:#5a3030;background:rgba(255,100,100,.12)}.tag-category.tag-trash:hover{border-color:#ff6b6b;background:rgba(255,100,100,.2);transform:translateY(-1px)}.tag-category.tag-trash.active{background:#ff4757;border-color:#ff4757;color:#fff}.tag-vote-count{font-weight:600;min-width:14px;text-align:center}
@@ -1303,8 +1217,9 @@ body.theme-light{color-scheme:light;background:#eef1f6;color:#1a2333}body.theme-
 <div id="preferences-backdrop" class="modal-backdrop hidden"></div>
 <section id="preferences" class="preferences hidden" aria-label="显示设置">
   <h2>显示设置</h2>
-  <label>主题<select id="theme-mode"><option value="dark">暗色</option><option value="light">浅色</option></select></label>
   <label>视图<select id="layout-mode"><option value="slideshow">幻灯片</option><option value="waterfall">瀑布流</option></select></label>
+  <label>图片画质（列表缩略图清晰度）<select id="preview-quality"><option value="176">极速（176px，流量最小）</option><option value="480">清晰（480px）</option><option value="800">高清（800px）</option><option value="1280">超清（1280px）</option><option value="2560">极清（2560px，流量最大）</option></select></label>
+  <label>大图画质（点击放大后的清晰度）<select id="lightbox-quality"><option value="original">原图（最清晰，加载较慢）</option><option value="2560">极清（2560px，推荐）</option><option value="1280">超清（1280px，最快）</option></select></label>
   <label>幻灯片自动播放间隔（秒，0 表示关闭）<input id="slideshow-interval" type="number" min="0" max="300" step="1"></label>
   <label>图片间距（0–48 px，仅瀑布流有效）<input id="grid-gap" type="number" min="0" max="48"></label>
   <label>图片名称样式<select id="caption-mode"><option value="path">完整路径</option><option value="name">仅图片名称</option><option value="hidden">不展示</option></select></label>
@@ -1318,6 +1233,7 @@ body.theme-light{color-scheme:light;background:#eef1f6;color:#1a2333}body.theme-
   <div class="announcement-main"><h2 id="announcement-title" class="announcement-title"></h2><div id="announcement-content" class="announcement-content"></div></div>
   <div class="announcement-footer"><p id="announcement-reading" class="meta"></p><div class="announcement-actions"><button id="announcement-close-once" type="button">本次关闭</button><button id="announcement-close-forever" type="button">不再显示</button></div></div>
 </section>
+<button id="theme-fab" type="button" title="切换明暗主题" aria-label="切换明暗主题">🌙</button>
 <script>
 const PREFERENCE_KEY='openlist-image-preferences-v2';
 const ANNOUNCEMENT_KEY_PREFIX='openlist-image-announcement-v2-';
@@ -1338,7 +1254,9 @@ const layoutMode=document.querySelector('#layout-mode');
 const slideshowInterval=document.querySelector('#slideshow-interval');
 const gridGap=document.querySelector('#grid-gap');
 const captionMode=document.querySelector('#caption-mode');
-const themeMode=document.querySelector('#theme-mode');
+const previewQuality=document.querySelector('#preview-quality');
+const lightboxQuality=document.querySelector('#lightbox-quality');
+const themeFab=document.querySelector('#theme-fab');
 const filterMode=document.querySelector('#filter-mode');
 const showTagsEnabled=document.querySelector('#show-tags-enabled');
 const slideHistoryPanel=document.querySelector('#slide-history');
@@ -1399,19 +1317,39 @@ let lastHiddenAt=0;
 let recoveryPromise=null;
 const URL_REFRESH_AGE_MS=25*60*1000;
 const IDLE_RECOVERY_MS=5*60*1000;
+const PREVIEW_QUALITY_OPTIONS=['176','480','800','1280','2560'];
+const LIGHTBOX_QUALITY_OPTIONS=['original','2560','1280'];
+function sizedThumb(url,size){
+  if(!url) return '';
+  if(/[?&]width=\d+/.test(url)) return url.replace(/([?&]width=)\d+/,'$1'+size).replace(/([?&]height=)\d+/,'$1'+size);
+  return url;
+}
+function cardSrc(image){
+  if(!image) return '';
+  if(!image.thumbnail) return image.url||'';
+  return sizedThumb(image.thumbnail,Number(settings&&settings.preview_quality)||176);
+}
+function lightboxSrc(image){
+  if(!image) return '';
+  const quality=settings&&settings.lightbox_quality||'original';
+  if(quality==='original'||!image.thumbnail) return image.url||'';
+  return sizedThumb(image.thumbnail,quality==='1280'?1280:2560);
+}
 
 function normalizedPreferences(value,defaults){
   const stored=value&&typeof value==='object'?value:{};
   const defaultLayout=defaults.view_layout==='waterfall'?'waterfall':'slideshow';
   const storedLayout=['single','grid'].includes(stored.view_layout)?'slideshow':stored.view_layout;
-  const result={view_layout:storedLayout,slideshow_interval:stored.slideshow_interval,grid_gap:stored.grid_gap,caption_mode:stored.caption_mode,show_tags_enabled:stored.show_tags_enabled,theme:stored.theme,filter_mode:stored.filter_mode};
+  const result={view_layout:storedLayout,slideshow_interval:stored.slideshow_interval,grid_gap:stored.grid_gap,caption_mode:stored.caption_mode,show_tags_enabled:stored.show_tags_enabled,theme:stored.theme,filter_mode:stored.filter_mode,preview_quality:stored.preview_quality,lightbox_quality:stored.lightbox_quality};
   if(!['slideshow','waterfall'].includes(result.view_layout)) result.view_layout=defaultLayout;
   if(!['path','name','hidden'].includes(result.caption_mode)) result.caption_mode=defaults.caption_mode;
-  result.slideshow_interval=Math.max(0,Math.min(300,Number(result.slideshow_interval??8)||0));
-  result.grid_gap=Math.max(0,Math.min(48,Number(result.grid_gap??defaults.grid_gap)||0));
+  result.slideshow_interval=Math.max(0,Math.min(300,Number(stored.slideshow_interval??8)||0));
+  result.grid_gap=Math.max(0,Math.min(48,Number(stored.grid_gap??defaults.grid_gap)||0));
   result.show_tags_enabled=result.show_tags_enabled!==false;
   if(!['dark','light'].includes(result.theme)) result.theme='dark';
   if(!['union','intersect'].includes(result.filter_mode)) result.filter_mode='union';
+  if(!PREVIEW_QUALITY_OPTIONS.includes(result.preview_quality)) result.preview_quality='176';
+  if(!LIGHTBOX_QUALITY_OPTIONS.includes(result.lightbox_quality)) result.lightbox_quality='original';
   return result;
 }
 
@@ -1505,11 +1443,12 @@ function showAnnouncement(force=false){
   setAnnouncementCountdown(force?0:announcement.required_seconds,key);
 }
 
-function persistPreferences(){localStorage.setItem(PREFERENCE_KEY,JSON.stringify({view_layout:settings.view_layout,slideshow_interval:settings.slideshow_interval,grid_gap:settings.grid_gap,caption_mode:settings.caption_mode,show_tags_enabled:settings.show_tags_enabled,theme:settings.theme,filter_mode:settings.filter_mode}));}
+function persistPreferences(){localStorage.setItem(PREFERENCE_KEY,JSON.stringify({view_layout:settings.view_layout,slideshow_interval:settings.slideshow_interval,grid_gap:settings.grid_gap,caption_mode:settings.caption_mode,show_tags_enabled:settings.show_tags_enabled,theme:settings.theme,filter_mode:settings.filter_mode,preview_quality:settings.preview_quality,lightbox_quality:settings.lightbox_quality}));}
 
 function openPreferences(){
   clearSlideTimer();
-  themeMode.value=settings.theme;
+  previewQuality.value=settings.preview_quality;
+  lightboxQuality.value=settings.lightbox_quality;
   layoutMode.value=settings.view_layout;
   slideshowInterval.value=settings.slideshow_interval;
   gridGap.value=settings.grid_gap;
@@ -1522,7 +1461,7 @@ function openPreferences(){
 
 function closePreferences(){preferencesPanel.classList.add('hidden');preferencesBackdrop.classList.add('hidden');scheduleSlideshow();}
 
-function applyGalleryTheme(theme){document.body.classList.toggle('theme-light',theme==='light');document.body.classList.toggle('theme-dark',theme!=='light');}
+function applyGalleryTheme(theme){document.body.classList.toggle('theme-light',theme==='light');document.body.classList.toggle('theme-dark',theme!=='light');if(themeFab)themeFab.textContent=theme==='light'?'☀':'🌙';}
 
 function directoryFor(image){
   if(!settings.directory_display_enabled) return '';
@@ -1613,7 +1552,7 @@ function attachImageRecovery(element,image){
   element.addEventListener('error',()=>{
     if(element.dataset.refreshAttempted==='1') return;
     element.dataset.refreshAttempted='1';
-    refreshImageUrl(image,true).then(()=>{element.src=image.thumbnail||image.url;}).catch(()=>{});
+    refreshImageUrl(image,true).then(()=>{element.src=cardSrc(image);}).catch(()=>{});
   });
 }
 
@@ -1723,7 +1662,7 @@ function openLightbox(image){
     refreshImageUrl(image,true).then(()=>{lightboxImage.src=image.url;}).catch(showError);
   };
   lightboxImage.alt=imageName(image.path)||'';
-  lightboxImage.src=image.url;
+  lightboxImage.src=lightboxSrc(image);
   if(lightboxImage.complete&&lightboxImage.naturalWidth) fitLightboxImage(false);
 }
 
@@ -1748,9 +1687,9 @@ function createCard(image,eager=false){
     if(picture.dataset.srcApplied==='1') return card._ready||Promise.resolve();
     picture.dataset.srcApplied='1';
     if(image.needs_url||!image.url){
-      card._ready=ensureFreshImage(image).then(()=>{picture.src=image.thumbnail||image.url;}).catch(()=>{});
+      card._ready=ensureFreshImage(image).then(()=>{picture.src=cardSrc(image);}).catch(()=>{});
     }else{
-      picture.src=image.thumbnail||image.url;
+      picture.src=cardSrc(image);
       card._ready=Promise.resolve();
     }
     return card._ready;
@@ -2084,7 +2023,7 @@ function renderSlideHistory(){
     thumbnail.alt='';
     thumbnail.loading='lazy';
     attachImageRecovery(thumbnail,image);
-    thumbnail.src=image.thumbnail||image.url;
+    thumbnail.src=cardSrc(image);
     const badge=document.createElement('span');
     badge.className='slide-thumbnail-index';
     badge.textContent=String(index+1);
@@ -2301,6 +2240,7 @@ async function render(){
   document.querySelector('#menu-next').classList.toggle('hidden',!slideshowVisible);
   document.querySelector('#menu-slideshow-toggle').classList.toggle('hidden',!slideshowVisible);
   slideHistoryPanel.classList.toggle('hidden',restricted||settings.view_layout!=='slideshow');
+  document.body.classList.toggle('has-slide-history',!restricted&&settings.view_layout==='slideshow');
   updateSlideshowToggle();
   refreshButton.disabled=restricted;
   if(restricted){statusEl.textContent='维护中';return;}
@@ -2341,8 +2281,9 @@ document.querySelector('#menu-settings').onclick=()=>{closeHeaderMenu();openPref
 document.querySelector('#menu-announcement').onclick=()=>{closeHeaderMenu();showAnnouncement(true);};
 document.querySelector('#maintenance-unlock').onclick=async()=>{const token=maintenanceToken.value.trim();if(!token){maintenanceMessage.textContent='请输入管理密钥。';return;}maintenanceMessage.textContent='正在验证…';const response=await fetch('/api/admin/config',{headers:{'X-OpenList-Admin-Token':token},cache:'no-store'});if(!response.ok){maintenanceMessage.textContent='管理密钥无效。';return;}maintenanceAccessToken=token;maintenanceMessage.textContent='';render().catch(showError);};
 lightboxDownload.onclick=()=>downloadImage().catch(showError);
-document.querySelector('#preferences-save').onclick=()=>{settings.view_layout=layoutMode.value;settings.slideshow_interval=Math.max(0,Math.min(300,Number(slideshowInterval.value)||0));settings.grid_gap=Math.max(0,Math.min(48,Number(gridGap.value)||0));settings.caption_mode=captionMode.value;settings.show_tags_enabled=showTagsEnabled.checked;settings.theme=themeMode.value;settings.filter_mode=filterMode.value;applyGalleryTheme(settings.theme);persistPreferences();closePreferences();render().catch(showError);};
-document.querySelector('#preferences-reset').onclick=()=>{localStorage.removeItem(PREFERENCE_KEY);settings.view_layout=settings.default_view_layout;settings.slideshow_interval=settings.default_slideshow_interval;settings.grid_gap=settings.default_grid_gap;settings.caption_mode=settings.default_caption_mode;settings.show_tags_enabled=settings.default_show_tags_enabled;settings.theme=settings.default_theme;settings.filter_mode=settings.default_filter_mode;applyGalleryTheme(settings.theme);closePreferences();render().catch(showError);};
+document.querySelector('#preferences-save').onclick=()=>{settings.view_layout=layoutMode.value;settings.slideshow_interval=Math.max(0,Math.min(300,Number(slideshowInterval.value)||0));settings.grid_gap=Math.max(0,Math.min(48,Number(gridGap.value)||0));settings.caption_mode=captionMode.value;settings.show_tags_enabled=showTagsEnabled.checked;settings.filter_mode=filterMode.value;settings.preview_quality=previewQuality.value;settings.lightbox_quality=lightboxQuality.value;persistPreferences();closePreferences();render().catch(showError);};
+document.querySelector('#preferences-reset').onclick=()=>{localStorage.removeItem(PREFERENCE_KEY);settings.view_layout=settings.default_view_layout;settings.slideshow_interval=settings.default_slideshow_interval;settings.grid_gap=settings.default_grid_gap;settings.caption_mode=settings.default_caption_mode;settings.show_tags_enabled=settings.default_show_tags_enabled;settings.theme=settings.default_theme;settings.filter_mode=settings.default_filter_mode;settings.preview_quality='176';settings.lightbox_quality='original';applyGalleryTheme(settings.theme);closePreferences();render().catch(showError);};
+themeFab.onclick=()=>{if(!settings)return;settings.theme=settings.theme==='light'?'dark':'light';applyGalleryTheme(settings.theme);persistPreferences();};
 document.querySelector('#preferences-close').onclick=closePreferences;
 preferencesBackdrop.onclick=closePreferences;
 zoomOutButton.onclick=()=>changeZoom(zoomScale-.25);
@@ -2491,7 +2432,11 @@ body.theme-light .tree{border-color:#dde3ee}
 .tree-label{flex:1;word-break:break-all}
 .tree-children{margin-left:22px;display:none}
 .tree-node.open>.tree-children{display:block}
-.theme-toggle{position:absolute;top:22px;right:22px;width:40px;height:40px;padding:0;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:18px}
+.theme-toggle{position:fixed;bottom:22px;right:22px;z-index:60;width:46px;height:46px;padding:0;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:20px;box-shadow:0 6px 18px rgba(0,0,0,.35);transition:transform .15s ease,box-shadow .15s ease}
+.theme-toggle:hover{transform:translateY(-2px);box-shadow:0 10px 24px rgba(0,0,0,.45)}
+.tabs-nav{flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:thin}
+.row{flex-wrap:wrap}
+@media(max-width:560px){body{padding:14px 12px}.row.actions button{flex:1 1 auto}}
 </style>
 </head>
 <body>
@@ -2520,10 +2465,8 @@ body.theme-light .tree{border-color:#dde3ee}
     <div class="row actions">
       <label style="flex:2">当前路径<input id="path" value="/"></label>
       <button id="browse" type="button" style="align-self:flex-end">加载目录树</button>
-      <button id="refresh-directory-cache" class="secondary" type="button" style="align-self:flex-end">刷新全部目录缓存</button>
-      <button id="refresh-current-directory" class="secondary" type="button" style="align-self:flex-end">刷新当前目录</button>
     </div>
-    <p class="note">勾选目录前的复选框即可加入已选列表；点击目录名可展开/折叠子目录。无展开箭头的目录表示没有子文件夹。"刷新当前目录"仅从 OpenList 重新读取当前路径的子目录，比全部刷新更快。</p>
+    <p class="note">目录树实时读取自 OpenList，总是最新状态，无需刷新缓存。勾选目录前的复选框即可加入已选列表；点击目录名可展开/折叠子目录。</p>
     <div id="directories" class="tree"><p class="note">点击“加载目录树”开始浏览。</p></div>
     <h3>已选目录</h3>
     <div id="selected" class="selected"></div>
@@ -2660,10 +2603,11 @@ function buildTreeNode(name,path,isDir,hasChildren){
   return node;
 }
 async function loadTreeChildren(path,parent){
-  const response=await fetch('/api/admin/directories?path='+encodeURIComponent(path),{headers:auth(),cache:'no-store'});
-  if(!response.ok)throw new Error(await errorText(response,'无法读取目录缓存'));
-  const data=await response.json();
   const container=parent.querySelector('.tree-children');
+  container.innerHTML='<p class="note" style="margin-left:24px">正在读取目录…</p>';
+  const response=await fetch('/api/admin/directories?path='+encodeURIComponent(path),{headers:auth(),cache:'no-store'});
+  if(!response.ok)throw new Error(await errorText(response,'无法读取目录'));
+  const data=await response.json();
   container.replaceChildren();
   if(!data.directories.length){container.innerHTML='<p class="note" style="margin-left:24px">无子目录</p>';const toggle=parent.querySelector('.tree-toggle');if(toggle){toggle.textContent='';toggle.classList.add('tree-leaf');}return;}
   data.directories.forEach(item=>{
@@ -2688,8 +2632,6 @@ async function browse(){
   if(!data.directories.length){container.innerHTML='<p class="note">当前目录没有子目录。</p>';}
   else{data.directories.forEach(item=>{const child=buildTreeNode(item.name,item.path,true,item.has_children);container.append(child);});}
 }
-async function refreshDirectoryCache(){if(!config)throw new Error('请先加载服务器配置');const response=await fetch('/api/admin/directories/refresh',{method:'POST',headers:auth()});if(!response.ok)throw new Error(await errorText(response,'目录缓存刷新未启动'));setAdminStatus('目录缓存正在后台刷新');clearTimeout(rebuildTimer);rebuildTimer=setTimeout(()=>pollRebuild('目录缓存刷新完成').catch(report),2000);}
-async function refreshCurrentDirectory(){if(!config)throw new Error('请先加载服务器配置');const path=document.querySelector('#path').value||'/';setAdminStatus('正在刷新当前目录…');const response=await fetch('/api/admin/directories/refresh?path='+encodeURIComponent(path),{method:'POST',headers:auth()});if(!response.ok)throw new Error(await errorText(response,'刷新当前目录失败'));const data=await response.json();setAdminStatus('目录 "'+path+'" 已刷新，共 '+data.count+' 个子目录');return browse().catch(report);}
 async function saveServer(){if(!config)throw new Error('请先加载服务器配置');const payload={directories:config.directories,caption_mode:document.querySelector('#default-caption').value,directory_display_enabled:document.querySelector('#directory-display-enabled').checked,directory_display_depth:Number(document.querySelector('#directory-display-depth').value),theme:document.querySelector('#theme').value,announcement_enabled:document.querySelector('#announcement-enabled').checked,announcement_title:document.querySelector('#announcement-title').value,announcement_content:document.querySelector('#announcement-content').value,announcement_required_seconds:Number(document.querySelector('#announcement-required-seconds').value),maintenance_enabled:document.querySelector('#maintenance-enabled').checked,tagging_enabled:document.querySelector('#tagging-enabled').checked,tagging_scope:document.querySelector('#tagging-scope').value,tagging_categories:document.querySelector('#tagging-categories').value.split('\n').map(s=>s.trim()).filter(Boolean),tagging_sort_default:document.querySelector('#tagging-sort-default').value,filter_enabled:document.querySelector('#filter-enabled').checked,log_level:document.querySelector('#log-level').value};const response=await fetch('/api/admin/config',{method:'PUT',headers:auth(),body:JSON.stringify(payload)});if(!response.ok)throw new Error(await errorText(response,'保存失败'));config=await response.json();showAdmin();setAdminStatus('全局服务器配置已保存；公告修改后将向访客显示新版本。');}
 function formatSeconds(value){const seconds=Math.max(1,Math.round(Number(value)||0));return seconds<60?seconds+' 秒':Math.ceil(seconds/60)+' 分钟';}
 async function pollRebuild(doneMessage='索引后台重建完成'){const response=await fetch('/api/status',{cache:'no-store'});if(!response.ok)return;if((await response.json()).refreshing){rebuildTimer=setTimeout(()=>pollRebuild(doneMessage).catch(report),2000);}else{setAdminStatus(doneMessage);rebuildTimer=null;}}
@@ -2705,8 +2647,6 @@ document.querySelector('#theme-toggle').onclick=toggleTheme;
 document.querySelector('#load').onclick=()=>load().catch(report);
 document.querySelector('#announcement-preview-button').onclick=previewAnnouncement;
 document.querySelector('#browse').onclick=()=>browse().catch(report);
-document.querySelector('#refresh-directory-cache').onclick=()=>refreshDirectoryCache().catch(report);
-document.querySelector('#refresh-current-directory').onclick=()=>refreshCurrentDirectory().catch(report);
 document.querySelector('#save-server').onclick=()=>saveServer().catch(report);
 document.querySelector('#save-server-bottom').onclick=()=>saveServer().catch(report);
 document.querySelector('#rebuild').onclick=()=>rebuild().catch(report);
@@ -2964,14 +2904,6 @@ def make_handler(application: Application):
                     if application.start_refresh():
                         return self._send_json(HTTPStatus.ACCEPTED, {"status": "rebuild started"})
                     return self._send_json(HTTPStatus.CONFLICT, {"error": "a rebuild is already running"})
-                if path == "/api/admin/directories/refresh":
-                    target_dir = parse_qs(urlparse(self.path).query).get("path", [None])[0]
-                    if target_dir:
-                        result = application.refresh_single_directory(target_dir)
-                        return self._send_json(HTTPStatus.OK, result)
-                    if application.start_directory_refresh():
-                        return self._send_json(HTTPStatus.ACCEPTED, {"status": "directory refresh started"})
-                    return self._send_json(HTTPStatus.CONFLICT, {"error": "an index refresh is already running"})
                 if path == "/api/admin/backup":
                     length = int(self.headers.get("Content-Length", "0"))
                     if not 0 < length <= MAX_REQUEST_BODY:
