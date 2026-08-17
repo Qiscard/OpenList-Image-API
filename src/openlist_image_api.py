@@ -1177,13 +1177,24 @@ body.theme-light ::-webkit-scrollbar-thumb{background:#c8d1e0}
 .preferences-grid label{margin:10px 0}
 .preferences .check{margin:12px 0}
 @media(max-width:400px){.preferences-grid{grid-template-columns:1fr}}
+.slide-nav{position:fixed;z-index:3;display:flex;align-items:center;justify-content:center;padding:0;border:1px solid #3a455b;background:#10131acc;color:#e7edf7;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);cursor:pointer;transition:transform .15s ease,border-color .15s ease}
+.slide-nav.prev{left:10px;top:50%;width:42px;height:64px;font-size:30px;border-radius:12px;transform:translateY(-50%)}
+.slide-nav.next{right:10px;top:50%;width:42px;height:64px;font-size:30px;border-radius:12px;transform:translateY(-50%)}
+.slide-nav.pause{left:50%;bottom:24px;width:44px;height:44px;font-size:16px;border-radius:50%;transform:translateX(-50%)}
+body.has-slide-history .slide-nav.pause{bottom:132px}
+.slide-nav.prev:hover{transform:translateY(-50%) scale(1.07);border-color:#4b8cff}
+.slide-nav.next:hover{transform:translateY(-50%) scale(1.07);border-color:#4b8cff}
+.slide-nav.pause:hover{transform:translateX(-50%) scale(1.07);border-color:#4b8cff}
+body.theme-light .slide-nav{background:#ffffffd9;border-color:#c8d1e0;color:#3a4252}
+.gallery.single{touch-action:pan-y}
+@media(max-width:560px){.slide-nav.prev{left:6px;width:36px;height:56px;font-size:26px}.slide-nav.next{right:6px;width:36px;height:56px;font-size:26px}.slide-nav.pause{bottom:12px}body.has-slide-history .slide-nav.pause{bottom:112px}}
 @media(max-width:760px){header{padding:10px 56px 10px 12px}header .spacer{display:none}header>button,header>a{display:none}#header-menu-toggle{display:block}}
 .header-menu{opacity:0;visibility:hidden;transform:translateY(-10px);transition:opacity .22s ease,transform .22s ease,visibility .22s}
 .header-menu.open{opacity:1;visibility:visible;transform:none}
 #header-menu-backdrop{opacity:0;visibility:hidden;background:#0007;transition:opacity .22s ease,visibility .22s}
 #header-menu-backdrop.open{opacity:1;visibility:visible}
 @media(max-width:760px){.header-menu{left:0;right:0;width:auto;top:var(--menu-top,56px);border-top:0;border-radius:0 0 14px 14px;padding:12px 14px;box-shadow:0 14px 28px rgba(0,0,0,.45)}#header-menu .button,#header-menu button{padding:11px 12px}}
-@media(max-width:560px){#theme-fab{right:12px;bottom:12px}body.has-slide-history #theme-fab{bottom:112px}.preferences{left:8px;right:8px;width:auto;top:auto;bottom:12px;transform:none;max-height:84vh;overflow:auto}.lightbox-foot{flex-wrap:wrap}.lightbox-meta{flex:1 1 100%}}
+@media(max-width:560px){#theme-fab{right:12px;bottom:12px}body.has-slide-history #theme-fab{bottom:112px}.preferences{width:calc(100vw - 24px);max-height:86vh;overflow:auto}.lightbox-foot{flex-wrap:wrap}.lightbox-meta{flex:1 1 100%}}
 </style>
 <style>
 .tag-bar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:8px 18px;border-bottom:1px solid #293040;background:#10131a;max-width:100%}.tag-bar-label{color:#a9b7cd;font-size:13px;margin-right:4px}.tag-chip{display:inline-flex;align-items:center;gap:4px;padding:4px 10px;border:1px solid #3a455b;border-radius:16px;background:#171c27;color:#cdd6e8;font-size:12px;cursor:pointer;transition:all .15s ease;user-select:none}.tag-chip:hover{border-color:#4b8cff;transform:translateY(-1px)}.tag-chip.active{background:#4b8cff;border-color:#4b8cff;color:#fff}.tag-chip-count{opacity:.7;font-size:11px}.tag-clear{padding:4px 10px;border:1px solid #3a455b;border-radius:16px;background:transparent;color:#a9b7cd;font-size:12px;cursor:pointer}.tag-clear:hover{color:#fff;border-color:#ff6b6b}.card-tags{position:absolute;bottom:0;left:0;right:0;display:flex;flex-wrap:wrap;gap:5px;padding:7px 10px;background:linear-gradient(transparent,rgba(0,0,0,.65));transition:opacity .2s ease;max-height:72px;overflow:hidden}@media(hover:hover){.card-tags{opacity:0}.card:hover .card-tags{opacity:1}.card.has-active-tag .card-tags{opacity:1}}.tag-vote{display:inline-flex;align-items:center;gap:4px;padding:4px 8px;border:1px solid #3a455b;border-radius:6px;background:rgba(255,255,255,.1);color:#fff;font-size:12px;cursor:pointer;transition:all .15s ease;user-select:none}.tag-vote:hover{border-color:#4b8cff;background:rgba(255,255,255,.16);transform:translateY(-1px)}.tag-vote.active{background:#ff4d6d;border-color:#ff4d6d;color:#fff}.tag-vote:disabled{opacity:.5;cursor:wait;transform:none}.tag-category{display:inline-flex;align-items:center;gap:3px;padding:4px 8px;border:1px solid #3a455b;border-radius:6px;background:rgba(255,255,255,.1);color:#fff;font-size:11px;cursor:pointer;transition:all .15s ease;user-select:none}.tag-category:hover{border-color:#4b8cff;background:rgba(255,255,255,.16);transform:translateY(-1px)}.tag-category.active{background:#4b8cff;border-color:#4b8cff;color:#fff}.tag-category.tag-trash{border-color:#5a3030;background:rgba(255,100,100,.12)}.tag-category.tag-trash:hover{border-color:#ff6b6b;background:rgba(255,100,100,.2);transform:translateY(-1px)}.tag-category.tag-trash.active{background:#ff4757;border-color:#ff4757;color:#fff}.tag-vote-count{font-weight:600;min-width:14px;text-align:center}
@@ -1216,6 +1227,9 @@ body.theme-light{color-scheme:light;background:#eef1f6;color:#1a2333}body.theme-
 </aside>
 <div id="tag-bar" class="tag-bar hidden"></div>
 <main id="gallery" class="gallery"></main>
+<button id="slide-nav-prev" class="slide-nav prev hidden" type="button" aria-label="上一张">‹</button>
+<button id="slide-nav-next" class="slide-nav next hidden" type="button" aria-label="下一张">›</button>
+<button id="slide-nav-pause" class="slide-nav pause hidden" type="button" aria-label="暂停播放">⏸</button>
 <section id="slide-history" class="slide-history hidden" aria-label="播放历史"><div class="slide-history-head"><span class="slide-history-title">播放历史</span><button id="slide-history-latest" class="slide-history-latest" type="button">跳转到最新</button></div><div id="slide-history-track" class="slide-history-track"></div></section>
 <section id="maintenance" class="maintenance hidden"><h1>维护中</h1><p>图片浏览暂时不可用，请稍后再试。</p><details><summary>管理员查看图片</summary><label>管理密钥<input id="maintenance-token" type="password" autocomplete="current-password"></label><button id="maintenance-unlock" type="button">查看图片</button><p id="maintenance-message" class="meta"></p></details></section>
 <dialog id="lightbox">
@@ -1951,6 +1965,8 @@ function updateSlideshowToggle(){
   slideshowToggle.setAttribute('aria-pressed',String(slideshowPaused));
   const menuToggle=document.querySelector('#menu-slideshow-toggle');
   if(menuToggle){menuToggle.textContent=slideshowPaused?'继续':'暂停';menuToggle.setAttribute('aria-pressed',String(slideshowPaused));}
+  const navPause=document.querySelector('#slide-nav-pause');
+  if(navPause){navPause.textContent=slideshowPaused?'▶':'⏸';navPause.setAttribute('aria-label',slideshowPaused?'继续播放':'暂停播放');}
 }
 
 function setSlideshowPaused(paused){
@@ -2248,6 +2264,9 @@ async function render(){
   nextButton.classList.toggle('hidden',restricted||settings.view_layout!=='slideshow');
   slideshowToggle.classList.toggle('hidden',restricted||settings.view_layout!=='slideshow');
   const slideshowVisible=!restricted&&settings.view_layout==='slideshow';
+  document.querySelector('#slide-nav-prev').classList.toggle('hidden',!slideshowVisible);
+  document.querySelector('#slide-nav-next').classList.toggle('hidden',!slideshowVisible);
+  document.querySelector('#slide-nav-pause').classList.toggle('hidden',!slideshowVisible);
   document.querySelector('#menu-previous').classList.toggle('hidden',!slideshowVisible);
   document.querySelector('#menu-next').classList.toggle('hidden',!slideshowVisible);
   document.querySelector('#menu-slideshow-toggle').classList.toggle('hidden',!slideshowVisible);
@@ -2273,6 +2292,19 @@ function showError(error){
 
 previousButton.onclick=previousSlide;
 nextButton.onclick=()=>nextSlide().catch(showError);
+document.querySelector('#slide-nav-prev').onclick=previousSlide;
+document.querySelector('#slide-nav-next').onclick=()=>nextSlide().catch(showError);
+document.querySelector('#slide-nav-pause').onclick=()=>setSlideshowPaused(!slideshowPaused);
+let touchSwipeStart=null;
+gallery.addEventListener('pointerdown',event=>{if(event.pointerType==='mouse')return;touchSwipeStart={x:event.clientX,y:event.clientY};});
+gallery.addEventListener('pointerup',event=>{
+  if(!touchSwipeStart)return;
+  const dx=event.clientX-touchSwipeStart.x,dy=event.clientY-touchSwipeStart.y;
+  touchSwipeStart=null;
+  if(!settings||settings.view_layout!=='slideshow')return;
+  if(Math.abs(dx)>48&&Math.abs(dx)>Math.abs(dy)*1.4){dx>0?previousSlide():nextSlide().catch(showError);}
+});
+gallery.addEventListener('pointercancel',()=>{touchSwipeStart=null;});
 slideshowToggle.onclick=()=>setSlideshowPaused(!slideshowPaused);
 slideHistoryLatest.onclick=()=>{const latest=slideHistory[slideHistory.length-1];if(latest)showHistoryImage(latest).catch(showError);};
 refreshButton.onclick=()=>render().catch(showError);
@@ -2293,8 +2325,8 @@ document.querySelector('#menu-settings').onclick=()=>{closeHeaderMenu();openPref
 document.querySelector('#menu-announcement').onclick=()=>{closeHeaderMenu();showAnnouncement(true);};
 document.querySelector('#maintenance-unlock').onclick=async()=>{const token=maintenanceToken.value.trim();if(!token){maintenanceMessage.textContent='请输入管理密钥。';return;}maintenanceMessage.textContent='正在验证…';const response=await fetch('/api/admin/config',{headers:{'X-OpenList-Admin-Token':token},cache:'no-store'});if(!response.ok){maintenanceMessage.textContent='管理密钥无效。';return;}maintenanceAccessToken=token;maintenanceMessage.textContent='';render().catch(showError);};
 lightboxDownload.onclick=()=>downloadImage().catch(showError);
-document.querySelector('#preferences-save').onclick=()=>{settings.view_layout=layoutMode.value;settings.slideshow_interval=Math.max(0,Math.min(300,Number(slideshowInterval.value)||0));settings.caption_mode=captionMode.value;settings.show_tags_enabled=showTagsEnabled.checked;settings.filter_mode=filterMode.value;settings.preview_quality=previewQuality.value;settings.lightbox_quality=lightboxQuality.value;persistPreferences();closePreferences();render().catch(showError);};
-document.querySelector('#preferences-reset').onclick=()=>{localStorage.removeItem(PREFERENCE_KEY);settings.view_layout=settings.default_view_layout;settings.slideshow_interval=settings.default_slideshow_interval;settings.grid_gap=settings.default_grid_gap;settings.caption_mode=settings.default_caption_mode;settings.show_tags_enabled=settings.default_show_tags_enabled;settings.theme=settings.default_theme;settings.filter_mode=settings.default_filter_mode;settings.preview_quality='176';settings.lightbox_quality='original';applyGalleryTheme(settings.theme);closePreferences();render().catch(showError);};
+document.querySelector('#preferences-save').onclick=()=>{settings.view_layout=layoutMode.value;settings.slideshow_interval=Math.max(0,Math.min(300,Number(slideshowInterval.value)||0));settings.caption_mode=captionMode.value;settings.show_tags_enabled=showTagsEnabled.checked;settings.filter_mode=filterMode.value;settings.preview_quality=previewQuality.value;settings.lightbox_quality=lightboxQuality.value;persistPreferences();location.reload();};
+document.querySelector('#preferences-reset').onclick=()=>{localStorage.removeItem(PREFERENCE_KEY);location.reload();};
 themeFab.onclick=()=>{if(!settings)return;settings.theme=settings.theme==='light'?'dark':'light';applyGalleryTheme(settings.theme);persistPreferences();};
 document.querySelector('#preferences-close').onclick=closePreferences;
 preferencesBackdrop.onclick=closePreferences;
