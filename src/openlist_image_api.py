@@ -1173,7 +1173,16 @@ body.theme-light #theme-fab{background:#fff;border-color:#c8d1e0;color:#3a4252;b
 .preview-button{cursor:zoom-in}
 ::-webkit-scrollbar{width:9px;height:9px}::-webkit-scrollbar-thumb{background:#39445a;border-radius:6px}::-webkit-scrollbar-thumb:hover{background:#4b5b78}::-webkit-scrollbar-track{background:transparent}
 body.theme-light ::-webkit-scrollbar-thumb{background:#c8d1e0}
+.preferences-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:2px 16px}
+.preferences-grid label{margin:10px 0}
+.preferences .check{margin:12px 0}
+@media(max-width:400px){.preferences-grid{grid-template-columns:1fr}}
 @media(max-width:760px){header{padding:10px 56px 10px 12px}header .spacer{display:none}header>button,header>a{display:none}#header-menu-toggle{display:block}}
+.header-menu{opacity:0;visibility:hidden;transform:translateY(-10px);transition:opacity .22s ease,transform .22s ease,visibility .22s}
+.header-menu.open{opacity:1;visibility:visible;transform:none}
+#header-menu-backdrop{opacity:0;visibility:hidden;background:#0007;transition:opacity .22s ease,visibility .22s}
+#header-menu-backdrop.open{opacity:1;visibility:visible}
+@media(max-width:760px){.header-menu{left:0;right:0;width:auto;top:var(--menu-top,56px);border-top:0;border-radius:0 0 14px 14px;padding:12px 14px;box-shadow:0 14px 28px rgba(0,0,0,.45)}#header-menu .button,#header-menu button{padding:11px 12px}}
 @media(max-width:560px){#theme-fab{right:12px;bottom:12px}body.has-slide-history #theme-fab{bottom:112px}.preferences{left:8px;right:8px;width:auto;top:auto;bottom:12px;transform:none;max-height:84vh;overflow:auto}.lightbox-foot{flex-wrap:wrap}.lightbox-meta{flex:1 1 100%}}
 </style>
 <style>
@@ -1194,9 +1203,9 @@ body.theme-light{color-scheme:light;background:#eef1f6;color:#1a2333}body.theme-
   <button id="announcement-button" class="hidden" type="button">公告</button>
   <a href="/admin">管理</a>
 </header>
-<button id="header-menu-toggle" type="button" aria-label="菜单">☰</button>
-<div id="header-menu-backdrop" class="hidden"></div>
-<aside id="header-menu" class="header-menu hidden">
+<button id="header-menu-toggle" type="button" aria-label="菜单" aria-expanded="false">☰</button>
+<div id="header-menu-backdrop"></div>
+<aside id="header-menu" class="header-menu" aria-label="快捷菜单">
   <button id="menu-previous" class="hidden" type="button">← 上一张</button>
   <button id="menu-slideshow-toggle" class="hidden" type="button" aria-pressed="false">暂停</button>
   <button id="menu-next" class="hidden" type="button">下一张 →</button>
@@ -1217,15 +1226,16 @@ body.theme-light{color-scheme:light;background:#eef1f6;color:#1a2333}body.theme-
 <div id="preferences-backdrop" class="modal-backdrop hidden"></div>
 <section id="preferences" class="preferences hidden" aria-label="显示设置">
   <h2>显示设置</h2>
-  <label>视图<select id="layout-mode"><option value="slideshow">幻灯片</option><option value="waterfall">瀑布流</option></select></label>
-  <label>图片画质（列表缩略图清晰度）<select id="preview-quality"><option value="176">极速（176px，流量最小）</option><option value="480">清晰（480px）</option><option value="800">高清（800px）</option><option value="1280">超清（1280px）</option><option value="2560">极清（2560px，流量最大）</option></select></label>
-  <label>大图画质（点击放大后的清晰度）<select id="lightbox-quality"><option value="original">原图（最清晰，加载较慢）</option><option value="2560">极清（2560px，推荐）</option><option value="1280">超清（1280px，最快）</option></select></label>
-  <label>幻灯片自动播放间隔（秒，0 表示关闭）<input id="slideshow-interval" type="number" min="0" max="300" step="1"></label>
-  <label>图片间距（0–48 px，仅瀑布流有效）<input id="grid-gap" type="number" min="0" max="48"></label>
-  <label>图片名称样式<select id="caption-mode"><option value="path">完整路径</option><option value="name">仅图片名称</option><option value="hidden">不展示</option></select></label>
-  <label>标签筛选模式<select id="filter-mode"><option value="union">并集（任一匹配）</option><option value="intersect">交集（全部匹配）</option></select></label>
+  <div class="preferences-grid">
+    <label>视图<select id="layout-mode"><option value="slideshow">幻灯片</option><option value="waterfall">瀑布流</option></select></label>
+    <label>图片名称样式<select id="caption-mode"><option value="path">完整路径</option><option value="name">仅图片名称</option><option value="hidden">不展示</option></select></label>
+    <label>图片画质<select id="preview-quality"><option value="176">极速（176px）</option><option value="480">清晰（480px）</option><option value="800">高清（800px）</option><option value="1280">超清（1280px）</option><option value="2560">极清（2560px）</option></select></label>
+    <label>大图画质<select id="lightbox-quality"><option value="original">原图（最清晰）</option><option value="2560">极清（2560px，推荐）</option><option value="1280">超清（1280px，最快）</option></select></label>
+    <label>标签筛选模式<select id="filter-mode"><option value="union">并集（任一匹配）</option><option value="intersect">交集（全部匹配）</option></select></label>
+    <label class="slideshow-only">自动播放间隔（秒，0 关闭）<input id="slideshow-interval" type="number" min="0" max="300" step="1"></label>
+  </div>
   <label class="check"><input id="show-tags-enabled" type="checkbox">在图片上显示标签按钮（点赞/分类）</label>
-  <p class="meta">设置仅保存在当前浏览器。</p>
+  <p class="meta">图片画质与大图画质越高越清晰，流量消耗也越大；设置仅保存在当前浏览器。</p>
   <div class="preferences-actions"><button id="preferences-reset" type="button">恢复默认</button><button id="preferences-save" type="button">保存</button><button id="preferences-close" type="button">关闭</button></div>
 </section>
 <div id="announcement-backdrop" class="modal-backdrop announcement-backdrop hidden"></div>
@@ -1252,7 +1262,6 @@ const preferencesPanel=document.querySelector('#preferences');
 const preferencesBackdrop=document.querySelector('#preferences-backdrop');
 const layoutMode=document.querySelector('#layout-mode');
 const slideshowInterval=document.querySelector('#slideshow-interval');
-const gridGap=document.querySelector('#grid-gap');
 const captionMode=document.querySelector('#caption-mode');
 const previewQuality=document.querySelector('#preview-quality');
 const lightboxQuality=document.querySelector('#lightbox-quality');
@@ -1451,7 +1460,7 @@ function openPreferences(){
   lightboxQuality.value=settings.lightbox_quality;
   layoutMode.value=settings.view_layout;
   slideshowInterval.value=settings.slideshow_interval;
-  gridGap.value=settings.grid_gap;
+  syncSlideshowOption();
   captionMode.value=settings.caption_mode;
   filterMode.value=settings.filter_mode;
   showTagsEnabled.checked=settings.show_tags_enabled;
@@ -1460,6 +1469,9 @@ function openPreferences(){
 }
 
 function closePreferences(){preferencesPanel.classList.add('hidden');preferencesBackdrop.classList.add('hidden');scheduleSlideshow();}
+
+function syncSlideshowOption(){document.querySelector('.slideshow-only').classList.toggle('hidden',layoutMode.value!=='slideshow');}
+layoutMode.addEventListener('change',syncSlideshowOption);
 
 function applyGalleryTheme(theme){document.body.classList.toggle('theme-light',theme==='light');document.body.classList.toggle('theme-dark',theme!=='light');if(themeFab)themeFab.textContent=theme==='light'?'☀':'🌙';}
 
@@ -2269,8 +2281,8 @@ announcementButton.onclick=()=>showAnnouncement(true);
 const headerMenuToggle=document.querySelector('#header-menu-toggle');
 const headerMenu=document.querySelector('#header-menu');
 const headerMenuBackdrop=document.querySelector('#header-menu-backdrop');
-function openHeaderMenu(){if(!headerMenu.classList.contains('hidden')){closeHeaderMenu();return;}clearSlideTimer();headerMenu.classList.remove('hidden');headerMenuBackdrop.classList.remove('hidden');}
-function closeHeaderMenu(){headerMenu.classList.add('hidden');headerMenuBackdrop.classList.add('hidden');scheduleSlideshow();}
+function openHeaderMenu(){if(headerMenu.classList.contains('open')){closeHeaderMenu();return;}clearSlideTimer();headerMenu.style.setProperty('--menu-top',Math.round(document.querySelector('header').getBoundingClientRect().bottom)+'px');headerMenu.classList.add('open');headerMenuBackdrop.classList.add('open');headerMenuToggle.setAttribute('aria-expanded','true');}
+function closeHeaderMenu(){headerMenu.classList.remove('open');headerMenuBackdrop.classList.remove('open');headerMenuToggle.setAttribute('aria-expanded','false');scheduleSlideshow();}
 headerMenuToggle.onclick=openHeaderMenu;
 headerMenuBackdrop.onclick=closeHeaderMenu;
 document.querySelector('#menu-previous').onclick=()=>{closeHeaderMenu();previousSlide();};
@@ -2281,7 +2293,7 @@ document.querySelector('#menu-settings').onclick=()=>{closeHeaderMenu();openPref
 document.querySelector('#menu-announcement').onclick=()=>{closeHeaderMenu();showAnnouncement(true);};
 document.querySelector('#maintenance-unlock').onclick=async()=>{const token=maintenanceToken.value.trim();if(!token){maintenanceMessage.textContent='请输入管理密钥。';return;}maintenanceMessage.textContent='正在验证…';const response=await fetch('/api/admin/config',{headers:{'X-OpenList-Admin-Token':token},cache:'no-store'});if(!response.ok){maintenanceMessage.textContent='管理密钥无效。';return;}maintenanceAccessToken=token;maintenanceMessage.textContent='';render().catch(showError);};
 lightboxDownload.onclick=()=>downloadImage().catch(showError);
-document.querySelector('#preferences-save').onclick=()=>{settings.view_layout=layoutMode.value;settings.slideshow_interval=Math.max(0,Math.min(300,Number(slideshowInterval.value)||0));settings.grid_gap=Math.max(0,Math.min(48,Number(gridGap.value)||0));settings.caption_mode=captionMode.value;settings.show_tags_enabled=showTagsEnabled.checked;settings.filter_mode=filterMode.value;settings.preview_quality=previewQuality.value;settings.lightbox_quality=lightboxQuality.value;persistPreferences();closePreferences();render().catch(showError);};
+document.querySelector('#preferences-save').onclick=()=>{settings.view_layout=layoutMode.value;settings.slideshow_interval=Math.max(0,Math.min(300,Number(slideshowInterval.value)||0));settings.caption_mode=captionMode.value;settings.show_tags_enabled=showTagsEnabled.checked;settings.filter_mode=filterMode.value;settings.preview_quality=previewQuality.value;settings.lightbox_quality=lightboxQuality.value;persistPreferences();closePreferences();render().catch(showError);};
 document.querySelector('#preferences-reset').onclick=()=>{localStorage.removeItem(PREFERENCE_KEY);settings.view_layout=settings.default_view_layout;settings.slideshow_interval=settings.default_slideshow_interval;settings.grid_gap=settings.default_grid_gap;settings.caption_mode=settings.default_caption_mode;settings.show_tags_enabled=settings.default_show_tags_enabled;settings.theme=settings.default_theme;settings.filter_mode=settings.default_filter_mode;settings.preview_quality='176';settings.lightbox_quality='original';applyGalleryTheme(settings.theme);closePreferences();render().catch(showError);};
 themeFab.onclick=()=>{if(!settings)return;settings.theme=settings.theme==='light'?'dark':'light';applyGalleryTheme(settings.theme);persistPreferences();};
 document.querySelector('#preferences-close').onclick=closePreferences;
