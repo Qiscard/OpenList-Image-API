@@ -12,6 +12,7 @@ from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -115,10 +116,6 @@ class WebUiMarkupTests(unittest.TestCase):
         self.assertIn("body:JSON.stringify({paths:pending.map(image=>image.path),fresh:!!force})", page)
         self.assertIn("openlist-image-preferences-v2", page)
         self.assertIn("openlist-image-announcement-v2-", page)
-        self.assertIn("grid-template-columns:repeat(3", page)
-        self.assertIn("grid-auto-flow:dense", page)
-        self.assertIn("grid-column:span 2", page)
-        self.assertIn("naturalHeight>=1.45", page)
         self.assertIn("waterfall-column", page)
         self.assertIn("shortestWaterfallColumn", page)
         self.assertIn("prioritizeWaterfallImages", page)
@@ -138,6 +135,9 @@ class WebUiMarkupTests(unittest.TestCase):
         self.assertNotIn("download.href=downloadUrl", page)
         self.assertNotIn("openlist-image-preferences-v1", page)
         self.assertNotIn("singleImages", page)
+        self.assertNotIn(".gallery.grid", page)
+        self.assertNotIn("card.classList.toggle('wide'", page)
+        self.assertNotIn("preferences.default_", page)
 
     def test_admin_exposes_announcement_maintenance_and_directory_controls(self) -> None:
         page = admin_html()
@@ -159,6 +159,8 @@ class WebUiMarkupTests(unittest.TestCase):
         self.assertNotIn("id=\"scale\"", page)
         self.assertNotIn("extensions:parsedExtensions()", page)
         self.assertNotIn("id=\"caption\"", page)
+        self.assertNotIn("tagging-sort-default", page)
+        self.assertIn("后台重建图片索引", page)
 
 
 class DownloadTests(unittest.TestCase):
@@ -259,6 +261,55 @@ class DownloadTests(unittest.TestCase):
             with urlopen(f"http://127.0.0.1:{server.server_port}/api/download-url?path=/gallery/a.jpg") as response:
                 single = json.loads(response.read().decode("utf-8"))
             self.assertEqual(single["url"], "https://example.invalid/gallery/a.jpg")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class TaggingAuthorizationTests(unittest.TestCase):
+    def test_token_scope_requires_valid_admin_token(self) -> None:
+        class FakeTags:
+            def set_category(self, path: str, category: str, value: bool) -> dict[str, object]:
+                return {"path": path, "category": category, "value": value}
+
+        class FakeApplication:
+            config = {"maintenance_enabled": False, "tagging_enabled": True, "tagging_scope": "token", "tagging_categories": ["review"]}
+            TRASH_TAG = "trash"
+            tags = FakeTags()
+
+            def is_admin(self, supplied_token: str | None) -> bool:
+                return supplied_token == "valid-token"
+
+            def indexed_image(self, path: str) -> dict[str, object]:
+                return {"path": path, "size": 1}
+
+            def voter_id(self, ip: str, user_agent: str, admin_token: str | None) -> str:
+                del ip, user_agent
+                return "voter:" + str(admin_token)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(FakeApplication()))
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            body = json.dumps({"path": "/gallery/a.jpg", "type": "category", "category": "review", "value": True}).encode("utf-8")
+            invalid = Request(
+                f"http://127.0.0.1:{server.server_port}/api/tagging/vote",
+                data=body,
+                headers={"Content-Type": "application/json", "X-OpenList-Admin-Token": "invalid-token"},
+                method="POST",
+            )
+            with self.assertRaises(HTTPError) as error:
+                urlopen(invalid)
+            self.assertEqual(error.exception.code, 403)
+
+            valid = Request(
+                f"http://127.0.0.1:{server.server_port}/api/tagging/vote",
+                data=body,
+                headers={"Content-Type": "application/json", "X-OpenList-Admin-Token": "valid-token"},
+                method="POST",
+            )
+            with urlopen(valid) as response:
+                self.assertEqual(response.status, 200)
         finally:
             server.shutdown()
             server.server_close()

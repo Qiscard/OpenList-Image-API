@@ -2,11 +2,9 @@
 """Mock OpenList server for local tag feature testing."""
 import json
 import os
-import re
-import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 
 STATE_DIR = Path(os.environ.get("MOCK_STATE_DIR", "/tmp/openlist-tag-preview"))
 IMAGE_DIR = STATE_DIR / "images"
@@ -121,7 +119,6 @@ class MockHandler(BaseHTTPRequestHandler):
             if not img:
                 self._send_json(404, {"code": 404, "message": "file not found", "data": None})
                 return
-            local_path = IMAGE_DIR / req_path.lstrip("/")
             raw_url = f"http://127.0.0.1:5245/raw{req_path}"
             thumb_url = f"http://127.0.0.1:5245/thumb{req_path}"
             self._send_json(200, {"code": 200, "message": "success", "data": {

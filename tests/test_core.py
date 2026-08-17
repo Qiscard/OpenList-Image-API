@@ -231,7 +231,12 @@ class UrlCacheConcurrencyTests(unittest.TestCase):
 
         class FakeRepository:
             def load(self) -> dict[str, object]:
-                return {"images": [{"path": "/gallery/ok.jpg", "size": 12}]}
+                return {
+                    "images": [
+                        {"path": "/gallery/ok.jpg", "size": 12},
+                        {"path": "/gallery/fail.jpg", "size": 12},
+                    ]
+                }
 
         application = Application.__new__(Application)
         application.config = {
@@ -248,7 +253,7 @@ class UrlCacheConcurrencyTests(unittest.TestCase):
             self.assertTrue(all("url" in item or "error" in item for item in resolved))
             missing = application.resolve_download_urls(["/gallery/missing.jpg", "/gallery/fail.jpg", "/gallery/ok.jpg"])
             self.assertEqual(missing[0]["path"], "/gallery/missing.jpg")
-            self.assertIn("url", missing[0])
+            self.assertEqual(missing[0]["error"], "image is not in the current index")
             self.assertEqual(missing[1]["error"], "unable to resolve image URL")
             self.assertEqual(missing[2]["url"], "https://example.invalid/gallery/ok.jpg")
         finally:

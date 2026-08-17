@@ -387,13 +387,6 @@ class TagRepository:
             atomic_write_json(self.path, data)
             self._cache = data
 
-    def get(self, path: str) -> dict[str, Any]:
-        tags = self.load().get("tags", {})
-        entry = tags.get(path)
-        if not entry:
-            return {"likes": 0, "dislikes": 0, "categories": [], "voters": {}}
-        return entry
-
     def stats(self, paths: list[str]) -> dict[str, Any]:
         tags = self.load().get("tags", {})
         result = {}
@@ -439,7 +432,7 @@ class TagRepository:
             self.save(data)
             return self._summary(entry)
 
-    def set_category(self, path: str, voter_id: str, category: str, value: bool) -> dict[str, Any]:
+    def set_category(self, path: str, category: str, value: bool) -> dict[str, Any]:
         with self._lock:
             data = self.load()
             tags = data.setdefault("tags", {})
@@ -609,10 +602,6 @@ class UrlCache:
     def _cached(self, path: str) -> tuple[str, str] | None:
         with self._lock:
             return self._cached_unlocked(path)
-
-    def invalidate(self, path: str) -> None:
-        with self._lock:
-            self._entries.pop(path, None)
 
     def cached_url(self, path: str) -> str | None:
         cached = self._cached(path)
@@ -1031,6 +1020,8 @@ class Application:
 
         def resolve_one(image: dict[str, Any]) -> dict[str, Any]:
             path = str(image["path"])
+            if image.get("_missing"):
+                return {"path": path, "error": "image is not in the current index"}
             try:
                 url, thumb = self.cache.resolve(path, client, refresh=refresh)
             except Exception:
@@ -1152,7 +1143,7 @@ def gallery_html() -> str:
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>图库</title>
 <style>
-:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#10131a;color:#e7edf7;font:15px system-ui,sans-serif}header{position:sticky;z-index:2;top:0;display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:14px 18px;background:#10131af2;border-bottom:1px solid #293040}button,.button{background:#4b8cff;border:0;border-radius:7px;color:#fff;padding:9px 13px;cursor:pointer;text-decoration:none}button:disabled{opacity:.45;cursor:not-allowed}.meta{color:#a9b7cd;font-size:13px}.spacer{flex:1}.gallery{padding:18px}.gallery.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));grid-auto-flow:dense;gap:var(--grid-gap,12px);align-items:start}.gallery.grid .card.wide{grid-column:span 2}.gallery.waterfall{display:flex;align-items:flex-start;gap:var(--grid-gap,12px)}.waterfall-column{display:flex;min-width:0;flex:1;flex-direction:column;gap:var(--grid-gap,12px)}.gallery.single{display:grid;min-height:calc(100vh - 80px);place-items:center}.gallery.single .card{max-width:min(96vw,1280px)}.card{position:relative;background:#171c27;border:1px solid #293040;border-radius:10px;overflow:hidden}.preview-button{display:block;width:100%;padding:0;border:0;border-radius:0;background:transparent}.card img{width:100%;display:block;max-height:82vh;object-fit:contain;background:#080a0f}.gallery.grid .card img{max-height:none}.card footer{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:9px 11px}.caption{margin:0;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.download{color:#b7d1ff;white-space:nowrap}.hidden{display:none!important}a{color:inherit}#empty{padding:40px;text-align:center;color:#a9b7cd}dialog{width:min(96vw,1500px);height:min(94vh,1000px);padding:0;border:1px solid #3a455b;border-radius:12px;background:#10131a;color:#e7edf7}dialog::backdrop{background:#000c}.lightbox-head,.lightbox-foot{display:flex;gap:12px;align-items:center;padding:10px 12px}.lightbox-head{justify-content:space-between}.lightbox-controls{display:flex;gap:8px}.lightbox-stage{height:calc(94vh - 126px);overflow:auto;background:#080a0f;display:grid;place-items:center}.lightbox-image{display:block;width:100%;height:100%;object-fit:contain;transform-origin:center;transition:transform .15s ease}.lightbox-meta{min-width:0;display:grid;gap:4px}.lightbox-caption,.lightbox-directory{margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.lightbox-directory{color:#a9b7cd;font-size:13px}.modal-backdrop{position:fixed;z-index:4;inset:0;background:#0008}#announcement-backdrop{position:fixed!important;z-index:1000!important;inset:0!important;background:#10131a!important;opacity:1!important;pointer-events:auto!important;animation:backdrop-in .25s ease both}.announcement{z-index:1001!important;pointer-events:auto!important}body.announcement-open{overflow:hidden}body.announcement-open>header,body.announcement-open>main,body.announcement-open>#maintenance{pointer-events:none!important;user-select:none}body.announcement-open>#announcement-backdrop,body.announcement-open>#announcement{display:block!important;visibility:visible!important}.preferences{position:fixed;z-index:5;top:50%;left:50%;width:min(92vw,430px);height:auto;padding:20px;border:1px solid #3a455b;border-radius:12px;background:#10131a;color:#e7edf7;transform:translate(-50%,-50%);box-shadow:0 1.5rem 2.2rem rgba(0,0,0,.28)}.preferences h2{margin-top:0}.preferences label{display:grid;gap:7px;margin:14px 0}.preferences select,.preferences input{padding:9px;border:1px solid #3a455b;border-radius:7px;background:#0d1119;color:#fff}.preferences-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:18px}.announcement{position:fixed;z-index:5;top:50%;left:50%;width:min(94vw,680px);height:auto;padding:0;border:0;border-radius:22px;background:linear-gradient(145deg,#fffdf8 0%,#fff 54%,#fff0e3 100%);color:#282828;box-shadow:0 1.5rem 3rem rgba(0,0,0,.38);overflow:hidden;transform:translate(-50%,-50%);animation:announcement-in .32s cubic-bezier(.2,.8,.2,1) both}.announcement.is-closing{animation:announcement-out .22s ease-in both}@keyframes backdrop-in{from{opacity:0}to{opacity:1}}@keyframes announcement-in{from{opacity:0;transform:translate(-50%,-46%) scale(.96)}to{opacity:1;transform:translate(-50%,-50%) scale(1)}}@keyframes announcement-out{from{opacity:1;transform:translate(-50%,-50%) scale(1)}to{opacity:0;transform:translate(-50%,-46%) scale(.97)}}.announcement-main{padding:26px 30px 12px}.announcement-title{position:relative;z-index:0;display:inline-block;margin:0 0 18px;font-size:21px}.announcement-title::after{content:'';position:absolute;z-index:-1;right:-3px;bottom:2px;left:-3px;height:14px;border-radius:4px;background:#fbeecd;transform:skewX(-15deg)}.announcement-content{margin:0;line-height:1.7}.announcement-content h1,.announcement-content h2,.announcement-content h3,.announcement-content h4{margin:16px 0 8px}.announcement-content p{margin:8px 0}.announcement-content code{padding:2px 5px;border-radius:4px;background:#f3f5f7}.announcement-content pre{overflow:auto;padding:12px;border-radius:8px;background:#f3f5f7}.announcement-content pre code{padding:0}.announcement-content a{color:#b63813}.announcement-footer{padding:12px 30px 28px;text-align:center;background:linear-gradient(170deg,#fff 0%,#fff 38%,#fbeecd 100%)}.announcement-actions{display:flex;justify-content:center;gap:10px;flex-wrap:wrap}.announcement-footer button{border-radius:50px;background:linear-gradient(to right,#ff711f,#e50914);box-shadow:0 10px 12px -4px rgba(229,9,20,.25)}.maintenance{max-width:520px;margin:13vh auto;padding:28px;border:1px solid #293040;border-radius:12px;background:#171c27;text-align:center}.maintenance details{text-align:left;margin-top:22px}.maintenance label{display:grid;gap:7px;margin:14px 0}.maintenance input{padding:9px;border:1px solid #3a455b;border-radius:7px;background:#0d1119;color:#fff;width:100%}@media(max-width:900px){.gallery.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}.header-menu{position:fixed;z-index:6;top:54px;right:8px;width:160px;display:flex;flex-direction:column;gap:6px;padding:10px;background:#10131a;border:1px solid #3a455b;border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.4)}#header-menu-backdrop{position:fixed;z-index:5;inset:0}#header-menu-toggle{display:none;position:fixed;z-index:7;top:8px;right:8px;width:38px;height:38px;padding:0;font-size:18px;border-radius:8px}#header-menu .button,#header-menu button{width:100%;text-align:center;padding:8px 10px}#header-menu a{display:block;padding:8px 10px;text-align:center;border-radius:7px;background:#4b8cff;color:#fff;text-decoration:none}@media(max-width:560px){header{padding:10px 56px 10px 12px}header>strong,header>.meta{font-size:14px}header .spacer{display:none}header>button,header>a{display:none}.gallery{padding:10px}.gallery.grid{grid-template-columns:1fr}.gallery.grid .card.wide{grid-column:span 1}.lightbox-image{height:calc(94vh - 126px)}#header-menu-toggle{display:block}.card-tags{max-height:56px;gap:3px;padding:5px 7px}.card-tags .tag-vote,.card-tags .tag-category{padding:3px 6px;font-size:10px}.tag-bar{padding:6px 10px;gap:4px;max-height:64px;overflow:hidden}.tag-bar-label{display:none}.tag-chip{padding:3px 8px;font-size:11px}}
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#10131a;color:#e7edf7;font:15px system-ui,sans-serif}header{position:sticky;z-index:2;top:0;display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:14px 18px;background:#10131af2;border-bottom:1px solid #293040}button,.button{background:#4b8cff;border:0;border-radius:7px;color:#fff;padding:9px 13px;cursor:pointer;text-decoration:none}button:disabled{opacity:.45;cursor:not-allowed}.meta{color:#a9b7cd;font-size:13px}.spacer{flex:1}.gallery{padding:18px}.gallery.waterfall{display:flex;align-items:flex-start;gap:var(--grid-gap,12px)}.waterfall-column{display:flex;min-width:0;flex:1;flex-direction:column;gap:var(--grid-gap,12px)}.card{position:relative;background:#171c27;border:1px solid #293040;border-radius:10px;overflow:hidden}.preview-button{display:block;width:100%;padding:0;border:0;border-radius:0;background:transparent}.card img{width:100%;display:block;max-height:82vh;object-fit:contain;background:#080a0f}.hidden{display:none!important}a{color:inherit}#empty{padding:40px;text-align:center;color:#a9b7cd}dialog{width:min(96vw,1500px);height:min(94vh,1000px);padding:0;border:1px solid #3a455b;border-radius:12px;background:#10131a;color:#e7edf7}dialog::backdrop{background:#000c}.lightbox-head,.lightbox-foot{display:flex;gap:12px;align-items:center;padding:10px 12px}.lightbox-head{justify-content:space-between}.lightbox-controls{display:flex;gap:8px}.lightbox-stage{height:calc(94vh - 126px);overflow:auto;background:#080a0f;display:grid;place-items:center}.lightbox-image{display:block;width:100%;height:100%;object-fit:contain;transform-origin:center;transition:transform .15s ease}.lightbox-meta{min-width:0;display:grid;gap:4px}.lightbox-caption,.lightbox-directory{margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.lightbox-directory{color:#a9b7cd;font-size:13px}.modal-backdrop{position:fixed;z-index:4;inset:0;background:#0008}#announcement-backdrop{position:fixed!important;z-index:1000!important;inset:0!important;background:#10131a!important;opacity:1!important;pointer-events:auto!important;animation:backdrop-in .25s ease both}.announcement{z-index:1001!important;pointer-events:auto!important}body.announcement-open{overflow:hidden}body.announcement-open>header,body.announcement-open>main,body.announcement-open>#maintenance{pointer-events:none!important;user-select:none}body.announcement-open>#announcement-backdrop,body.announcement-open>#announcement{display:block!important;visibility:visible!important}.preferences{position:fixed;z-index:5;top:50%;left:50%;width:min(92vw,430px);height:auto;padding:20px;border:1px solid #3a455b;border-radius:12px;background:#10131a;color:#e7edf7;transform:translate(-50%,-50%);box-shadow:0 1.5rem 2.2rem rgba(0,0,0,.28)}.preferences h2{margin-top:0}.preferences label{display:grid;gap:7px;margin:14px 0}.preferences select,.preferences input{padding:9px;border:1px solid #3a455b;border-radius:7px;background:#0d1119;color:#fff}.preferences-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:18px}.announcement{position:fixed;z-index:5;top:50%;left:50%;width:min(94vw,680px);height:auto;padding:0;border:0;border-radius:22px;background:linear-gradient(145deg,#fffdf8 0%,#fff 54%,#fff0e3 100%);color:#282828;box-shadow:0 1.5rem 3rem rgba(0,0,0,.38);overflow:hidden;transform:translate(-50%,-50%);animation:announcement-in .32s cubic-bezier(.2,.8,.2,1) both}.announcement.is-closing{animation:announcement-out .22s ease-in both}@keyframes backdrop-in{from{opacity:0}to{opacity:1}}@keyframes announcement-in{from{opacity:0;transform:translate(-50%,-46%) scale(.96)}to{opacity:1;transform:translate(-50%,-50%) scale(1)}}@keyframes announcement-out{from{opacity:1;transform:translate(-50%,-50%) scale(1)}to{opacity:0;transform:translate(-50%,-46%) scale(.97)}}.announcement-main{padding:26px 30px 12px}.announcement-title{position:relative;z-index:0;display:inline-block;margin:0 0 18px;font-size:21px}.announcement-title::after{content:'';position:absolute;z-index:-1;right:-3px;bottom:2px;left:-3px;height:14px;border-radius:4px;background:#fbeecd;transform:skewX(-15deg)}.announcement-content{margin:0;line-height:1.7}.announcement-content h1,.announcement-content h2,.announcement-content h3,.announcement-content h4{margin:16px 0 8px}.announcement-content p{margin:8px 0}.announcement-content code{padding:2px 5px;border-radius:4px;background:#f3f5f7}.announcement-content pre{overflow:auto;padding:12px;border-radius:8px;background:#f3f5f7}.announcement-content pre code{padding:0}.announcement-content a{color:#b63813}.announcement-footer{padding:12px 30px 28px;text-align:center;background:linear-gradient(170deg,#fff 0%,#fff 38%,#fbeecd 100%)}.announcement-actions{display:flex;justify-content:center;gap:10px;flex-wrap:wrap}.announcement-footer button{border-radius:50px;background:linear-gradient(to right,#ff711f,#e50914);box-shadow:0 10px 12px -4px rgba(229,9,20,.25)}.maintenance{max-width:520px;margin:13vh auto;padding:28px;border:1px solid #293040;border-radius:12px;background:#171c27;text-align:center}.maintenance details{text-align:left;margin-top:22px}.maintenance label{display:grid;gap:7px;margin:14px 0}.maintenance input{padding:9px;border:1px solid #3a455b;border-radius:7px;background:#0d1119;color:#fff;width:100%}.header-menu{position:fixed;z-index:6;top:54px;right:8px;width:160px;display:flex;flex-direction:column;gap:6px;padding:10px;background:#10131a;border:1px solid #3a455b;border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.4)}#header-menu-backdrop{position:fixed;z-index:5;inset:0}#header-menu-toggle{display:none;position:fixed;z-index:7;top:8px;right:8px;width:38px;height:38px;padding:0;font-size:18px;border-radius:8px}#header-menu .button,#header-menu button{width:100%;text-align:center;padding:8px 10px}#header-menu a{display:block;padding:8px 10px;text-align:center;border-radius:7px;background:#4b8cff;color:#fff;text-decoration:none}@media(max-width:560px){header{padding:10px 56px 10px 12px}header>strong,header>.meta{font-size:14px}header .spacer{display:none}header>button,header>a{display:none}.gallery{padding:10px}.lightbox-image{height:calc(94vh - 126px)}#header-menu-toggle{display:block}.card-tags{max-height:56px;gap:3px;padding:5px 7px}.card-tags .tag-vote,.card-tags .tag-category{padding:3px 6px;font-size:10px}.tag-bar{padding:6px 10px;gap:4px;max-height:64px;overflow:hidden}.tag-bar-label{display:none}.tag-chip{padding:3px 8px;font-size:11px}}
 </style>
 <style>
 .gallery.slideshow{display:grid;min-height:calc(100vh - 80px);place-items:center}.gallery.slideshow .card{max-width:min(96vw,1280px)}.gallery.waterfall .card{min-height:180px}.gallery.waterfall .card img{max-height:none;min-height:180px}.lightbox-stage{position:relative;overflow:hidden;cursor:grab;touch-action:none;overscroll-behavior:contain}.lightbox-stage.is-dragging{cursor:grabbing}.lightbox-image{width:100%;height:100%;max-width:none;max-height:none;pointer-events:none;user-select:none;will-change:transform}.announcement{display:flex;max-height:min(78vh,680px);flex-direction:column}.announcement-main{display:flex;min-height:0;flex:1;flex-direction:column}.announcement-content{min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding-right:8px}.announcement-footer{flex:0 0 auto}body.announcement-open>#announcement{display:flex!important}
@@ -1186,7 +1177,7 @@ body.has-slide-history .slide-nav.pause{bottom:132px}
 .slide-nav.next:hover{transform:translateY(-50%) scale(1.07);border-color:#4b8cff}
 .slide-nav.pause:hover{transform:translateX(-50%) scale(1.07);border-color:#4b8cff}
 body.theme-light .slide-nav{background:#ffffffd9;border-color:#c8d1e0;color:#3a4252}
-.gallery.single{touch-action:pan-y}
+.gallery.slideshow{touch-action:pan-y}
 @media(max-width:560px){.slide-nav.prev{left:6px;width:36px;height:56px;font-size:26px}.slide-nav.next{right:6px;width:36px;height:56px;font-size:26px}.slide-nav.pause{bottom:12px}body.has-slide-history .slide-nav.pause{bottom:112px}}
 @media(max-width:760px){header{padding:10px 56px 10px 12px}header .spacer{display:none}header>button,header>a{display:none}#header-menu-toggle{display:block}}
 .header-menu{opacity:0;visibility:hidden;transform:translateY(-10px);transition:opacity .22s ease,transform .22s ease,visibility .22s}
@@ -1369,7 +1360,7 @@ function normalizedPreferences(value,defaults){
   result.slideshow_interval=Math.max(0,Math.min(300,Number(stored.slideshow_interval??8)||0));
   result.grid_gap=Math.max(0,Math.min(48,Number(stored.grid_gap??defaults.grid_gap)||0));
   result.show_tags_enabled=result.show_tags_enabled!==false;
-  if(!['dark','light'].includes(result.theme)) result.theme='dark';
+  if(!['dark','light'].includes(result.theme)) result.theme=['dark','light'].includes(defaults.theme)?defaults.theme:'dark';
   if(!['union','intersect'].includes(result.filter_mode)) result.filter_mode='union';
   if(!PREVIEW_QUALITY_OPTIONS.includes(result.preview_quality)) result.preview_quality='176';
   if(!LIGHTBOX_QUALITY_OPTIONS.includes(result.lightbox_quality)) result.lightbox_quality='original';
@@ -1383,13 +1374,6 @@ async function loadSettings(){
   let stored={};
   try{stored=JSON.parse(localStorage.getItem(PREFERENCE_KEY)||'{}');}catch(error){localStorage.removeItem(PREFERENCE_KEY);}
   const preferences=normalizedPreferences(stored,defaults);
-  preferences.default_view_layout=defaults.view_layout==='waterfall'?'waterfall':'slideshow';
-  preferences.default_slideshow_interval=8;
-  preferences.default_grid_gap=defaults.grid_gap;
-  preferences.default_caption_mode=defaults.caption_mode;
-  preferences.default_show_tags_enabled=true;
-  preferences.default_theme='dark';
-  preferences.default_filter_mode='union';
   preferences.announcement=defaults.announcement;
   preferences.maintenance_enabled=defaults.maintenance_enabled;
   preferences.directory_display_enabled=defaults.directory_display_enabled;
@@ -1707,7 +1691,6 @@ function createCard(image,eager=false){
   picture.decoding='async';
   if(eager) picture.fetchPriority='high';
   picture.alt='';
-  picture.addEventListener('load',()=>card.classList.toggle('wide',picture.naturalWidth/picture.naturalHeight>=1.45),{once:true});
   attachImageRecovery(picture,image);
   const applySrc=()=>{
     if(picture.dataset.srcApplied==='1') return card._ready||Promise.resolve();
@@ -2553,7 +2536,6 @@ body.theme-light .tree{border-color:#dde3ee}
     <h3>标签分类</h3>
     <p class="note">每行一个分类名称（最多 32 个），如：男生、女生、AI、风景、动漫。访客可点击为图片打上分类标签。</p>
     <textarea id="tagging-categories" rows="5" placeholder="男生&#10;女生&#10;AI&#10;风景&#10;动漫" style="width:100%;font:inherit;padding:9px;border:1px solid #3a455b;border-radius:7px;background:#0d1119;color:#fff"></textarea>
-    <label>默认排序方式<select id="tagging-sort-default"><option value="likes">按点赞数</option><option value="ratio">按好评率</option></select></label>
     <h3>筛选功能</h3>
     <label class="check"><input id="filter-enabled" type="checkbox">允许访客使用标签筛选功能</label>
     <h3>日志记录</h3>
@@ -2583,7 +2565,7 @@ body.theme-light .tree{border-color:#dde3ee}
 
   <div id="tab-tools" class="tab-panel">
     <h2>索引与备份</h2>
-    <div class="row actions"><button id="save-server" type="button">保存服务器配置</button><button id="rebuild" type="button">后台重建图片与目录索引</button><button id="backup" type="button">下载配置备份</button></div>
+    <div class="row actions"><button id="save-server" type="button">保存服务器配置</button><button id="rebuild" type="button">后台重建图片索引</button><button id="backup" type="button">下载配置备份</button></div>
     <div class="row actions"><label>上传备份配置（ZIP）<input id="backup-file" type="file" accept=".zip,application/zip"></label><button id="restore-backup" class="secondary" type="button">上传并恢复备份</button></div>
     <p class="note">恢复仅覆盖可在本页面编辑的配置，不恢复管理密钥、OpenList 令牌、端口等系统设置。</p>
   </div>
@@ -2599,7 +2581,7 @@ function showSelected(){const root=document.querySelector('#selected');root.repl
 function escapeHtml(value){return value.replace(/[&<>"']/g,character=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));}
 function renderMarkdown(value){return escapeHtml(value).replace(/&lt;font\s+color=(?:&quot;|&#39;)?(#[0-9a-f]{3,8}|[a-z]+)(?:&quot;|&#39;)?\s*&gt;/gi,'<span style="color:$1">').replace(/&lt;\/font&gt;/gi,'</span>').replace(/```([\s\S]*?)```/g,'<pre><code>$1</code></pre>').replace(/^### (.*)$/gm,'<h3>$1</h3>').replace(/^## (.*)$/gm,'<h2>$1</h2>').replace(/^# (.*)$/gm,'<h1>$1</h1>').replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>').replace(/\*([^*]+)\*/g,'<em>$1</em>').replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>').replace(/\n\n/g,'</p><p>').replace(/\n/g,'<br>');}
 function previewAnnouncement(){document.querySelector('#announcement-preview').innerHTML='<p>'+renderMarkdown(document.querySelector('#announcement-content').value)+'</p>';}
-function showAdmin(){document.querySelector('#default-caption').value=config.caption_mode;document.querySelector('#directory-display-enabled').checked=config.directory_display_enabled;document.querySelector('#directory-display-depth').value=config.directory_display_depth;document.querySelector('#theme').value=config.theme||'dark';document.querySelector('#announcement-enabled').checked=config.announcement_enabled;document.querySelector('#announcement-title').value=config.announcement_title;document.querySelector('#announcement-content').value=config.announcement_content;document.querySelector('#announcement-required-seconds').value=config.announcement_required_seconds;document.querySelector('#maintenance-enabled').checked=config.maintenance_enabled;document.querySelector('#tagging-enabled').checked=config.tagging_enabled||false;document.querySelector('#tagging-scope').value=config.tagging_scope||'disabled';document.querySelector('#tagging-categories').value=(config.tagging_categories||[]).join('\n');document.querySelector('#tagging-sort-default').value=config.tagging_sort_default||'likes';document.querySelector('#filter-enabled').checked=config.filter_enabled!==false;document.querySelector('#log-level').value=config.log_level||'INFO';document.querySelector('#protected').classList.remove('hidden');showSelected();previewAnnouncement();}
+function showAdmin(){document.querySelector('#default-caption').value=config.caption_mode;document.querySelector('#directory-display-enabled').checked=config.directory_display_enabled;document.querySelector('#directory-display-depth').value=config.directory_display_depth;document.querySelector('#theme').value=config.theme||'dark';document.querySelector('#announcement-enabled').checked=config.announcement_enabled;document.querySelector('#announcement-title').value=config.announcement_title;document.querySelector('#announcement-content').value=config.announcement_content;document.querySelector('#announcement-required-seconds').value=config.announcement_required_seconds;document.querySelector('#maintenance-enabled').checked=config.maintenance_enabled;document.querySelector('#tagging-enabled').checked=config.tagging_enabled||false;document.querySelector('#tagging-scope').value=config.tagging_scope||'disabled';document.querySelector('#tagging-categories').value=(config.tagging_categories||[]).join('\n');document.querySelector('#filter-enabled').checked=config.filter_enabled!==false;document.querySelector('#log-level').value=config.log_level||'INFO';document.querySelector('#protected').classList.remove('hidden');showSelected();previewAnnouncement();}
 async function errorText(response,fallback){try{const data=await response.json();return data.error||fallback;}catch(error){return fallback;}}
 async function load(){const response=await fetch('/api/admin/config',{headers:auth(),cache:'no-store'});if(!response.ok)throw new Error(await errorText(response,'令牌无效或服务不可用'));config=await response.json();showAdmin();setAdminStatus('服务器配置已加载');}
 function addDirectory(path){if(!config.directories.includes(path)){config.directories.push(path);showSelected();setAdminStatus('已添加目录：'+path+'，请保存服务器配置');}}
@@ -2676,12 +2658,12 @@ async function browse(){
   if(!data.directories.length){container.innerHTML='<p class="note">当前目录没有子目录。</p>';}
   else{data.directories.forEach(item=>{const child=buildTreeNode(item.name,item.path,true,item.has_children);container.append(child);});}
 }
-async function saveServer(){if(!config)throw new Error('请先加载服务器配置');const payload={directories:config.directories,caption_mode:document.querySelector('#default-caption').value,directory_display_enabled:document.querySelector('#directory-display-enabled').checked,directory_display_depth:Number(document.querySelector('#directory-display-depth').value),theme:document.querySelector('#theme').value,announcement_enabled:document.querySelector('#announcement-enabled').checked,announcement_title:document.querySelector('#announcement-title').value,announcement_content:document.querySelector('#announcement-content').value,announcement_required_seconds:Number(document.querySelector('#announcement-required-seconds').value),maintenance_enabled:document.querySelector('#maintenance-enabled').checked,tagging_enabled:document.querySelector('#tagging-enabled').checked,tagging_scope:document.querySelector('#tagging-scope').value,tagging_categories:document.querySelector('#tagging-categories').value.split('\n').map(s=>s.trim()).filter(Boolean),tagging_sort_default:document.querySelector('#tagging-sort-default').value,filter_enabled:document.querySelector('#filter-enabled').checked,log_level:document.querySelector('#log-level').value};const response=await fetch('/api/admin/config',{method:'PUT',headers:auth(),body:JSON.stringify(payload)});if(!response.ok)throw new Error(await errorText(response,'保存失败'));config=await response.json();showAdmin();setAdminStatus('全局服务器配置已保存；公告修改后将向访客显示新版本。');}
+async function saveServer(){if(!config)throw new Error('请先加载服务器配置');const payload={directories:config.directories,caption_mode:document.querySelector('#default-caption').value,directory_display_enabled:document.querySelector('#directory-display-enabled').checked,directory_display_depth:Number(document.querySelector('#directory-display-depth').value),theme:document.querySelector('#theme').value,announcement_enabled:document.querySelector('#announcement-enabled').checked,announcement_title:document.querySelector('#announcement-title').value,announcement_content:document.querySelector('#announcement-content').value,announcement_required_seconds:Number(document.querySelector('#announcement-required-seconds').value),maintenance_enabled:document.querySelector('#maintenance-enabled').checked,tagging_enabled:document.querySelector('#tagging-enabled').checked,tagging_scope:document.querySelector('#tagging-scope').value,tagging_categories:document.querySelector('#tagging-categories').value.split('\n').map(s=>s.trim()).filter(Boolean),filter_enabled:document.querySelector('#filter-enabled').checked,log_level:document.querySelector('#log-level').value};const response=await fetch('/api/admin/config',{method:'PUT',headers:auth(),body:JSON.stringify(payload)});if(!response.ok)throw new Error(await errorText(response,'保存失败'));config=await response.json();showAdmin();setAdminStatus('全局服务器配置已保存；公告修改后将向访客显示新版本。');}
 function formatSeconds(value){const seconds=Math.max(1,Math.round(Number(value)||0));return seconds<60?seconds+' 秒':Math.ceil(seconds/60)+' 分钟';}
 async function pollRebuild(doneMessage='索引后台重建完成'){const response=await fetch('/api/status',{cache:'no-store'});if(!response.ok)return;if((await response.json()).refreshing){rebuildTimer=setTimeout(()=>pollRebuild(doneMessage).catch(report),2000);}else{setAdminStatus(doneMessage);rebuildTimer=null;}}
 async function rebuild(){const statusResponse=await fetch('/api/status',{cache:'no-store'});const previous=statusResponse.ok?await statusResponse.json():{};const response=await fetch('/api/admin/rebuild',{method:'POST',headers:auth()});if(!response.ok)throw new Error(await errorText(response,'重建未启动'));const estimate=Number(previous.last_build_duration_seconds)||0;setAdminStatus('索引正在后台重建'+(estimate?'，预计约 '+formatSeconds(estimate):'，首次重建暂无预估时间'));clearTimeout(rebuildTimer);rebuildTimer=setTimeout(()=>pollRebuild().catch(report),2000);}
 async function backup(){const response=await fetch('/api/admin/backup',{headers:auth()});if(!response.ok)throw new Error(await errorText(response,'备份下载失败'));const blob=await response.blob();const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download='openlist-image-api-backup.zip';link.click();setTimeout(()=>URL.revokeObjectURL(link.href),1000);setAdminStatus('配置备份已下载（不含 token）');}
-async function restoreBackup(){const file=document.querySelector('#backup-file').files[0];if(!file)throw new Error('请先选择 ZIP 备份文件');if(!window.confirm('确定恢复该备份中的可编辑配置吗？'))return;const response=await fetch('/api/admin/backup',{method:'POST',headers:{'X-OpenList-Admin-Token':document.querySelector('#token').value},body:file});if(!response.ok)throw new Error(await errorText(response,'备份恢复失败'));config=await response.json();showAdmin();setAdminStatus('备份配置已恢复，请按需保存或重建图片与目录索引。');}
+async function restoreBackup(){const file=document.querySelector('#backup-file').files[0];if(!file)throw new Error('请先选择 ZIP 备份文件');if(!window.confirm('确定恢复该备份中的可编辑配置吗？'))return;const response=await fetch('/api/admin/backup',{method:'POST',headers:{'X-OpenList-Admin-Token':document.querySelector('#token').value},body:file});if(!response.ok)throw new Error(await errorText(response,'备份恢复失败'));config=await response.json();showAdmin();setAdminStatus('备份配置已恢复，请按需保存或重建图片索引。');}
 function report(error){setAdminStatus('操作失败：'+error.message);}
 document.querySelectorAll('.tab-button').forEach(btn=>{btn.onclick=()=>{document.querySelectorAll('.tab-button').forEach(b=>b.classList.remove('active'));document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));btn.classList.add('active');document.getElementById('tab-'+btn.dataset.tab).classList.add('active');};});
 function applyTheme(theme){document.body.classList.toggle('theme-light',theme==='light');document.body.classList.toggle('theme-dark',theme!=='light');document.querySelector('#theme-toggle').textContent=theme==='light'?'☀':'🌙';try{localStorage.setItem('openlist-admin-theme',theme);}catch(e){}}
@@ -2845,20 +2827,14 @@ def make_handler(application: Application):
                         return
                     raw_path = params.get("path", [""])[0]
                     refresh = params.get("fresh", ["0"])[0].lower() in {"1", "true", "yes"}
-                    try:
-                        image = application.indexed_image(raw_path)
-                    except ValueError:
-                        image = {"path": normalize_directory(raw_path), "size": 0}
+                    image = application.indexed_image(raw_path)
                     resolved = application.resolve_images([image], refresh=refresh)[0]
                     return self._send_json(HTTPStatus.OK, {"url": resolved["url"], "thumbnail": resolved.get("thumbnail", "")})
                 if parsed.path == "/download":
                     if self._maintenance_access_required():
                         return
                     raw_path = params.get("path", [""])[0]
-                    try:
-                        image = application.indexed_image(raw_path)
-                    except ValueError:
-                        image = {"path": normalize_directory(raw_path), "size": 0}
+                    image = application.indexed_image(raw_path)
                     return self._proxy_download(image)
                 if parsed.path == "/random":
                     if self._maintenance_access_required():
@@ -3025,8 +3001,13 @@ def make_handler(application: Application):
                     return self._send_json(HTTPStatus.BAD_REQUEST, {"error": "value must be a boolean"})
                 admin_token = admin_token_from_headers(self.headers)
                 scope = application.config["tagging_scope"]
-                if scope == "token" and not admin_token:
-                    return self._send_json(HTTPStatus.FORBIDDEN, {"error": "admin token required for token-scope tagging"})
+                if scope == "token":
+                    try:
+                        authorized = bool(admin_token) and application.is_admin(admin_token)
+                    except RuntimeError:
+                        authorized = False
+                    if not authorized:
+                        return self._send_json(HTTPStatus.FORBIDDEN, {"error": "valid admin token required for token-scope tagging"})
                 normalized = normalize_directory(image_path)
                 application.indexed_image(normalized)
                 voter = application.voter_id(self.client_address[0], self.headers.get("User-Agent", ""), admin_token)
@@ -3042,7 +3023,7 @@ def make_handler(application: Application):
                         return self._send_json(HTTPStatus.BAD_REQUEST, {"error": "category not allowed"})
                     if len(category) > 32:
                         return self._send_json(HTTPStatus.BAD_REQUEST, {"error": "category name too long"})
-                    result = application.tags.set_category(normalized, voter, category, value)
+                    result = application.tags.set_category(normalized, category, value)
                 else:
                     result = application.tags.vote(normalized, voter, vote_type, value)
                 return self._send_json(HTTPStatus.OK, result)
