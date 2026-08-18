@@ -6,4 +6,6 @@ build/
 dist/
 .preview/
 .local-preview/
+.brv/
+.zcode/
 testrun.txt

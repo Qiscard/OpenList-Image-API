@@ -106,14 +106,36 @@ class WebUiMarkupTests(unittest.TestCase):
         page = gallery_html()
         self.assertIn("requestImages(WATERFALL_BATCH_SIZE)", page)
         self.assertIn("WATERFALL_BATCH_SIZE=20", page)
-        self.assertIn("SLIDE_PRELOAD_COUNT=3", page)
+        self.assertIn("SLIDE_PRELOAD_COUNT=2", page)
+        self.assertIn("URL_RESOLVE_CONCURRENCY=3", page)
         self.assertIn("SLIDE_INITIAL_LOAD=6", page)
         self.assertIn("loadSlideshow", page)
         self.assertIn("document.documentElement.scrollHeight*.6", page)
-        self.assertIn("refreshImageUrls(images,false)", page)
+        self.assertIn("queueImageResolve(current,{priority:0})", page)
+        self.assertIn("refreshImageUrls(upcoming,false,true,1)", page)
+        self.assertIn("preloadUpcomingSlides", page)
+        self.assertIn("waterfallPrefetchPromise", page)
         self.assertIn("prefetchNextWaterfallBatch()", page)
+        self.assertIn("const cards=images.map(image=>createCard(image))", page)
+        self.assertNotIn("const first=images.slice(0,4)", page)
         self.assertIn("method:'POST'", page)
-        self.assertIn("body:JSON.stringify({paths:pending.map(image=>image.path),fresh:!!force})", page)
+        self.assertIn("fetchJsonWithRetry('/api/download-url'", page)
+        self.assertIn("preview:true", page)
+        self.assertIn("new Map((resolved.images||[]).map", page)
+        self.assertIn("批量预览解析失败，将按图片重试", page)
+        self.assertIn("const URL_RESOLVE_CONCURRENCY=3", page)
+        self.assertIn("urlResolveTasks=new Map()", page)
+        self.assertIn("needsImageResolve(image,force,preview)", page)
+        self.assertIn("if(needsImageResolve(image,false,true))", page)
+        self.assertIn("const sourceReady=preview?!!image.thumbnail:!!image.url", page)
+        self.assertIn("generation!==renderGeneration", page)
+        self.assertIn("role=\"status\" aria-live=\"polite\"", page)
+        self.assertIn("aria-busy=\"true\"", page)
+        self.assertIn("if(width<=560) return 1", page)
+        self.assertIn("scroll-snap-type:x proximity", page)
+        self.assertIn("role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"preferences-title\"", page)
+        self.assertIn("prefers-reduced-motion:reduce", page)
+        self.assertIn("className='image-error'", page)
         self.assertIn("openlist-image-preferences-v2", page)
         self.assertIn("openlist-image-announcement-v2-", page)
         self.assertIn("waterfall-column", page)
@@ -161,6 +183,14 @@ class WebUiMarkupTests(unittest.TestCase):
         self.assertNotIn("id=\"caption\"", page)
         self.assertNotIn("tagging-sort-default", page)
         self.assertIn("后台重建图片索引", page)
+        self.assertIn("role=\"tablist\"", page)
+        self.assertIn("role=\"tab\" aria-selected=\"true\"", page)
+        self.assertIn("role=\"tabpanel\"", page)
+        self.assertIn("runButtonAction", page)
+        self.assertIn("#tagging-stats').onclick=event=>runButtonAction", page)
+        self.assertIn("#trash-delete-all').onclick=event=>runButtonAction", page)
+        self.assertIn("aria-expanded", page)
+        self.assertNotIn("save-server-bottom", page)
 
 
 class DownloadTests(unittest.TestCase):
@@ -238,6 +268,13 @@ class DownloadTests(unittest.TestCase):
                     for path in paths
                 ]
 
+            def resolve_preview_urls(self, paths: list[str], refresh: bool = False) -> list[dict[str, object]]:
+                del refresh
+                return [
+                    {"path": path, "url": "", "thumbnail": "https://example.invalid/thumb" + path}
+                    for path in paths
+                ]
+
         server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(FakeApplication()))
         server_thread = threading.Thread(target=server.serve_forever, daemon=True)
         server_thread.start()
@@ -261,6 +298,16 @@ class DownloadTests(unittest.TestCase):
             with urlopen(f"http://127.0.0.1:{server.server_port}/api/download-url?path=/gallery/a.jpg") as response:
                 single = json.loads(response.read().decode("utf-8"))
             self.assertEqual(single["url"], "https://example.invalid/gallery/a.jpg")
+            preview_request = Request(
+                f"http://127.0.0.1:{server.server_port}/api/download-url",
+                data=json.dumps({"paths": ["/gallery/a.jpg"], "preview": True}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(preview_request) as response:
+                preview = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(preview["images"][0]["url"], "")
+            self.assertEqual(preview["images"][0]["thumbnail"], "https://example.invalid/thumb/gallery/a.jpg")
         finally:
             server.shutdown()
             server.server_close()
@@ -378,6 +425,19 @@ class TuiManagementTests(unittest.TestCase):
         self.assertIn('"6": show_status_with_admin_token', menu_source)
         self.assertIn('"7": maintenance_menu', menu_source)
         self.assertNotIn('"12": print_admin_token', menu_source)
+
+    def test_cache_cleanup_removes_persisted_url_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cache_path = Path(temporary) / "url_cache.json"
+            cache_path.write_text("{}", encoding="utf-8")
+            with (
+                patch.object(openlist_tui, "require_root"),
+                patch.object(openlist_tui, "cleanup_legacy_residuals"),
+                patch.object(openlist_tui, "read_config", return_value={"state_dir": temporary}),
+                patch.object(openlist_tui, "command_output", return_value="inactive"),
+            ):
+                openlist_tui.cleanup_residuals_and_runtime_cache()
+            self.assertFalse(cache_path.exists())
 
 
 class InstallerTests(unittest.TestCase):

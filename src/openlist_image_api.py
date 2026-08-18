@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import hashlib
 import hmac
 import io
 import json
@@ -18,7 +19,7 @@ import threading
 import time
 import zipfile
 from collections import OrderedDict, deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -65,6 +66,10 @@ ALLOWED_DELIVERY = {"preview", "download"}
 ALLOWED_CAPTION_MODES = {"path", "name", "hidden"}
 MAX_REQUEST_BODY = 64 * 1024
 URL_RESOLVE_WORKERS = 20
+URL_RESOLVE_WAIT_SECONDS = 8
+INDEX_LIST_TIMEOUT_SECONDS = 10
+INDEX_LIST_WORKERS = 4
+INDEX_CHECKPOINT_INTERVAL = 32
 DEVICE_PREFERENCE_DEFAULTS: dict[str, Any] = {
     "view_layout": DEFAULT_CONFIG["view_layout"],
     "grid_gap": DEFAULT_CONFIG["grid_gap"],
@@ -253,7 +258,14 @@ class OpenListClient:
         self.base_url = config["openlist_api_url"].rstrip("/")
         self.token_path = Path(config["openlist_token_file"])
 
-    def _post(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _post(
+        self,
+        endpoint: str,
+        payload: dict[str, Any],
+        timeout: float = 15,
+        retries: int = 1,
+        retry_throttled_only: bool = False,
+    ) -> dict[str, Any]:
         token = read_secret_cached(self.token_path, "OpenList API token")
         post_start = time.time()
         request = Request(
@@ -263,9 +275,10 @@ class OpenListClient:
             method="POST",
         )
         last_error: Exception | None = None
-        for attempt in range(2):
+        attempts = max(1, retries + 1)
+        for attempt in range(attempts):
             try:
-                with urlopen(request, timeout=15) as response:
+                with urlopen(request, timeout=timeout) as response:
                     result = json.load(response)
                 if result.get("code") != 200:
                     raise RuntimeError(result.get("message") or "OpenList rejected request")
@@ -277,41 +290,80 @@ class OpenListClient:
             except (HTTPError, URLError, TimeoutError, ValueError, RuntimeError) as error:
                 last_error = error
                 logging.debug("OpenList %s failed attempt %d: %s", endpoint, attempt + 1, error)
-                if attempt < 1:
-                    time.sleep(0.5)
+                throttled = (
+                    isinstance(error, HTTPError) and error.code == HTTPStatus.TOO_MANY_REQUESTS
+                ) or "throttl" in str(error).lower()
+                if (
+                    isinstance(error, TimeoutError)
+                    or attempt >= attempts - 1
+                    or (retry_throttled_only and not throttled)
+                ):
+                    break
+                time.sleep(1.0 if throttled else 0.5)
         raise RuntimeError(f"OpenList request failed: {last_error}")
 
-    def list_directory(self, path: str) -> list[dict[str, Any]]:
+    def list_directory(self, path: str, index_scan: bool = False) -> list[dict[str, Any]]:
         page = 1
         entries: list[dict[str, Any]] = []
+        timeout = INDEX_LIST_TIMEOUT_SECONDS if index_scan else 15
         while True:
             data = self._post(
                 "/api/fs/list",
                 {"path": path, "password": "", "page": page, "per_page": 1000, "refresh": False},
+                timeout=timeout,
+                retries=1,
+                retry_throttled_only=index_scan,
             )
             content = data.get("content") or []
             if not isinstance(content, list):
                 raise RuntimeError("OpenList returned invalid directory content")
             entries.extend(item for item in content if isinstance(item, dict))
-            total = int(data.get("total") or len(entries))
-            if not content or len(entries) >= total:
+            try:
+                total = int(data.get("total") or len(entries))
+            except (TypeError, ValueError) as error:
+                raise RuntimeError("OpenList returned invalid directory total") from error
+            if total < len(entries) or not content:
                 return entries
             page += 1
 
     def resolve_file(self, path: str) -> tuple[str, str]:
-        data = self._post("/api/fs/get", {"path": path, "password": "", "refresh": False})
+        data = self._post(
+            "/api/fs/get",
+            {"path": path, "password": "", "refresh": False},
+            timeout=8,
+            retries=1,
+            retry_throttled_only=True,
+        )
         url = str(data.get("raw_url") or data.get("url") or "").strip()
         if not url:
             raise RuntimeError("OpenList did not return a file URL")
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise RuntimeError("OpenList returned an invalid file URL")
-        thumb = str(data.get("thumb") or "").strip()
-        if thumb:
-            parsed_thumb = urlparse(thumb)
-            if parsed_thumb.scheme not in {"http", "https"} or not parsed_thumb.netloc:
-                thumb = ""
-        return url, thumb
+        return url, self._safe_thumb(data.get("thumb"))
+
+    def resolve_preview(self, path: str) -> tuple[str, str]:
+        data = self._post(
+            "/api/fs/get",
+            {"path": path, "password": "", "refresh": False},
+            timeout=8,
+            retries=1,
+            retry_throttled_only=True,
+        )
+        thumb = self._safe_thumb(data.get("thumb"))
+        if not thumb:
+            raise RuntimeError("OpenList did not return a thumbnail")
+        return "", thumb
+
+    @staticmethod
+    def _safe_thumb(value: Any) -> str:
+        thumb = str(value or "").strip()
+        if not thumb:
+            return ""
+        parsed = urlparse(thumb)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return ""
+        return thumb
 
     def remove_file(self, path: str) -> None:
         parts = path.rsplit("/", 1)
@@ -520,39 +572,149 @@ def join_virtual_path(parent: str, child: str) -> str:
     return normalize_directory(f"{parent.rstrip('/')}/{child}")
 
 
-def build_index(config: dict[str, Any], repository: IndexRepository) -> dict[str, Any]:
+def _index_config_fingerprint(config: dict[str, Any]) -> str:
+    payload = {
+        "directories": config["directories"],
+        "extensions": sorted(config["extensions"]),
+    }
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def build_index(
+    config: dict[str, Any],
+    repository: IndexRepository,
+    progress: Any = None,
+) -> dict[str, Any]:
     started_at = time.time()
     client = OpenListClient(config)
     extensions = set(config["extensions"])
-    queue: deque[str] = deque(config["directories"])
+    state_dir = Path(config["state_dir"])
+    checkpoint_path = state_dir / "index.checkpoint.json"
+    fingerprint = _index_config_fingerprint(config)
+    queue: deque[str] = deque()
     visited: set[str] = set()
     images: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
+    retry_pending: deque[str] = deque()
+    resumed = False
 
-    while queue:
-        current = queue.popleft()
-        if current in visited:
-            continue
-        visited.add(current)
+    try:
+        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        if isinstance(checkpoint, dict) and checkpoint.get("fingerprint") == fingerprint:
+            raw_queue = checkpoint.get("queue", [])
+            raw_visited = checkpoint.get("visited", [])
+            raw_images = checkpoint.get("images", [])
+            raw_retry = checkpoint.get("retry_pending", [])
+            if all(isinstance(item, str) for item in raw_queue + raw_visited + raw_retry) and isinstance(raw_images, list):
+                queue.extend(raw_queue)
+                visited.update(raw_visited)
+                images.extend(item for item in raw_images if isinstance(item, dict))
+                retry_pending.extend(raw_retry)
+                started_at = float(checkpoint.get("started_at") or started_at)
+                resumed = True
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+
+    if not resumed:
+        for directory in config["directories"]:
+            if directory not in visited:
+                visited.add(directory)
+                queue.append(directory)
+
+    completed = 0
+    retry_round = False
+    failures: list[tuple[str, str]] = []
+    state_lock = threading.Lock()
+
+    def report() -> None:
+        if progress is None:
+            return
+        with state_lock:
+            progress({
+                "completed": completed,
+                "queued": len(queue),
+                "active": len(active),
+                "failed": len(failures) + len(retry_pending),
+                "directory_count": len(visited),
+                "image_count": len(images),
+                "elapsed_seconds": round(time.time() - started_at, 2),
+                "retry_round": retry_round,
+            })
+
+    def save_checkpoint() -> None:
+        active_paths = [path for path in active.values()]
+        payload = {
+            "version": 1,
+            "fingerprint": fingerprint,
+            "started_at": started_at,
+            "queue": list(queue) + active_paths,
+            "visited": sorted(visited),
+            "images": images,
+            "retry_pending": list(retry_pending) + [path for path, _error in failures],
+        }
         try:
-            entries = client.list_directory(current)
-        except RuntimeError as error:
-            logging.warning("Skipping directory %s: %s", current, error)
-            errors.append({"directory": current, "error": str(error)})
-            continue
+            atomic_write_json(checkpoint_path, payload)
+        except OSError:
+            logging.warning("Unable to save index checkpoint")
+
+    def handle_entries(current: str, entries: list[dict[str, Any]]) -> None:
         for entry in entries:
             name = str(entry.get("name") or "")
-            if not name or "/" in name or "\\" in name:
+            if not name or name in {".", ".."} or "/" in name or "\\" in name:
                 continue
             path = join_virtual_path(current, name)
             if entry.get("is_dir"):
-                queue.append(path)
+                if path not in visited:
+                    visited.add(path)
+                    queue.append(path)
             elif Path(name).suffix.lower() in extensions:
                 try:
                     size = max(0, int(entry.get("size") or 0))
                 except (TypeError, ValueError):
                     size = 0
                 images.append({"path": path, "size": size})
+
+    active: dict[Any, str] = {}
+    save_checkpoint()
+    with ThreadPoolExecutor(max_workers=INDEX_LIST_WORKERS, thread_name_prefix="openlist-index") as executor:
+        while queue or active or retry_pending or failures:
+            if not active and not queue and failures and not retry_round:
+                retry_pending.extend(path for path, _error in failures)
+                failures.clear()
+                retry_round = True
+            if not active and not queue and retry_pending:
+                retry_round = True
+                queue.extend(retry_pending)
+                retry_pending.clear()
+                continue
+            limit = 1 if retry_round else INDEX_LIST_WORKERS
+            while queue and len(active) < limit:
+                current = queue.popleft()
+                future = executor.submit(client.list_directory, current, True)
+                active[future] = current
+            if not active:
+                if retry_pending:
+                    queue.extend(retry_pending)
+                    retry_pending.clear()
+                    continue
+                break
+            done, _pending = wait(tuple(active), return_when=FIRST_COMPLETED)
+            for future in done:
+                current = active.pop(future)
+                completed += 1
+                try:
+                    handle_entries(current, future.result())
+                except Exception as error:
+                    message = str(error)
+                    if not retry_round:
+                        logging.warning("Retrying directory %s: %s", current, message)
+                        failures.append((current, message))
+                    else:
+                        logging.warning("Skipping directory %s: %s", current, message)
+                        errors.append({"directory": current, "error": message})
+            if completed % INDEX_CHECKPOINT_INTERVAL == 0 or not active:
+                save_checkpoint()
+            report()
 
     index = {
         "version": 2,
@@ -565,6 +727,24 @@ def build_index(config: dict[str, Any], repository: IndexRepository) -> dict[str
         "images": images,
     }
     repository.save(index)
+    try:
+        checkpoint_path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logging.warning("Unable to remove index checkpoint")
+    if progress is not None:
+        progress({
+            "completed": completed,
+            "queued": 0,
+            "active": 0,
+            "failed": len(errors),
+            "directory_count": len(visited),
+            "image_count": len(images),
+            "elapsed_seconds": round(time.time() - started_at, 2),
+            "retry_round": retry_round,
+            "complete": True,
+        })
     return index
 
 
@@ -578,14 +758,17 @@ class _InflightResolve:
 
 
 class UrlCache:
-    def __init__(self, max_size: int, ttl_seconds: int):
+    def __init__(self, max_size: int, ttl_seconds: int, persist_path: Path | None = None):
         self.max_size = max_size
         self.ttl_seconds = ttl_seconds
+        self.persist_path = persist_path
         self._entries: OrderedDict[str, tuple[float, str, str]] = OrderedDict()
         self._lock = threading.Lock()
-        self._inflight: dict[str, _InflightResolve] = {}
+        self._inflight: dict[tuple[str, str], _InflightResolve] = {}
+        self._save_timer: threading.Timer | None = None
         self.hits = 0
         self.misses = 0
+        self._load_persisted()
 
     def _cached_unlocked(self, path: str, count_hit: bool = True) -> tuple[str, str] | None:
         cached = self._entries.get(path)
@@ -611,23 +794,97 @@ class UrlCache:
         cached = self._cached(path)
         return cached[1] if cached else None
 
+    def cached_pair(self, path: str) -> tuple[str, str] | None:
+        return self._cached(path)
+
+    def _load_persisted(self) -> None:
+        if not self.persist_path or not self.max_size or not self.persist_path.exists():
+            return
+        try:
+            data = json.loads(self.persist_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        entries = data.get("entries") if isinstance(data, dict) else None
+        if not isinstance(entries, dict):
+            return
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        loaded: OrderedDict[str, tuple[float, str, str]] = OrderedDict()
+        for path, item in entries.items():
+            if not isinstance(path, str) or not isinstance(item, list) or len(item) < 3:
+                continue
+            saved_at, url, thumb = item[0], item[1], item[2]
+            if not isinstance(saved_at, (int, float)) or not isinstance(url, str) or not isinstance(thumb, str):
+                continue
+            age = now_wall - float(saved_at)
+            if age < 0 or age >= self.ttl_seconds or not (url or thumb):
+                continue
+            loaded[path] = (now_mono - age, url, thumb)
+            if len(loaded) >= self.max_size:
+                break
+        if loaded:
+            self._entries = loaded
+
+    def _mark_dirty(self) -> None:
+        if not self.persist_path or not self.max_size:
+            return
+        with self._lock:
+            if self._save_timer is not None:
+                self._save_timer.cancel()
+            timer = threading.Timer(1.5, self._flush)
+            timer.daemon = True
+            self._save_timer = timer
+            timer.start()
+
+    def _flush(self) -> None:
+        if not self.persist_path or not self.max_size or not self.persist_path.parent.exists():
+            return
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        with self._lock:
+            payload = {
+                "saved_at": int(now_wall),
+                "entries": {
+                    path: [now_wall - (now_mono - stamp), url, thumb]
+                    for path, (stamp, url, thumb) in self._entries.items()
+                    if now_mono - stamp < self.ttl_seconds and (url or thumb)
+                },
+            }
+        try:
+            atomic_write_json(self.persist_path, payload)
+        except OSError:
+            logging.debug("unable to persist url cache")
+
+    def remember(self, path: str, url: str = "", thumb: str = "") -> None:
+        if not self.max_size or not (url or thumb):
+            return
+        with self._lock:
+            previous = self._entries.get(path)
+            if previous and time.monotonic() - previous[0] < self.ttl_seconds:
+                url = url or previous[1]
+                thumb = thumb or previous[2]
+            self._entries[path] = (time.monotonic(), url, thumb)
+            self._entries.move_to_end(path)
+            while len(self._entries) > self.max_size:
+                self._entries.popitem(last=False)
+        self._mark_dirty()
+
     def resolve(self, path: str, client: OpenListClient, refresh: bool = False) -> tuple[str, str]:
         if not refresh:
             cached = self._cached(path)
-            if cached is not None:
+            if cached is not None and cached[0]:
                 return cached
+        key = (path, "download")
         with self._lock:
-            inflight = self._inflight.get(path)
+            inflight = self._inflight.get(key)
             if inflight is None:
                 if not refresh:
                     cached = self._cached_unlocked(path)
-                    if cached is not None:
+                    if cached is not None and cached[0]:
                         return cached
                 inflight = _InflightResolve()
-                self._inflight[path] = inflight
+                self._inflight[key] = inflight
                 self.misses += 1
-                if refresh:
-                    self._entries.pop(path, None)
                 leader = True
             else:
                 leader = False
@@ -642,10 +899,14 @@ class UrlCache:
             url, thumb = client.resolve_file(path)
             if self.max_size:
                 with self._lock:
+                    previous = self._entries.get(path)
+                    if previous and time.monotonic() - previous[0] < self.ttl_seconds:
+                        thumb = thumb or previous[2]
                     self._entries[path] = (time.monotonic(), url, thumb)
                     self._entries.move_to_end(path)
                     while len(self._entries) > self.max_size:
                         self._entries.popitem(last=False)
+                self._mark_dirty()
             inflight.result = (url, thumb)
             return url, thumb
         except Exception as error:
@@ -653,8 +914,56 @@ class UrlCache:
             raise
         finally:
             with self._lock:
-                if self._inflight.get(path) is inflight:
-                    del self._inflight[path]
+                if self._inflight.get(key) is inflight:
+                    del self._inflight[key]
+            inflight.event.set()
+
+    def resolve_preview(self, path: str, client: OpenListClient, refresh: bool = False) -> tuple[str, str]:
+        if not refresh:
+            cached = self._cached(path)
+            if cached is not None and cached[1]:
+                return "", cached[1]
+        key = (path, "preview")
+        with self._lock:
+            inflight = self._inflight.get(key)
+            if inflight is None:
+                if not refresh:
+                    cached = self._cached_unlocked(path)
+                    if cached is not None and cached[1]:
+                        return "", cached[1]
+                inflight = _InflightResolve()
+                self._inflight[key] = inflight
+                self.misses += 1
+                leader = True
+            else:
+                leader = False
+        if not leader:
+            inflight.event.wait()
+            if inflight.error is not None:
+                raise inflight.error
+            if inflight.result is None:
+                raise RuntimeError("preview resolve produced no result")
+            return inflight.result
+        try:
+            _url, thumb = client.resolve_preview(path)
+            if self.max_size:
+                with self._lock:
+                    previous = self._entries.get(path)
+                    url = previous[1] if previous and time.monotonic() - previous[0] < self.ttl_seconds else ""
+                    self._entries[path] = (time.monotonic(), url, thumb)
+                    self._entries.move_to_end(path)
+                    while len(self._entries) > self.max_size:
+                        self._entries.popitem(last=False)
+                self._mark_dirty()
+            inflight.result = ("", thumb)
+            return "", thumb
+        except Exception as error:
+            inflight.error = error
+            raise
+        finally:
+            with self._lock:
+                if self._inflight.get(key) is inflight:
+                    del self._inflight[key]
             inflight.event.set()
 
     def status(self) -> dict[str, int]:
@@ -668,12 +977,28 @@ class Application:
         self.config = load_config(config_path)
         self.repository = IndexRepository(Path(self.config["state_dir"]))
         self.tags = TagRepository(Path(self.config["state_dir"]))
-        self.cache = UrlCache(self.config["url_cache_size"], self.config["url_cache_ttl_seconds"])
+        self.cache = self._make_url_cache()
         self.url_executor = ThreadPoolExecutor(max_workers=URL_RESOLVE_WORKERS, thread_name_prefix="openlist-url")
         self.config_lock = threading.Lock()
         self.refresh_lock = threading.Lock()
         self.refreshing = False
         self.last_refresh_error = ""
+        self.index_progress_lock = threading.Lock()
+        self.index_progress: dict[str, Any] = {
+            "completed": 0,
+            "queued": 0,
+            "active": 0,
+            "failed": 0,
+            "directory_count": 0,
+            "image_count": 0,
+            "elapsed_seconds": 0.0,
+            "retry_round": False,
+            "complete": False,
+        }
+
+    def _make_url_cache(self) -> UrlCache:
+        persist = Path(self.config["state_dir"]) / "url_cache.json"
+        return UrlCache(self.config["url_cache_size"], self.config["url_cache_ttl_seconds"], persist)
 
     def reload_config(self) -> dict[str, Any]:
         previous_config = self.config
@@ -685,7 +1010,7 @@ class Application:
             for key in ("url_cache_size", "url_cache_ttl_seconds", "openlist_api_url", "openlist_token_file")
         )
         if cache_changed:
-            self.cache = UrlCache(self.config["url_cache_size"], self.config["url_cache_ttl_seconds"])
+            self.cache = self._make_url_cache()
         self.apply_log_level()
         return self.config
 
@@ -858,14 +1183,29 @@ class Application:
         expected = read_secret_cached(Path(self.config["admin_token_file"]), "admin token")
         return hmac.compare_digest(supplied_token, expected)
 
+    def _set_index_progress(self, value: dict[str, Any]) -> None:
+        with self.index_progress_lock:
+            self.index_progress = dict(value)
+
     def start_refresh(self) -> bool:
         if not self.refresh_lock.acquire(blocking=False):
             return False
         self.refreshing = True
+        self._set_index_progress({
+            "completed": 0,
+            "queued": len(self.config["directories"]),
+            "active": 0,
+            "failed": 0,
+            "directory_count": 0,
+            "image_count": 0,
+            "elapsed_seconds": 0.0,
+            "retry_round": False,
+            "complete": False,
+        })
 
         def worker() -> None:
             try:
-                index = build_index(self.config, self.repository)
+                index = build_index(self.config, self.repository, self._set_index_progress)
                 valid_paths = {img["path"] for img in index.get("images", []) if isinstance(img, dict) and "path" in img}
                 if valid_paths:
                     stats = self.tags.migrate_paths(valid_paths)
@@ -877,6 +1217,8 @@ class Application:
                 self.last_refresh_error = str(error)
             finally:
                 self.refreshing = False
+                with self.index_progress_lock:
+                    self.index_progress = {**self.index_progress, "complete": True}
                 self.refresh_lock.release()
 
         threading.Thread(target=worker, name="openlist-index-rebuild", daemon=True).start()
@@ -887,6 +1229,12 @@ class Application:
             index = self.repository.load()
         except RuntimeError as error:
             index = {"images": [], "directory_count": 0, "generated_at": 0, "errors": [str(error)]}
+        progress_lock = getattr(self, "index_progress_lock", None)
+        if progress_lock is None:
+            progress = {}
+        else:
+            with progress_lock:
+                progress = dict(getattr(self, "index_progress", {}))
         return {
             "status": "ok",
             "image_count": len(index.get("images", [])),
@@ -895,6 +1243,7 @@ class Application:
             "last_build_duration_seconds": float(index.get("build_duration_seconds") or 0),
             "refreshing": self.refreshing,
             "last_refresh_error": self.last_refresh_error,
+            "index_progress": progress,
             "cache": self.cache.status(),
             **self.public_config(),
         }
@@ -1031,25 +1380,60 @@ class Application:
 
         if len(images) == 1:
             return [resolve_one(images[0])]
-        return list(self.url_executor.map(resolve_one, images))
+        futures = {self.url_executor.submit(resolve_one, image): str(image["path"]) for image in images}
+        done, not_done = wait(futures, timeout=URL_RESOLVE_WAIT_SECONDS)
+        for future in not_done:
+            future.cancel()
+        completed = {futures[future]: future.result() for future in done}
+        return [
+            completed.get(str(image["path"]))
+            or {"path": str(image["path"]), "error": "url resolve timed out"}
+            for image in images
+        ]
+
+    def resolve_preview_urls(self, paths: list[str], refresh: bool = False) -> list[dict[str, Any]]:
+        images = self.indexed_images(paths[:50])
+        if not images:
+            return []
+        client = OpenListClient(self.config)
+
+        def resolve_one(image: dict[str, Any]) -> dict[str, Any]:
+            path = str(image["path"])
+            if image.get("_missing"):
+                return {"path": path, "error": "image is not in the current index"}
+            try:
+                url, thumb = self.cache.resolve_preview(path, client, refresh=refresh)
+            except Exception:
+                logging.warning("Failed to resolve preview URL for %s", path)
+                return {"path": path, "error": "unable to resolve image URL"}
+            return {"path": path, "url": url, "thumbnail": thumb or ""}
+
+        if len(images) == 1:
+            return [resolve_one(images[0])]
+        futures = {self.url_executor.submit(resolve_one, image): str(image["path"]) for image in images}
+        done, not_done = wait(futures, timeout=URL_RESOLVE_WAIT_SECONDS)
+        for future in not_done:
+            future.cancel()
+        completed = {futures[future]: future.result() for future in done}
+        return [
+            completed.get(str(image["path"]))
+            or {"path": str(image["path"]), "error": "url resolve timed out"}
+            for image in images
+        ]
 
     def resolve_images_lazy(self, images: list[dict[str, Any]], include_tags: bool = False) -> list[dict[str, Any]]:
         paths = [str(image["path"]) for image in images]
         tag_stats = self.tags.stats(paths) if include_tags else {}
         results = []
-        unresolved = []
         for image in images:
             path = str(image["path"])
-            url = self.cache.cached_url(path) or ""
-            thumb = self.cache.cached_thumb(path) or ""
-            result = {"path": path, "size": int(image.get("size") or 0), "url": url, "thumbnail": thumb, "needs_url": not url}
+            cached = self.cache.cached_pair(path)
+            url = cached[0] if cached else ""
+            thumb = cached[1] if cached else ""
+            result = {"path": path, "size": int(image.get("size") or 0), "url": url, "thumbnail": thumb, "needs_url": not thumb and not url}
             if include_tags:
                 result["tags"] = tag_stats.get(path, {"likes": 0, "dislikes": 0, "categories": []})
             results.append(result)
-            if not url:
-                unresolved.append(image)
-        if unresolved:
-            self.prefetch_urls(unresolved)
         return results
 
     def prefetch_urls(self, images: list[dict[str, Any]]) -> None:
@@ -1140,108 +1524,267 @@ def gallery_html() -> str:
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>图库</title>
 <style>
-:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#10131a;color:#e7edf7;font:15px system-ui,sans-serif}header{position:sticky;z-index:2;top:0;display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:14px 18px;background:#10131af2;border-bottom:1px solid #293040}button,.button{background:#4b8cff;border:0;border-radius:7px;color:#fff;padding:9px 13px;cursor:pointer;text-decoration:none}button:disabled{opacity:.45;cursor:not-allowed}.meta{color:#a9b7cd;font-size:13px}.spacer{flex:1}.gallery{padding:18px}.gallery.waterfall{display:flex;align-items:flex-start;gap:var(--grid-gap,12px)}.waterfall-column{display:flex;min-width:0;flex:1;flex-direction:column;gap:var(--grid-gap,12px)}.card{position:relative;background:#171c27;border:1px solid #293040;border-radius:10px;overflow:hidden}.preview-button{display:block;width:100%;padding:0;border:0;border-radius:0;background:transparent}.card img{width:100%;display:block;max-height:82vh;object-fit:contain;background:#080a0f}.hidden{display:none!important}a{color:inherit}#empty{padding:40px;text-align:center;color:#a9b7cd}dialog{width:min(96vw,1500px);height:min(94vh,1000px);padding:0;border:1px solid #3a455b;border-radius:12px;background:#10131a;color:#e7edf7}dialog::backdrop{background:#000c}.lightbox-head,.lightbox-foot{display:flex;gap:12px;align-items:center;padding:10px 12px}.lightbox-head{justify-content:space-between}.lightbox-controls{display:flex;gap:8px}.lightbox-stage{height:calc(94vh - 126px);overflow:auto;background:#080a0f;display:grid;place-items:center}.lightbox-image{display:block;width:100%;height:100%;object-fit:contain;transform-origin:center;transition:transform .15s ease}.lightbox-meta{min-width:0;display:grid;gap:4px}.lightbox-caption,.lightbox-directory{margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.lightbox-directory{color:#a9b7cd;font-size:13px}.modal-backdrop{position:fixed;z-index:4;inset:0;background:#0008}#announcement-backdrop{position:fixed!important;z-index:1000!important;inset:0!important;background:#10131a!important;opacity:1!important;pointer-events:auto!important;animation:backdrop-in .25s ease both}.announcement{z-index:1001!important;pointer-events:auto!important}body.announcement-open{overflow:hidden}body.announcement-open>header,body.announcement-open>main,body.announcement-open>#maintenance{pointer-events:none!important;user-select:none}body.announcement-open>#announcement-backdrop,body.announcement-open>#announcement{display:block!important;visibility:visible!important}.preferences{position:fixed;z-index:5;top:50%;left:50%;width:min(92vw,430px);height:auto;padding:20px;border:1px solid #3a455b;border-radius:12px;background:#10131a;color:#e7edf7;transform:translate(-50%,-50%);box-shadow:0 1.5rem 2.2rem rgba(0,0,0,.28)}.preferences h2{margin-top:0}.preferences label{display:grid;gap:7px;margin:14px 0}.preferences select,.preferences input{padding:9px;border:1px solid #3a455b;border-radius:7px;background:#0d1119;color:#fff}.preferences-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:18px}.announcement{position:fixed;z-index:5;top:50%;left:50%;width:min(94vw,680px);height:auto;padding:0;border:0;border-radius:22px;background:linear-gradient(145deg,#fffdf8 0%,#fff 54%,#fff0e3 100%);color:#282828;box-shadow:0 1.5rem 3rem rgba(0,0,0,.38);overflow:hidden;transform:translate(-50%,-50%);animation:announcement-in .32s cubic-bezier(.2,.8,.2,1) both}.announcement.is-closing{animation:announcement-out .22s ease-in both}@keyframes backdrop-in{from{opacity:0}to{opacity:1}}@keyframes announcement-in{from{opacity:0;transform:translate(-50%,-46%) scale(.96)}to{opacity:1;transform:translate(-50%,-50%) scale(1)}}@keyframes announcement-out{from{opacity:1;transform:translate(-50%,-50%) scale(1)}to{opacity:0;transform:translate(-50%,-46%) scale(.97)}}.announcement-main{padding:26px 30px 12px}.announcement-title{position:relative;z-index:0;display:inline-block;margin:0 0 18px;font-size:21px}.announcement-title::after{content:'';position:absolute;z-index:-1;right:-3px;bottom:2px;left:-3px;height:14px;border-radius:4px;background:#fbeecd;transform:skewX(-15deg)}.announcement-content{margin:0;line-height:1.7}.announcement-content h1,.announcement-content h2,.announcement-content h3,.announcement-content h4{margin:16px 0 8px}.announcement-content p{margin:8px 0}.announcement-content code{padding:2px 5px;border-radius:4px;background:#f3f5f7}.announcement-content pre{overflow:auto;padding:12px;border-radius:8px;background:#f3f5f7}.announcement-content pre code{padding:0}.announcement-content a{color:#b63813}.announcement-footer{padding:12px 30px 28px;text-align:center;background:linear-gradient(170deg,#fff 0%,#fff 38%,#fbeecd 100%)}.announcement-actions{display:flex;justify-content:center;gap:10px;flex-wrap:wrap}.announcement-footer button{border-radius:50px;background:linear-gradient(to right,#ff711f,#e50914);box-shadow:0 10px 12px -4px rgba(229,9,20,.25)}.maintenance{max-width:520px;margin:13vh auto;padding:28px;border:1px solid #293040;border-radius:12px;background:#171c27;text-align:center}.maintenance details{text-align:left;margin-top:22px}.maintenance label{display:grid;gap:7px;margin:14px 0}.maintenance input{padding:9px;border:1px solid #3a455b;border-radius:7px;background:#0d1119;color:#fff;width:100%}.header-menu{position:fixed;z-index:6;top:54px;right:8px;width:160px;display:flex;flex-direction:column;gap:6px;padding:10px;background:#10131a;border:1px solid #3a455b;border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.4)}#header-menu-backdrop{position:fixed;z-index:5;inset:0}#header-menu-toggle{display:none;position:fixed;z-index:7;top:8px;right:8px;width:38px;height:38px;padding:0;font-size:18px;border-radius:8px}#header-menu .button,#header-menu button{width:100%;text-align:center;padding:8px 10px}#header-menu a{display:block;padding:8px 10px;text-align:center;border-radius:7px;background:#4b8cff;color:#fff;text-decoration:none}@media(max-width:560px){header{padding:10px 56px 10px 12px}header>strong,header>.meta{font-size:14px}header .spacer{display:none}header>button,header>a{display:none}.gallery{padding:10px}.lightbox-image{height:calc(94vh - 126px)}#header-menu-toggle{display:block}.card-tags{max-height:56px;gap:3px;padding:5px 7px}.card-tags .tag-vote,.card-tags .tag-category{padding:3px 6px;font-size:10px}.tag-bar{padding:6px 10px;gap:4px;max-height:64px;overflow:hidden}.tag-bar-label{display:none}.tag-chip{padding:3px 8px;font-size:11px}}
-</style>
-<style>
-.gallery.slideshow{display:grid;min-height:calc(100vh - 80px);place-items:center}.gallery.slideshow .card{max-width:min(96vw,1280px)}.gallery.waterfall .card{min-height:180px}.gallery.waterfall .card img{max-height:none;min-height:180px}.lightbox-stage{position:relative;overflow:hidden;cursor:grab;touch-action:none;overscroll-behavior:contain}.lightbox-stage.is-dragging{cursor:grabbing}.lightbox-image{width:100%;height:100%;max-width:none;max-height:none;pointer-events:none;user-select:none;will-change:transform}.announcement{display:flex;max-height:min(78vh,680px);flex-direction:column}.announcement-main{display:flex;min-height:0;flex:1;flex-direction:column}.announcement-content{min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding-right:8px}.announcement-footer{flex:0 0 auto}body.announcement-open>#announcement{display:flex!important}
-@media(max-width:560px){.gallery.waterfall{gap:8px;padding:8px}.waterfall-column{gap:8px}.announcement{width:92vw;height:min(68vh,520px);max-height:68vh;border-radius:14px}.announcement-main{padding:16px 18px 8px}.announcement-title{margin-bottom:10px;font-size:18px}.announcement-content{padding-right:5px;line-height:1.55}.announcement-content h1,.announcement-content h2,.announcement-content h3,.announcement-content h4{margin:10px 0 6px}.announcement-footer{padding:8px 18px 14px}.announcement-footer .meta{margin:4px 0 8px}.announcement-footer button{padding:8px 12px}dialog{width:100vw;height:100dvh;max-width:none;max-height:none;border:0;border-radius:0}.lightbox-stage{height:calc(100dvh - 126px)}.lightbox-image{height:100%}.lightbox-head,.lightbox-foot{padding:8px}.lightbox-controls{gap:5px}.lightbox-controls button{padding:8px 10px}}
-</style>
-<style>
-.gallery.slideshow{min-height:calc(100vh - 176px)}.lightbox-stage{cursor:default}.lightbox-stage.can-pan{cursor:grab}.lightbox-stage.can-pan.is-dragging{cursor:grabbing}.lightbox-image{width:auto;height:auto;object-fit:fill}.slide-history{padding:8px 18px 14px;border-top:1px solid #293040;background:#10131a}.slide-history-track{display:flex;gap:8px;overflow-x:auto;padding:2px 1px 6px;scrollbar-width:thin;scroll-snap-type:x proximity}.slide-thumbnail{position:relative;flex:0 0 76px;width:76px;height:58px;padding:0;overflow:hidden;border:1px solid #3a455b;border-radius:6px;background:#080a0f;scroll-snap-align:center}.slide-thumbnail img{display:block;width:100%;height:100%;object-fit:cover}.slide-thumbnail.active{border-color:#fff;box-shadow:0 0 0 2px #4b8cff}.slide-thumbnail-index{position:absolute;right:3px;bottom:3px;min-width:19px;padding:1px 4px;border-radius:4px;background:#000b;color:#fff;font-size:11px}.preferences .check{display:flex;align-items:center;gap:8px}.preferences .check input{width:auto;margin:0}
-@media(max-width:560px){.gallery.slideshow{min-height:calc(100dvh - 190px)}.slide-history{padding:7px 8px 10px}.slide-history-track{gap:6px}.slide-thumbnail{flex-basis:62px;width:62px;height:48px}}
-</style>
-<style>
-.slide-history-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:7px}.slide-history-title{color:#a9b7cd;font-size:13px}.slide-history-latest{padding:6px 10px;background:#39445a;font-size:13px}
-#theme-fab{position:fixed;right:18px;bottom:18px;z-index:60;width:46px;height:46px;padding:0;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:20px;background:#171c27;border:1px solid #3a455b;color:#cdd6e8;cursor:pointer;box-shadow:0 6px 18px rgba(0,0,0,.35);transition:transform .15s ease,box-shadow .15s ease,border-color .15s ease}
-#theme-fab:hover{transform:translateY(-2px);box-shadow:0 10px 24px rgba(0,0,0,.45);border-color:#4b8cff}
-body.has-slide-history #theme-fab{bottom:132px}
-body.theme-light #theme-fab{background:#fff;border-color:#c8d1e0;color:#3a4252;box-shadow:0 6px 18px rgba(30,40,60,.18)}
-.card{transition:transform .18s ease,box-shadow .18s ease,border-color .18s ease}
-@media(hover:hover){.card:hover{transform:translateY(-3px);box-shadow:0 12px 28px rgba(0,0,0,.4);border-color:#4b8cff}}
-.preview-button{cursor:zoom-in}
-::-webkit-scrollbar{width:9px;height:9px}::-webkit-scrollbar-thumb{background:#39445a;border-radius:6px}::-webkit-scrollbar-thumb:hover{background:#4b5b78}::-webkit-scrollbar-track{background:transparent}
-body.theme-light ::-webkit-scrollbar-thumb{background:#c8d1e0}
-.preferences-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:2px 16px}
-.preferences-grid label{margin:10px 0}
-.preferences .check{margin:12px 0}
-@media(max-width:400px){.preferences-grid{grid-template-columns:1fr}}
-.slide-nav{position:fixed;z-index:3;display:flex;align-items:center;justify-content:center;padding:0;border:1px solid #3a455b;background:#10131acc;color:#e7edf7;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);cursor:pointer;transition:transform .15s ease,border-color .15s ease}
+:root{
+  color-scheme:dark;
+  --bg:#0f1115;
+  --bg-elev:#171b22;
+  --bg-soft:#1d232d;
+  --line:#2a3140;
+  --text:#e8edf5;
+  --muted:#8b97ab;
+  --accent:#3d8bfd;
+  --accent-hover:#5aa0ff;
+  --danger:#ff5d6c;
+  --radius:14px;
+  --radius-sm:9px;
+  --shadow:0 16px 40px rgba(0,0,0,.38);
+  --header-h:56px;
+  --font:"Segoe UI",system-ui,-apple-system,"PingFang SC","Noto Sans SC",sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text);font:15px/1.45 var(--font)}
+button,.button,input,select,textarea{font:inherit}
+button,.button{border:0;border-radius:var(--radius-sm);background:var(--accent);color:#fff;padding:8px 13px;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;gap:6px}
+button:hover,.button:hover{background:var(--accent-hover)}
+button:disabled{opacity:.45;cursor:not-allowed}
+button.ghost,.button.ghost{background:transparent;color:var(--text);border:1px solid var(--line)}
+button.ghost:hover,.button.ghost:hover{background:var(--bg-soft);border-color:var(--accent)}
+button:focus-visible,.button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:3px solid color-mix(in srgb,var(--accent) 55%,transparent);outline-offset:2px}
+.meta{color:var(--muted);font-size:13px}
+.hidden{display:none!important}
+a{color:inherit}
+header{
+  position:sticky;z-index:8;top:0;display:flex;align-items:center;gap:12px;
+  min-height:var(--header-h);padding:8px 16px;
+  background:color-mix(in srgb,var(--bg) 86%,transparent);
+  backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
+  border-bottom:1px solid var(--line);
+}
+.brand{display:flex;align-items:baseline;gap:10px;min-width:0;flex:1}
+.brand strong{font-size:16px;letter-spacing:.02em}
+.brand .meta{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.header-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.header-actions #previous,.header-actions #next,.header-actions #slideshow-toggle{display:none!important}
+#header-menu-toggle{
+  display:none;width:40px;height:40px;padding:0;border-radius:11px;
+  background:var(--bg-soft);border:1px solid var(--line);color:var(--text);font-size:18px
+}
+.header-menu{
+  position:fixed;z-index:6;top:var(--menu-top,56px);right:10px;width:188px;
+  display:flex;flex-direction:column;gap:8px;padding:12px;
+  background:var(--bg-elev);border:1px solid var(--line);border-radius:16px;
+  box-shadow:var(--shadow);
+  opacity:0;visibility:hidden;transform:translateY(-8px);
+  transition:opacity .22s ease,transform .22s ease,visibility .22s
+}
+.header-menu.open{opacity:1;visibility:visible;transform:none}
+#header-menu-backdrop{position:fixed;z-index:5;inset:0;opacity:0;visibility:hidden;background:#0007;transition:opacity .22s ease,visibility .22s}
+#header-menu-backdrop.open{opacity:1;visibility:visible}
+#header-menu .button,#header-menu button,#header-menu a{
+  width:100%;text-align:center;padding:11px 12px;border-radius:10px
+}
+#menu-previous,#menu-next,#menu-slideshow-toggle{display:none!important}
+.gallery{padding:16px}
+.gallery.waterfall{display:flex;align-items:flex-start;gap:var(--grid-gap,12px);width:min(100%,1800px);margin:0 auto}
+.waterfall-column{display:flex;min-width:0;flex:1;flex-direction:column;gap:var(--grid-gap,12px)}
+.gallery.slideshow{display:grid;min-height:calc(100dvh - var(--header-h) - 118px);place-items:center;touch-action:pan-y}
+.gallery.slideshow .card{max-width:min(96vw,1280px);width:100%}
+.gallery.waterfall .card{min-height:180px}
+.gallery.waterfall .card img{max-height:none;min-height:180px}
+.card{position:relative;background:var(--bg-elev);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;transition:transform .18s ease,box-shadow .18s ease,border-color .18s ease}
+@media(hover:hover){.card:hover{transform:translateY(-3px);box-shadow:var(--shadow);border-color:var(--accent)}}
+.preview-button{display:block;width:100%;padding:0;border:0;border-radius:0;background:transparent;cursor:zoom-in}
+.card img{width:100%;display:block;max-height:82vh;object-fit:contain;background:#080a0f}
+.image-error{display:grid;min-height:180px;place-items:center;gap:8px;padding:24px;text-align:center;color:var(--muted)}
+.image-error button{justify-self:center}
+#empty{padding:48px 20px;text-align:center;color:var(--muted)}
+dialog{width:min(96vw,1500px);height:min(94vh,1000px);padding:0;border:1px solid var(--line);border-radius:16px;background:var(--bg);color:var(--text)}
+dialog::backdrop{background:#000c}
+.lightbox-head,.lightbox-foot{display:flex;gap:12px;align-items:center;padding:10px 12px}
+.lightbox-head{justify-content:space-between}
+.lightbox-controls{display:flex;gap:8px}
+.lightbox-stage{position:relative;height:calc(94vh - 126px);overflow:hidden;background:#080a0f;display:grid;place-items:center;cursor:default;touch-action:none;overscroll-behavior:contain}
+.lightbox-stage.can-pan{cursor:grab}
+.lightbox-stage.can-pan.is-dragging{cursor:grabbing}
+.lightbox-image{display:block;width:auto;height:auto;max-width:none;max-height:none;object-fit:fill;transform-origin:center;transition:transform .15s ease;pointer-events:none;user-select:none;will-change:transform}
+.lightbox-meta{min-width:0;display:grid;gap:4px}
+.lightbox-caption,.lightbox-directory{margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lightbox-directory{color:var(--muted);font-size:13px}
+.modal-backdrop{position:fixed;z-index:4;inset:0;background:#0008}
+#announcement-backdrop{position:fixed!important;z-index:1000!important;inset:0!important;background:#10131a!important;opacity:1!important;pointer-events:auto!important;animation:backdrop-in .25s ease both}
+.announcement{z-index:1001!important;pointer-events:auto!important}
+body.announcement-open{overflow:hidden}
+body.announcement-open>header,body.announcement-open>main,body.announcement-open>#maintenance{pointer-events:none!important;user-select:none}
+body.announcement-open>#announcement-backdrop,body.announcement-open>#announcement{display:block!important;visibility:visible!important}
+.preferences{
+  position:fixed;z-index:5;top:50%;left:50%;width:min(92vw,460px);max-height:86vh;overflow:auto;
+  padding:22px;border:1px solid var(--line);border-radius:18px;background:var(--bg-elev);color:var(--text);
+  transform:translate(-50%,-50%);box-shadow:var(--shadow)
+}
+.preferences h2{margin:0 0 8px;font-size:18px}
+.pref-section{margin:14px 0;padding-top:12px;border-top:1px solid var(--line)}
+.pref-section h3{margin:0 0 8px;font-size:13px;color:var(--muted);font-weight:600}
+.preferences label{display:grid;gap:6px;margin:10px 0}
+.preferences select,.preferences input{padding:9px 10px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--text)}
+.preferences-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:2px 14px}
+.preferences .check{display:flex;align-items:center;gap:8px;margin:12px 0}
+.preferences .check input{width:auto;margin:0}
+.preferences-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px;flex-wrap:wrap}
+.announcement{position:fixed;z-index:5;top:50%;left:50%;width:min(94vw,680px);max-height:min(78vh,680px);height:auto;padding:0;border:0;border-radius:22px;background:linear-gradient(145deg,#fffdf8 0%,#fff 54%,#fff0e3 100%);color:#282828;box-shadow:0 1.5rem 3rem rgba(0,0,0,.38);overflow:hidden;transform:translate(-50%,-50%);animation:announcement-in .32s cubic-bezier(.2,.8,.2,1) both;display:flex;flex-direction:column}
+.announcement.is-closing{animation:announcement-out .22s ease-in both}
+@keyframes backdrop-in{from{opacity:0}to{opacity:1}}
+@keyframes announcement-in{from{opacity:0;transform:translate(-50%,-46%) scale(.96)}to{opacity:1;transform:translate(-50%,-50%) scale(1)}}
+@keyframes announcement-out{from{opacity:1;transform:translate(-50%,-50%) scale(1)}to{opacity:0;transform:translate(-50%,-46%) scale(.97)}}
+.announcement-main{padding:26px 30px 12px;display:flex;min-height:0;flex:1;flex-direction:column}
+.announcement-title{position:relative;z-index:0;display:inline-block;margin:0 0 18px;font-size:21px}
+.announcement-title::after{content:'';position:absolute;z-index:-1;right:-3px;bottom:2px;left:-3px;height:14px;border-radius:4px;background:#fbeecd;transform:skewX(-15deg)}
+.announcement-content{margin:0;line-height:1.7;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding-right:8px}
+.announcement-content h1,.announcement-content h2,.announcement-content h3,.announcement-content h4{margin:16px 0 8px}
+.announcement-content p{margin:8px 0}
+.announcement-content code{padding:2px 5px;border-radius:4px;background:#f3f5f7}
+.announcement-content pre{overflow:auto;padding:12px;border-radius:8px;background:#f3f5f7}
+.announcement-content pre code{padding:0}
+.announcement-content a{color:#b63813}
+.announcement-footer{padding:12px 30px 28px;text-align:center;background:linear-gradient(170deg,#fff 0%,#fff 38%,#fbeecd 100%);flex:0 0 auto}
+.announcement-actions{display:flex;justify-content:center;gap:10px;flex-wrap:wrap}
+.announcement-footer button{border-radius:50px;background:linear-gradient(to right,#ff711f,#e50914);box-shadow:0 10px 12px -4px rgba(229,9,20,.25)}
+body.announcement-open>#announcement{display:flex!important}
+.maintenance{max-width:520px;margin:13vh auto;padding:28px;border:1px solid var(--line);border-radius:18px;background:var(--bg-elev);text-align:center}
+.maintenance details{text-align:left;margin-top:22px}
+.maintenance label{display:grid;gap:7px;margin:14px 0}
+.maintenance input{padding:9px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--text);width:100%}
+.slide-history{padding:8px 16px calc(12px + env(safe-area-inset-bottom));border-top:1px solid var(--line);background:var(--bg)}
+.slide-history-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:7px}
+.slide-history-title{color:var(--muted);font-size:13px}
+.slide-history-latest{padding:6px 10px;background:var(--bg-soft);font-size:13px}
+.slide-history-track{display:flex;gap:8px;overflow-x:auto;padding:2px 1px 6px;scrollbar-width:thin;scroll-snap-type:x proximity}
+.slide-thumbnail{position:relative;flex:0 0 76px;width:76px;height:58px;padding:0;overflow:hidden;border:1px solid var(--line);border-radius:8px;background:#080a0f;scroll-snap-align:center}
+.slide-thumbnail img{display:block;width:100%;height:100%;object-fit:cover}
+.slide-thumbnail.active{border-color:#fff;box-shadow:0 0 0 2px var(--accent)}
+.slide-thumbnail-index{position:absolute;right:3px;bottom:3px;min-width:19px;padding:1px 4px;border-radius:4px;background:#000b;color:#fff;font-size:11px}
+#theme-fab{position:fixed;right:max(16px,env(safe-area-inset-right));bottom:max(16px,env(safe-area-inset-bottom));z-index:60;width:48px;height:48px;padding:0;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:20px;background:var(--bg-elev);border:1px solid var(--line);color:var(--text);cursor:pointer;box-shadow:var(--shadow)}
+#theme-fab:hover{transform:translateY(-2px);border-color:var(--accent)}
+body.has-slide-history #theme-fab{bottom:calc(124px + env(safe-area-inset-bottom))}
+.slide-nav{position:fixed;z-index:3;display:flex;align-items:center;justify-content:center;padding:0;border:1px solid var(--line);background:color-mix(in srgb,var(--bg) 78%,transparent);color:var(--text);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);cursor:pointer}
 .slide-nav.prev{left:10px;top:50%;width:42px;height:64px;font-size:30px;border-radius:12px;transform:translateY(-50%)}
 .slide-nav.next{right:10px;top:50%;width:42px;height:64px;font-size:30px;border-radius:12px;transform:translateY(-50%)}
-.slide-nav.pause{left:50%;bottom:24px;width:44px;height:44px;font-size:16px;border-radius:50%;transform:translateX(-50%)}
-body.has-slide-history .slide-nav.pause{bottom:132px}
-.slide-nav.prev:hover{transform:translateY(-50%) scale(1.07);border-color:#4b8cff}
-.slide-nav.next:hover{transform:translateY(-50%) scale(1.07);border-color:#4b8cff}
-.slide-nav.pause:hover{transform:translateX(-50%) scale(1.07);border-color:#4b8cff}
-body.theme-light .slide-nav{background:#ffffffd9;border-color:#c8d1e0;color:#3a4252}
-.gallery.slideshow{touch-action:pan-y}
-@media(max-width:560px){.slide-nav.prev{left:6px;width:36px;height:56px;font-size:26px}.slide-nav.next{right:6px;width:36px;height:56px;font-size:26px}.slide-nav.pause{bottom:12px}body.has-slide-history .slide-nav.pause{bottom:112px}}
-@media(max-width:760px){header{padding:10px 56px 10px 12px}header .spacer{display:none}header>button,header>a{display:none}#header-menu-toggle{display:block}}
-.header-menu{opacity:0;visibility:hidden;transform:translateY(-10px);transition:opacity .22s ease,transform .22s ease,visibility .22s}
-.header-menu.open{opacity:1;visibility:visible;transform:none}
-#header-menu-backdrop{opacity:0;visibility:hidden;background:#0007;transition:opacity .22s ease,visibility .22s}
-#header-menu-backdrop.open{opacity:1;visibility:visible}
-@media(max-width:760px){.header-menu{left:0;right:0;width:auto;top:var(--menu-top,56px);border-top:0;border-radius:0 0 14px 14px;padding:12px 14px;box-shadow:0 14px 28px rgba(0,0,0,.45)}#header-menu .button,#header-menu button{padding:11px 12px}}
-@media(max-width:560px){#theme-fab{right:12px;bottom:12px}body.has-slide-history #theme-fab{bottom:112px}.preferences{width:calc(100vw - 24px);max-height:86vh;overflow:auto}.lightbox-foot{flex-wrap:wrap}.lightbox-meta{flex:1 1 100%}}
-</style>
-<style>
-.tag-bar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:8px 18px;border-bottom:1px solid #293040;background:#10131a;max-width:100%}.tag-bar-label{color:#a9b7cd;font-size:13px;margin-right:4px}.tag-chip{display:inline-flex;align-items:center;gap:4px;padding:4px 10px;border:1px solid #3a455b;border-radius:16px;background:#171c27;color:#cdd6e8;font-size:12px;cursor:pointer;transition:all .15s ease;user-select:none}.tag-chip:hover{border-color:#4b8cff;transform:translateY(-1px)}.tag-chip.active{background:#4b8cff;border-color:#4b8cff;color:#fff}.tag-chip-count{opacity:.7;font-size:11px}.tag-clear{padding:4px 10px;border:1px solid #3a455b;border-radius:16px;background:transparent;color:#a9b7cd;font-size:12px;cursor:pointer}.tag-clear:hover{color:#fff;border-color:#ff6b6b}.card-tags{position:absolute;bottom:0;left:0;right:0;display:flex;flex-wrap:wrap;gap:5px;padding:7px 10px;background:linear-gradient(transparent,rgba(0,0,0,.65));transition:opacity .2s ease;max-height:72px;overflow:hidden}@media(hover:hover){.card-tags{opacity:0}.card:hover .card-tags{opacity:1}.card.has-active-tag .card-tags{opacity:1}}.tag-vote{display:inline-flex;align-items:center;gap:4px;padding:4px 8px;border:1px solid #3a455b;border-radius:6px;background:rgba(255,255,255,.1);color:#fff;font-size:12px;cursor:pointer;transition:all .15s ease;user-select:none}.tag-vote:hover{border-color:#4b8cff;background:rgba(255,255,255,.16);transform:translateY(-1px)}.tag-vote.active{background:#ff4d6d;border-color:#ff4d6d;color:#fff}.tag-vote:disabled{opacity:.5;cursor:wait;transform:none}.tag-category{display:inline-flex;align-items:center;gap:3px;padding:4px 8px;border:1px solid #3a455b;border-radius:6px;background:rgba(255,255,255,.1);color:#fff;font-size:11px;cursor:pointer;transition:all .15s ease;user-select:none}.tag-category:hover{border-color:#4b8cff;background:rgba(255,255,255,.16);transform:translateY(-1px)}.tag-category.active{background:#4b8cff;border-color:#4b8cff;color:#fff}.tag-category.tag-trash{border-color:#5a3030;background:rgba(255,100,100,.12)}.tag-category.tag-trash:hover{border-color:#ff6b6b;background:rgba(255,100,100,.2);transform:translateY(-1px)}.tag-category.tag-trash.active{background:#ff4757;border-color:#ff4757;color:#fff}.tag-vote-count{font-weight:600;min-width:14px;text-align:center}
-body.theme-light{color-scheme:light;background:#eef1f6;color:#1a2333}body.theme-light header{background:#eef1f6f2;border-bottom-color:#dde3ee}body.theme-light .meta{color:#6b7689}body.theme-light .gallery{background:transparent}body.theme-light .card{background:#fff;border-color:#dde3ee}body.theme-light .card img{background:#f0f3f8}body.theme-light .tag-bar{background:#eef1f6;border-bottom-color:#dde3ee}body.theme-light .tag-chip{background:#fff;border-color:#c8d1e0;color:#3a4252}body.theme-light .tag-chip.active{background:#4b8cff;border-color:#4b8cff;color:#fff}body.theme-light .tag-clear{background:transparent;border-color:#c8d1e0;color:#6b7689}body.theme-light .preferences{background:#fff;color:#1a2333;border-color:#c8d1e0}body.theme-light .preferences select,body.theme-light .preferences input{background:#f7f9fc;border-color:#c8d1e0;color:#1a2333}body.theme-light .header-menu{background:#fff;border-color:#c8d1e0}body.theme-light .slide-history{background:#eef1f6;border-top-color:#dde3ee}body.theme-light .slide-history-title{color:#6b7689}body.theme-light .slide-thumbnail{background:#f0f3f8;border-color:#dde3ee}body.theme-light .slide-thumbnail.active{border-color:#4b8cff}body.theme-light .maintenance{background:#fff;border-color:#dde3ee}body.theme-light .maintenance input{background:#f7f9fc;border-color:#c8d1e0;color:#1a2333}
+.slide-nav.pause{left:50%;bottom:max(20px,env(safe-area-inset-bottom));width:46px;height:46px;font-size:16px;border-radius:50%;transform:translateX(-50%)}
+body.has-slide-history .slide-nav.pause{bottom:calc(124px + env(safe-area-inset-bottom))}
+.tag-bar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:8px 16px;border-bottom:1px solid var(--line);background:var(--bg)}
+.tag-bar-label{color:var(--muted);font-size:13px;margin-right:4px}
+.tag-chip{display:inline-flex;align-items:center;gap:4px;padding:4px 10px;border:1px solid var(--line);border-radius:999px;background:var(--bg-elev);color:var(--text);font-size:12px;cursor:pointer}
+.tag-chip.active{background:var(--accent);border-color:var(--accent);color:#fff}
+.tag-chip-count{opacity:.7;font-size:11px}
+.tag-clear{padding:4px 10px;border:1px solid var(--line);border-radius:999px;background:transparent;color:var(--muted);font-size:12px;cursor:pointer}
+.card-tags{position:absolute;bottom:0;left:0;right:0;display:flex;flex-wrap:wrap;gap:5px;padding:7px 10px;background:linear-gradient(transparent,rgba(0,0,0,.65));max-height:72px;overflow:hidden}
+@media(hover:hover){.card-tags{opacity:0}.card:hover .card-tags{opacity:1}.card.has-active-tag .card-tags{opacity:1}}
+.tag-vote,.tag-category{display:inline-flex;align-items:center;gap:3px;padding:4px 8px;border:1px solid var(--line);border-radius:6px;background:rgba(255,255,255,.1);color:#fff;font-size:11px;cursor:pointer}
+.tag-vote.active{background:#ff4d6d;border-color:#ff4d6d}
+.tag-category.active{background:var(--accent);border-color:var(--accent)}
+.tag-category.tag-trash{border-color:#5a3030;background:rgba(255,100,100,.12)}
+.tag-category.tag-trash.active{background:#ff4757;border-color:#ff4757}
+.tag-vote-count{font-weight:600;min-width:14px;text-align:center}
+::-webkit-scrollbar{width:9px;height:9px}::-webkit-scrollbar-thumb{background:var(--line);border-radius:6px}::-webkit-scrollbar-track{background:transparent}
+body.theme-light{color-scheme:light;--bg:#f3f5f8;--bg-elev:#fff;--bg-soft:#eef1f6;--line:#d5dbe6;--text:#1a2230;--muted:#667085;--accent:#2d6cf0;--accent-hover:#1f5ee0;--shadow:0 14px 32px rgba(30,40,60,.12)}
+body.theme-light .card img,body.theme-light .lightbox-stage,body.theme-light .slide-thumbnail{background:#e8edf5}
+@media(max-width:760px){
+  header{padding:8px 12px}
+  .header-actions{display:none}
+  #header-menu-toggle{display:inline-flex}
+  .header-menu{left:0;right:0;width:auto;border-radius:0 0 16px 16px;border-left:0;border-right:0}
+}
+@media(max-width:560px){
+  .gallery{padding:10px}
+  .gallery.waterfall{gap:8px}
+  .waterfall-column{gap:8px}
+  .gallery.slideshow{min-height:calc(100dvh - var(--header-h) - 108px)}
+  .brand strong{font-size:15px}
+  .tag-bar{padding:7px 10px;flex-wrap:nowrap;overflow-x:auto;scrollbar-width:thin;scroll-snap-type:x proximity}
+  .tag-bar>*{flex:0 0 auto;scroll-snap-align:start}
+  .tag-bar-label{display:none}
+  .card-tags{max-height:56px}
+  .preferences{width:calc(100vw - 24px)}
+  .preferences-grid{grid-template-columns:1fr 1fr}
+  dialog{width:100vw;height:100dvh;max-width:none;max-height:none;border:0;border-radius:0}
+  .lightbox-stage{height:calc(100dvh - 126px)}
+  .lightbox-foot{flex-wrap:wrap}
+  .lightbox-meta{flex:1 1 100%}
+  .slide-nav.prev{left:6px;width:36px;height:56px;font-size:26px}
+  .slide-nav.next{right:6px;width:36px;height:56px;font-size:26px}
+  .announcement{width:92vw;max-height:68vh;border-radius:14px}
+  .announcement-main{padding:16px 18px 8px}
+  .announcement-title{font-size:18px}
+  .announcement-footer{padding:8px 18px 14px}
+}
+@media(max-width:400px){.preferences-grid{grid-template-columns:1fr}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
 </style>
 </head>
 <body>
 <header>
-  <strong>图库</strong>
-  <span class="meta" id="status">正在加载…</span>
-  <span class="spacer"></span>
-  <button id="previous" class="hidden" type="button">← 上一张</button>
-  <button id="slideshow-toggle" class="hidden" type="button" aria-pressed="false">暂停</button>
-  <button id="next" class="hidden" type="button">下一张 →</button>
-  <button id="refresh" type="button">刷新</button>
-  <button id="settings" type="button">显示设置</button>
-  <button id="announcement-button" class="hidden" type="button">公告</button>
-  <a href="/admin">管理</a>
+  <div class="brand"><strong>图库</strong><span class="meta" id="status" role="status" aria-live="polite">正在加载…</span></div>
+  <nav class="header-actions" aria-label="页面操作">
+    <button id="previous" class="hidden ghost" type="button">上一张</button>
+    <button id="slideshow-toggle" class="hidden ghost" type="button" aria-pressed="false">暂停</button>
+    <button id="next" class="hidden ghost" type="button">下一张</button>
+    <button id="refresh" class="ghost" type="button">刷新</button>
+    <button id="settings" type="button">设置</button>
+    <button id="announcement-button" class="hidden ghost" type="button">公告</button>
+    <a href="/admin" class="button ghost">管理</a>
+  </nav>
+  <button id="header-menu-toggle" type="button" aria-label="菜单" aria-expanded="false">☰</button>
 </header>
-<button id="header-menu-toggle" type="button" aria-label="菜单" aria-expanded="false">☰</button>
 <div id="header-menu-backdrop"></div>
 <aside id="header-menu" class="header-menu" aria-label="快捷菜单">
-  <button id="menu-previous" class="hidden" type="button">← 上一张</button>
-  <button id="menu-slideshow-toggle" class="hidden" type="button" aria-pressed="false">暂停</button>
-  <button id="menu-next" class="hidden" type="button">下一张 →</button>
-  <button id="menu-refresh" type="button">刷新</button>
-  <button id="menu-settings" type="button">显示设置</button>
-  <button id="menu-announcement" class="hidden" type="button">公告</button>
-  <a href="/admin" class="button">管理</a>
+  <button id="menu-previous" class="hidden ghost" type="button">上一张</button>
+  <button id="menu-slideshow-toggle" class="hidden ghost" type="button" aria-pressed="false">暂停</button>
+  <button id="menu-next" class="hidden ghost" type="button">下一张</button>
+  <button id="menu-refresh" class="ghost" type="button">刷新</button>
+  <button id="menu-settings" type="button">设置</button>
+  <button id="menu-announcement" class="hidden ghost" type="button">公告</button>
+  <a href="/admin" class="button ghost">管理</a>
 </aside>
 <div id="tag-bar" class="tag-bar hidden"></div>
-<main id="gallery" class="gallery"></main>
+<main id="gallery" class="gallery" aria-busy="true"></main>
 <button id="slide-nav-prev" class="slide-nav prev hidden" type="button" aria-label="上一张">‹</button>
 <button id="slide-nav-next" class="slide-nav next hidden" type="button" aria-label="下一张">›</button>
 <button id="slide-nav-pause" class="slide-nav pause hidden" type="button" aria-label="暂停播放">⏸</button>
-<section id="slide-history" class="slide-history hidden" aria-label="播放历史"><div class="slide-history-head"><span class="slide-history-title">播放历史</span><button id="slide-history-latest" class="slide-history-latest" type="button">跳转到最新</button></div><div id="slide-history-track" class="slide-history-track"></div></section>
+<section id="slide-history" class="slide-history hidden" aria-label="播放历史"><div class="slide-history-head"><span class="slide-history-title">播放历史</span><button id="slide-history-latest" class="slide-history-latest ghost" type="button">跳到最新</button></div><div id="slide-history-track" class="slide-history-track"></div></section>
 <section id="maintenance" class="maintenance hidden"><h1>维护中</h1><p>图片浏览暂时不可用，请稍后再试。</p><details><summary>管理员查看图片</summary><label>管理密钥<input id="maintenance-token" type="password" autocomplete="current-password"></label><button id="maintenance-unlock" type="button">查看图片</button><p id="maintenance-message" class="meta"></p></details></section>
-<dialog id="lightbox">
-  <div class="lightbox-head"><div class="lightbox-controls"><button id="rotate-left" type="button" title="向左旋转" aria-label="向左旋转">↶</button><button id="zoom-out" type="button" title="缩小" aria-label="缩小">−</button><button id="zoom-reset" type="button" title="复位">100%</button><button id="zoom-in" type="button" title="放大" aria-label="放大">＋</button><button id="rotate-right" type="button" title="向右旋转" aria-label="向右旋转">↷</button></div><button id="lightbox-close" type="button">关闭</button></div>
+<dialog id="lightbox" aria-labelledby="lightbox-caption">
+  <div class="lightbox-head"><div class="lightbox-controls"><button id="rotate-left" class="ghost" type="button" title="向左旋转" aria-label="向左旋转">↶</button><button id="zoom-out" class="ghost" type="button" title="缩小" aria-label="缩小">−</button><button id="zoom-reset" class="ghost" type="button" title="复位" aria-label="恢复原始比例">100%</button><button id="zoom-in" class="ghost" type="button" title="放大" aria-label="放大">＋</button><button id="rotate-right" class="ghost" type="button" title="向右旋转" aria-label="向右旋转">↷</button></div><button id="lightbox-close" class="ghost" type="button" aria-label="关闭图片预览">关闭</button></div>
   <div id="lightbox-stage" class="lightbox-stage"><img id="lightbox-image" class="lightbox-image" alt="" draggable="false"></div>
   <div class="lightbox-foot"><div class="lightbox-meta"><p id="lightbox-caption" class="lightbox-caption"></p><p id="lightbox-directory" class="lightbox-directory"></p></div><button id="lightbox-download" type="button">下载</button></div>
 </dialog>
 <div id="preferences-backdrop" class="modal-backdrop hidden"></div>
-<section id="preferences" class="preferences hidden" aria-label="显示设置">
-  <h2>显示设置</h2>
-  <div class="preferences-grid">
-    <label>视图<select id="layout-mode"><option value="slideshow">幻灯片</option><option value="waterfall">瀑布流</option></select></label>
-    <label>图片名称样式<select id="caption-mode"><option value="path">完整路径</option><option value="name">仅图片名称</option><option value="hidden">不展示</option></select></label>
-    <label>图片画质<select id="preview-quality"><option value="176">极速（176px）</option><option value="480">清晰（480px）</option><option value="800">高清（800px）</option><option value="1280">超清（1280px）</option><option value="2560">极清（2560px）</option></select></label>
-    <label>大图画质<select id="lightbox-quality"><option value="original">原图（最清晰）</option><option value="2560">极清（2560px，推荐）</option><option value="1280">超清（1280px，最快）</option></select></label>
-    <label>标签筛选模式<select id="filter-mode"><option value="union">并集（任一匹配）</option><option value="intersect">交集（全部匹配）</option></select></label>
-    <label class="slideshow-only">自动播放间隔（秒，0 关闭）<input id="slideshow-interval" type="number" min="0" max="300" step="1"></label>
+<section id="preferences" class="preferences hidden" role="dialog" aria-modal="true" aria-labelledby="preferences-title" tabindex="-1">
+  <h2 id="preferences-title">显示设置</h2>
+  <p class="meta">只影响当前浏览器。</p>
+  <div class="pref-section">
+    <h3>浏览</h3>
+    <div class="preferences-grid">
+      <label>视图<select id="layout-mode"><option value="slideshow">幻灯片</option><option value="waterfall">瀑布流</option></select></label>
+      <label>图片名称<select id="caption-mode"><option value="path">完整路径</option><option value="name">仅名称</option><option value="hidden">不展示</option></select></label>
+      <label class="slideshow-only">自动播放（秒）<input id="slideshow-interval" type="number" min="0" max="300" step="1"></label>
+    </div>
   </div>
-  <label class="check"><input id="show-tags-enabled" type="checkbox">在图片上显示标签按钮（点赞/分类）</label>
-  <p class="meta">图片画质与大图画质越高越清晰，流量消耗也越大；设置仅保存在当前浏览器。</p>
-  <div class="preferences-actions"><button id="preferences-reset" type="button">恢复默认</button><button id="preferences-save" type="button">保存</button><button id="preferences-close" type="button">关闭</button></div>
+  <div class="pref-section">
+    <h3>画质</h3>
+    <div class="preferences-grid">
+      <label>列表预览<select id="preview-quality"><option value="176">极速 176</option><option value="480">清晰 480</option><option value="800">高清 800</option><option value="1280">超清 1280</option><option value="2560">极清 2560</option></select></label>
+      <label>大图预览<select id="lightbox-quality"><option value="original">原图</option><option value="2560">极清 2560</option><option value="1280">超清 1280</option></select></label>
+    </div>
+  </div>
+  <div class="pref-section">
+    <h3>标签</h3>
+    <label>筛选模式<select id="filter-mode"><option value="union">任一匹配</option><option value="intersect">全部匹配</option></select></label>
+    <label class="check"><input id="show-tags-enabled" type="checkbox">在图片上显示标签</label>
+  </div>
+  <p class="meta">设置仅保存在当前浏览器。</p>
+  <div class="preferences-actions"><button id="preferences-reset" class="ghost" type="button">恢复默认</button><button id="preferences-close" class="ghost" type="button">关闭</button><button id="preferences-save" type="button">保存</button></div>
 </section>
 <div id="announcement-backdrop" class="modal-backdrop announcement-backdrop hidden"></div>
 <section id="announcement" class="announcement hidden" role="dialog" aria-modal="true" aria-labelledby="announcement-title">
@@ -1253,6 +1796,7 @@ body.theme-light{color-scheme:light;background:#eef1f6;color:#1a2333}body.theme-
 const PREFERENCE_KEY='openlist-image-preferences-v2';
 const ANNOUNCEMENT_KEY_PREFIX='openlist-image-announcement-v2-';
 const gallery=document.querySelector('#gallery');
+const pageHeader=document.querySelector('header');
 const statusEl=document.querySelector('#status');
 const previousButton=document.querySelector('#previous');
 const nextButton=document.querySelector('#next');
@@ -1297,6 +1841,7 @@ const rotateRightButton=document.querySelector('#rotate-right');
 let settings=null;
 let maintenanceAccessToken='';
 let activeImage=null;
+let lightboxReturnFocus=null;
 let announcementTimer=null;
 let slideImages=[];
 let slideIndex=0;
@@ -1312,15 +1857,20 @@ let slideHistorySequence=0;
 let waterfallLoading=false;
 let waterfallExhausted=false;
 let waterfallPrefetch=[];
-let waterfallPrefetching=false;
+let waterfallPrefetchPromise=null;
 let waterfallPrefetchToken=0;
+let renderGeneration=0;
 let loadedCount=0;
 let cardSequence=0;
 let waterfallColumnCount=0;
 let resizeTimer=null;
 const slidePreloads=new Map();
 const activePointers=new Map();
-const SLIDE_PRELOAD_COUNT=3;
+const urlResolveTasks=new Map();
+const urlResolveQueue=[];
+let urlResolveActive=0;
+const URL_RESOLVE_CONCURRENCY=3;
+const SLIDE_PRELOAD_COUNT=2;
 const SLIDE_INITIAL_LOAD=6;
 const WATERFALL_BATCH_SIZE=20;
 let dragStart=null;
@@ -1346,8 +1896,8 @@ function cardSrc(image){
 function lightboxSrc(image){
   if(!image) return '';
   const quality=settings&&settings.lightbox_quality||'original';
-  if(quality==='original'||!image.thumbnail) return image.url||'';
-  return sizedThumb(image.thumbnail,quality==='1280'?1280:2560);
+  if(quality==='original') return image.url||sizedThumb(image.thumbnail,Number(settings&&settings.preview_quality)||176);
+  return image.thumbnail?sizedThumb(image.thumbnail,quality==='1280'?1280:2560):image.url||'';
 }
 
 function normalizedPreferences(value,defaults){
@@ -1413,9 +1963,9 @@ function announcementSeen(key){
 
 function closeAnnouncement(key,persist){
   if(announcementTimer) clearInterval(announcementTimer);
-  localStorage.setItem(key,persist?'forever':'day:'+todayKey());
+  try{localStorage.setItem(key,persist?'forever':'day:'+todayKey());}catch(error){}
   announcementPanel.classList.add('is-closing');
-  setTimeout(()=>{announcementPanel.classList.add('hidden');announcementPanel.classList.remove('is-closing');announcementBackdrop.classList.add('hidden');document.body.classList.remove('announcement-open');scheduleSlideshow();},220);
+  setTimeout(()=>{announcementPanel.classList.add('hidden');announcementPanel.classList.remove('is-closing');announcementBackdrop.classList.add('hidden');document.body.classList.remove('announcement-open');if(announcementReturnFocus&&announcementReturnFocus.focus)announcementReturnFocus.focus();scheduleSlideshow();},220);
 }
 
 function setAnnouncementCountdown(seconds,key){
@@ -1435,12 +1985,14 @@ function setAnnouncementCountdown(seconds,key){
   announcementCloseForever.onclick=()=>closeAnnouncement(key,true);
 }
 
+let announcementReturnFocus=null;
 function showAnnouncement(force=false){
   const announcement=settings.announcement;
   if(!announcement||!announcement.enabled||!announcement.content.trim()) return;
   const key=ANNOUNCEMENT_KEY_PREFIX+announcement.version;
   if(!force&&announcementSeen(key)) return;
   clearSlideTimer();
+  announcementReturnFocus=document.activeElement;
   announcementTitle.textContent=announcement.title||'网站公告';
   announcementContent.innerHTML='<p>'+renderMarkdown(announcement.content)+'</p>';
   document.body.classList.add('announcement-open');
@@ -1448,12 +2000,25 @@ function showAnnouncement(force=false){
   announcementPanel.classList.remove('is-closing');
   announcementBackdrop.classList.remove('hidden');
   setAnnouncementCountdown(force?0:announcement.required_seconds,key);
+  const first=focusableWithin(announcementPanel)[0];
+  if(first) first.focus();
 }
 
-function persistPreferences(){localStorage.setItem(PREFERENCE_KEY,JSON.stringify({view_layout:settings.view_layout,slideshow_interval:settings.slideshow_interval,grid_gap:settings.grid_gap,caption_mode:settings.caption_mode,show_tags_enabled:settings.show_tags_enabled,theme:settings.theme,filter_mode:settings.filter_mode,preview_quality:settings.preview_quality,lightbox_quality:settings.lightbox_quality}));}
+function persistPreferences(){try{localStorage.setItem(PREFERENCE_KEY,JSON.stringify({view_layout:settings.view_layout,slideshow_interval:settings.slideshow_interval,grid_gap:settings.grid_gap,caption_mode:settings.caption_mode,show_tags_enabled:settings.show_tags_enabled,theme:settings.theme,filter_mode:settings.filter_mode,preview_quality:settings.preview_quality,lightbox_quality:settings.lightbox_quality}));}catch(error){statusEl.textContent='设置无法保存到当前浏览器';}}
 
+let preferencesReturnFocus=null;
+function focusableWithin(root){return [...root.querySelectorAll('button:not([disabled]),a[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])')].filter(element=>!element.closest('.hidden'));}
+function trapFocus(root,event){
+  if(event.key!=='Tab') return;
+  const items=focusableWithin(root);
+  if(!items.length) return;
+  const first=items[0],last=items[items.length-1];
+  if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus();}
+  else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus();}
+}
 function openPreferences(){
   clearSlideTimer();
+  preferencesReturnFocus=document.activeElement;
   previewQuality.value=settings.preview_quality;
   lightboxQuality.value=settings.lightbox_quality;
   layoutMode.value=settings.view_layout;
@@ -1464,9 +2029,10 @@ function openPreferences(){
   showTagsEnabled.checked=settings.show_tags_enabled;
   preferencesPanel.classList.remove('hidden');
   preferencesBackdrop.classList.remove('hidden');
+  preferencesPanel.focus();
 }
 
-function closePreferences(){preferencesPanel.classList.add('hidden');preferencesBackdrop.classList.add('hidden');scheduleSlideshow();}
+function closePreferences(){preferencesPanel.classList.add('hidden');preferencesBackdrop.classList.add('hidden');if(preferencesReturnFocus&&preferencesReturnFocus.focus)preferencesReturnFocus.focus();preferencesReturnFocus=null;scheduleSlideshow();}
 
 function syncSlideshowOption(){document.querySelector('.slideshow-only').classList.toggle('hidden',layoutMode.value!=='slideshow');}
 layoutMode.addEventListener('change',syncSlideshowOption);
@@ -1489,6 +2055,12 @@ async function fetchJsonWithRetry(url,options={},attempts=3){
   let lastError=null;
   for(let attempt=0;attempt<attempts;attempt+=1){
     const controller=new AbortController();
+    const externalSignal=options.signal;
+    const abort=()=>controller.abort();
+    if(externalSignal){
+      if(externalSignal.aborted) throw Object.assign(new Error('请求已取消'),{name:'AbortError'});
+      externalSignal.addEventListener('abort',abort,{once:true});
+    }
     const timeout=setTimeout(()=>controller.abort(),45000);
     try{
       const response=await fetch(url,{...options,signal:controller.signal,cache:'no-store'});
@@ -1500,60 +2072,96 @@ async function fetchJsonWithRetry(url,options={},attempts=3){
       return await response.json();
     }catch(error){
       lastError=error;
-      const retryable=error.name==='AbortError'||error.retryable!==false;
+      const cancelled=Boolean(externalSignal&&externalSignal.aborted);
+      const retryable=!cancelled&&(error.name!=='AbortError'||!externalSignal||!externalSignal.aborted)&&error.retryable!==false;
       if(!retryable||attempt===attempts-1) break;
       await wait(500*Math.pow(2,attempt));
-    }finally{clearTimeout(timeout);}
+    }finally{
+      clearTimeout(timeout);
+      if(externalSignal) externalSignal.removeEventListener('abort',abort);
+    }
   }
   throw lastError||new Error('请求失败');
 }
 
 function applyResolvedUrl(image,data){
-  if(!data||data.error||!data.url) return image;
-  image.url=data.url;
+  if(!data||data.error) return image;
+  const received=Boolean(data.url||data.thumbnail);
+  if(data.url) image.url=data.url;
   if(data.thumbnail) image.thumbnail=data.thumbnail;
-  image._resolvedAt=Date.now();
-  image.needs_url=false;
+  if(received){
+    image._resolvedAt=Date.now();
+    image.needs_url=false;
+  }
   return image;
 }
 
-async function refreshImageUrls(images,force=false){
-  const pending=images.filter(image=>image&&image.path&&(force||image.needs_url||!image.url||Date.now()-(image._resolvedAt||0)>URL_REFRESH_AGE_MS));
-  if(!pending.length) return images;
-  const data=await fetchJsonWithRetry('/api/download-url',{
-    method:'POST',
-    headers:{'Content-Type':'application/json',...adminHeaders()},
-    body:JSON.stringify({paths:pending.map(image=>image.path),fresh:!!force})
-  },2);
-  const lookup=new Map((data.images||[]).map(item=>[item.path,item]));
-  const failed=[];
-  for(const image of pending){
-    const resolved=lookup.get(image.path);
-    if(resolved&&resolved.url&&!resolved.error){
-      applyResolvedUrl(image,resolved);
-    }else{
-      failed.push(image);
-    }
+function needsImageResolve(image,force=false,preview=true){
+  const sourceReady=preview?!!image.thumbnail:!!image.url;
+  return !!(image&&image.path&&(force||!sourceReady||Date.now()-(image._resolvedAt||0)>URL_REFRESH_AGE_MS));
+}
+
+function cancelUrlResolveTasks(){
+  urlResolveQueue.splice(0,urlResolveQueue.length).forEach(task=>{
+    task.cancelled=true;
+    task.reject(Object.assign(new Error('请求已取消'),{name:'AbortError'}));
+  });
+  urlResolveTasks.forEach(task=>{
+    task.cancelled=true;
+    task.controller&&task.controller.abort();
+  });
+  urlResolveTasks.clear();
+}
+
+function runNextUrlResolve(){
+  while(urlResolveActive<URL_RESOLVE_CONCURRENCY&&urlResolveQueue.length){
+    urlResolveQueue.sort((left,right)=>left.priority-right.priority||left.sequence-right.sequence);
+    const task=urlResolveQueue.shift();
+    if(task.cancelled) continue;
+    urlResolveActive+=1;
+    task.started=true;
+    task.run().then(task.resolve,task.reject).finally(()=>{
+      urlResolveActive-=1;
+      if(urlResolveTasks.get(task.key)===task) urlResolveTasks.delete(task.key);
+      runNextUrlResolve();
+    });
   }
-  if(failed.length){
-    await Promise.all(failed.map(image=>refreshImageUrl(image,force).catch(()=>{})));
+}
+
+let urlResolveSequence=0;
+function queueImageResolve(image,{force=false,preview=true,priority=2}={}){
+  if(!needsImageResolve(image,force,preview)) return Promise.resolve(image);
+  const key=image.path+'|'+(preview?'preview':'download');
+  const existing=urlResolveTasks.get(key);
+  if(existing){
+    existing.priority=Math.min(existing.priority,priority);
+    existing.force=existing.force||force;
+    return existing.promise.then(data=>applyResolvedUrl(image,data));
   }
+  const task={key,priority,force,sequence:urlResolveSequence++,controller:new AbortController(),started:false,cancelled:false};
+  task.promise=new Promise((resolve,reject)=>{task.resolve=resolve;task.reject=reject;});
+  task.run=async()=>{
+    const fresh=task.force?'&fresh=1':'';
+    const mode=preview?'&preview=1':'';
+    return fetchJsonWithRetry('/api/download-url?path='+encodeURIComponent(image.path)+fresh+mode,{headers:adminHeaders(),signal:task.controller.signal},2);
+  };
+  urlResolveTasks.set(key,task);
+  urlResolveQueue.push(task);
+  runNextUrlResolve();
+  return task.promise.then(data=>applyResolvedUrl(image,data));
+}
+
+async function refreshImageUrls(images,force=false,preview=true,priority=2){
+  await Promise.all(images.map(image=>queueImageResolve(image,{force,preview,priority}).catch(()=>image)));
   return images;
 }
 
-async function refreshImageUrl(image,force=true){
-  const fresh=force?'&fresh=1':'';
-  const data=await fetchJsonWithRetry('/api/download-url?path='+encodeURIComponent(image.path)+fresh,{headers:adminHeaders()},2);
-  return applyResolvedUrl(image,data);
+function refreshImageUrl(image,force=true,preview=true,priority=0){
+  return queueImageResolve(image,{force,preview,priority});
 }
 
-async function ensureFreshImage(image){
-  try{
-    if(image.needs_url||!image.url) await refreshImageUrl(image,false);
-    else if(!image._resolvedAt||Date.now()-image._resolvedAt>URL_REFRESH_AGE_MS) await refreshImageUrl(image,false);
-  }catch(error){
-    image.needs_url=false;
-  }
+async function ensureFreshImage(image,preview=true,priority=2){
+  if(needsImageResolve(image,false,preview)) await queueImageResolve(image,{force:false,preview,priority});
   return image;
 }
 
@@ -1562,14 +2170,14 @@ function attachImageRecovery(element,image){
   element.addEventListener('error',()=>{
     if(element.dataset.refreshAttempted==='1') return;
     element.dataset.refreshAttempted='1';
-    refreshImageUrl(image,true).then(()=>{element.src=cardSrc(image);}).catch(()=>{});
+    refreshImageUrl(image,true,true).then(()=>{element.src=cardSrc(image);}).catch(()=>{});
   });
 }
 
 async function downloadImage(){
   if(!activeImage) return;
-  if(!activeImage.url||activeImage.needs_url||!activeImage._resolvedAt||Date.now()-activeImage._resolvedAt>URL_REFRESH_AGE_MS){
-    await refreshImageUrl(activeImage,false);
+  if(!activeImage.url||Date.now()-(activeImage._resolvedAt||0)>URL_REFRESH_AGE_MS){
+    await refreshImageUrl(activeImage,false,false);
   }
   const link=document.createElement('a');
   link.href=activeImage.url;
@@ -1652,8 +2260,11 @@ function beginPointerGesture(){
   }
 }
 
+let lightboxResolveToken=0;
 function openLightbox(image){
   clearSlideTimer();
+  lightboxReturnFocus=document.activeElement;
+  const token=++lightboxResolveToken;
   const caption=captionFor(image);
   const directory=settings.caption_mode!=='path'?directoryFor(image):'';
   activeImage=image;
@@ -1669,10 +2280,19 @@ function openLightbox(image){
   lightboxImage.onerror=()=>{
     if(lightboxImage.dataset.refreshAttempted==='1') return;
     lightboxImage.dataset.refreshAttempted='1';
-    refreshImageUrl(image,true).then(()=>{lightboxImage.src=image.url;}).catch(showError);
+    refreshImageUrl(image,true,false,0).then(()=>{if(token===lightboxResolveToken)lightboxImage.src=lightboxSrc(image);}).catch(()=>{});
   };
-  lightboxImage.alt=imageName(image.path)||'';
-  lightboxImage.src=lightboxSrc(image);
+  lightboxImage.alt=imageName(image.path)||'图片';
+  const previewSrc=lightboxSrc(image);
+  if(previewSrc) lightboxImage.src=previewSrc;
+  const wantOriginal=(settings.lightbox_quality||'original')==='original';
+  if(wantOriginal||!previewSrc){
+    refreshImageUrl(image,false,false,0).then(()=>{
+      if(token!==lightboxResolveToken||!lightbox.open)return;
+      const next=lightboxSrc(image);
+      if(next&&lightboxImage.src!==next) lightboxImage.src=next;
+    }).catch(()=>{});
+  }
   if(lightboxImage.complete&&lightboxImage.naturalWidth) fitLightboxImage(false);
 }
 
@@ -1684,19 +2304,37 @@ function createCard(image,eager=false){
   const preview=document.createElement('button');
   preview.className='preview-button';
   preview.type='button';
-  preview.setAttribute('aria-label','查看图片');
+  const accessibleName=imageName(image.path)||'图片';
+  preview.setAttribute('aria-label','查看图片：'+accessibleName);
   preview.onclick=()=>openLightbox(image);
   const picture=document.createElement('img');
   picture.loading=eager?'eager':'lazy';
   picture.decoding='async';
   if(eager) picture.fetchPriority='high';
-  picture.alt='';
+  picture.alt=accessibleName;
   attachImageRecovery(picture,image);
+  const showCardError=()=>{
+    picture.classList.add('hidden');
+    let error=card.querySelector('.image-error');
+    if(!error){
+      error=document.createElement('div');
+      error.className='image-error';
+      const message=document.createElement('span');
+      message.textContent='图片加载失败';
+      const retry=document.createElement('button');
+      retry.className='ghost';
+      retry.type='button';
+      retry.textContent='重试';
+      retry.onclick=event=>{event.stopPropagation();error.remove();picture.classList.remove('hidden');delete picture.dataset.srcApplied;queueImageResolve(image,{force:true,preview:true,priority:0}).then(()=>{picture.src=cardSrc(image);}).catch(showCardError);};
+      error.append(message,retry);
+      card.append(error);
+    }
+  };
   const applySrc=()=>{
     if(picture.dataset.srcApplied==='1') return card._ready||Promise.resolve();
     picture.dataset.srcApplied='1';
-    if(image.needs_url||!image.url){
-      card._ready=ensureFreshImage(image).then(()=>{picture.src=cardSrc(image);}).catch(()=>{});
+    if(needsImageResolve(image,false,true)){
+      card._ready=ensureFreshImage(image,true,eager?0:2).then(()=>{const src=cardSrc(image);if(!src)throw new Error('missing image source');picture.src=src;}).catch(showCardError);
     }else{
       picture.src=cardSrc(image);
       card._ready=Promise.resolve();
@@ -1714,6 +2352,8 @@ function createCard(image,eager=false){
     const like=document.createElement('button');
     like.className='tag-vote like';
     like.type='button';
+    like.setAttribute('aria-label','喜欢 '+accessibleName);
+    like.setAttribute('aria-pressed','false');
     like.innerHTML='❤ <span class="tag-vote-count">'+(image.tags.likes||0)+'</span>';
     like.onclick=(e)=>{e.stopPropagation();handleTagVote(image.path,'like',like,e);};
     tags.append(like);
@@ -1724,7 +2364,9 @@ function createCard(image,eager=false){
         btn.type='button';
         btn.textContent=cat;
         btn.dataset.category=cat;
-        if(image.tags.categories&&image.tags.categories.includes(cat))btn.classList.add('active');
+        const active=image.tags.categories&&image.tags.categories.includes(cat);
+        btn.classList.toggle('active',!!active);
+        btn.setAttribute('aria-pressed',String(!!active));
         btn.onclick=(e)=>{e.stopPropagation();handleTagCategory(image.path,cat,btn,e);};
         tags.append(btn);
       });
@@ -1735,8 +2377,11 @@ function createCard(image,eager=false){
       trash.type='button';
       trash.textContent='🗑️';
       trash.title='标记为垃圾图片';
+      trash.setAttribute('aria-label','标记为垃圾图片：'+accessibleName);
       trash.dataset.category=taggingConfig.trash_tag;
-      if(image.tags.categories&&image.tags.categories.includes(taggingConfig.trash_tag))trash.classList.add('active');
+      const active=image.tags.categories&&image.tags.categories.includes(taggingConfig.trash_tag);
+      trash.classList.toggle('active',!!active);
+      trash.setAttribute('aria-pressed',String(!!active));
       trash.onclick=(e)=>{e.stopPropagation();handleTagCategory(image.path,taggingConfig.trash_tag,trash,e);};
       tags.append(trash);
     }
@@ -1754,8 +2399,21 @@ async function requestImages(count){
   }
   url+='&_='+Date.now();
   const data=await fetchJsonWithRetry(url,{headers:adminHeaders()},3);
-  const resolvedAt=Date.now();
-  return data.images.map(image=>({...image,_resolvedAt:resolvedAt}));
+  const images=(data.images||[]).map(image=>({...image,_resolvedAt:image.url||image.thumbnail?Date.now():0}));
+  const pending=images.filter(image=>needsImageResolve(image,false,true));
+  if(!pending.length) return images;
+  try{
+    const resolved=await fetchJsonWithRetry('/api/download-url',{
+      method:'POST',
+      headers:{'Content-Type':'application/json',...adminHeaders()},
+      body:JSON.stringify({paths:pending.map(image=>image.path),preview:true})
+    },2);
+    const resolvedByPath=new Map((resolved.images||[]).map(image=>[image.path,image]));
+    pending.forEach(image=>applyResolvedUrl(image,resolvedByPath.get(image.path)));
+  }catch(error){
+    if(error.name!=='AbortError') console.debug('批量预览解析失败，将按图片重试',error);
+  }
+  return images;
 }
 
 async function handleTagVote(path,type,button,event){
@@ -1768,6 +2426,7 @@ async function handleTagVote(path,type,button,event){
     if(!response.ok){const err=await response.json().catch(()=>({}));throw new Error(err.error||'投票失败');}
     const result=await response.json();
     button.classList.toggle('active',newValue);
+    button.setAttribute('aria-pressed',String(newValue));
     const count=button.querySelector('.tag-vote-count');
     if(count)count.textContent=result.likes!==undefined?result.likes:count.textContent;
     const card=button.closest('.card');
@@ -1788,6 +2447,7 @@ async function handleTagCategory(path,category,button,event){
     const response=await fetch('/api/tagging/vote',{method:'POST',headers:{'Content-Type':'application/json',...adminHeaders()},body:JSON.stringify({path:path,type:'category',category:category,value:newValue})});
     if(!response.ok){const err=await response.json().catch(()=>({}));throw new Error(err.error||'分类标记失败');}
     button.classList.toggle('active',newValue);
+    button.setAttribute('aria-pressed',String(newValue));
     const card=button.closest('.card');
     if(card)updateCardActiveTag(card);
   }catch(error){
@@ -1827,7 +2487,9 @@ function renderTagBar(){
     chip.textContent=cat;
     const count=tagCategoriesCache.categories&&tagCategoriesCache.categories[cat];
     if(count){const c=document.createElement('span');c.className='tag-chip-count';c.textContent='('+count+')';chip.append(c);}
-    if(activeTagFilters.includes(cat))chip.classList.add('active');
+    const active=activeTagFilters.includes(cat);
+    chip.classList.toggle('active',active);
+    chip.setAttribute('aria-pressed',String(active));
     chip.onclick=()=>{
       const idx=activeTagFilters.indexOf(cat);
       if(idx>=0)activeTagFilters.splice(idx,1);else activeTagFilters.push(cat);
@@ -1842,9 +2504,12 @@ function renderTagBar(){
     chip.type='button';
     chip.textContent='🗑️';
     chip.title=taggingConfig.trash_tag;
+    chip.setAttribute('aria-label',taggingConfig.trash_tag);
     const count=tagCategoriesCache.categories&&tagCategoriesCache.categories[taggingConfig.trash_tag];
     if(count){const c=document.createElement('span');c.className='tag-chip-count';c.textContent='('+count+')';chip.append(c);}
-    if(activeTagFilters.includes(taggingConfig.trash_tag))chip.classList.add('active');
+    const active=activeTagFilters.includes(taggingConfig.trash_tag);
+    chip.classList.toggle('active',active);
+    chip.setAttribute('aria-pressed',String(active));
     chip.onclick=()=>{
       const idx=activeTagFilters.indexOf(taggingConfig.trash_tag);
       if(idx>=0)activeTagFilters.splice(idx,1);else activeTagFilters.push(taggingConfig.trash_tag);
@@ -1866,6 +2531,7 @@ function renderTagBar(){
 
 function preferredWaterfallColumns(){
   const width=gallery.clientWidth||window.innerWidth;
+  if(width<=560) return 1;
   return width>900?3:2;
 }
 
@@ -1968,37 +2634,42 @@ function scheduleSlideshow(delayMs=null){
 
 function preloadUpcomingSlides(){
   const upcoming=slideImages.slice(slideIndex+1,slideIndex+1+SLIDE_PRELOAD_COUNT);
-  const urls=new Set(upcoming.map(image=>image.url));
+  const urls=new Set(upcoming.map(image=>cardSrc(image)).filter(Boolean));
   for(const [url,image] of slidePreloads){if(!urls.has(url)){image.src='';slidePreloads.delete(url);}}
   for(const image of upcoming){
-    if(slidePreloads.has(image.url)) continue;
+    const src=cardSrc(image);
+    if(!src||slidePreloads.has(src)) continue;
     const preload=new Image();
     preload.decoding='async';
-    preload.src=image.url;
-    slidePreloads.set(image.url,preload);
+    preload.src=src;
+    slidePreloads.set(src,preload);
   }
 }
 
-async function appendSlideImages(count){
+async function appendSlideImages(count,generation=renderGeneration){
   if(slideExhausted) return [];
   if(slideLoadPromise) return slideLoadPromise;
-  slideLoadPromise=requestImages(count).then(images=>{
+  const loadPromise=requestImages(count).then(images=>{
+    if(generation!==renderGeneration) return [];
     slideImages.push(...images);
     if(images.length<count) slideExhausted=true;
     return images;
   }).catch(error=>{
-    slideExhausted=true;
+    if(generation===renderGeneration) slideExhausted=true;
     throw error;
-  }).finally(()=>{slideLoadPromise=null;});
-  return slideLoadPromise;
+  }).finally(()=>{if(slideLoadPromise===loadPromise)slideLoadPromise=null;});
+  slideLoadPromise=loadPromise;
+  return loadPromise;
 }
 
-async function ensureSlideBuffer(){
+async function ensureSlideBuffer(generation=renderGeneration){
   const remaining=slideImages.length-slideIndex-1;
-  if(remaining<SLIDE_PRELOAD_COUNT&&!slideExhausted) await appendSlideImages(SLIDE_PRELOAD_COUNT-remaining);
-  const upcoming=slideImages.slice(slideIndex,slideIndex+1+SLIDE_PRELOAD_COUNT);
-  await refreshImageUrls(upcoming,false).catch(()=>{});
-  preloadUpcomingSlides();
+  if(remaining<SLIDE_PRELOAD_COUNT&&!slideExhausted) await appendSlideImages(SLIDE_PRELOAD_COUNT-remaining,generation);
+  if(generation!==renderGeneration) return;
+  const current=slideImages[slideIndex];
+  const upcoming=slideImages.slice(slideIndex+1,slideIndex+1+SLIDE_PRELOAD_COUNT);
+  if(current) queueImageResolve(current,{priority:0}).then(()=>{if(generation===renderGeneration&&slideImages[slideIndex]===current)renderSlideshow();}).catch(()=>{});
+  refreshImageUrls(upcoming,false,true,1).then(()=>{if(generation===renderGeneration)preloadUpcomingSlides();}).catch(()=>{});
 }
 
 function recordSlideHistory(image){
@@ -2010,7 +2681,6 @@ function recordSlideHistory(image){
 
 async function showHistoryImage(image){
   setSlideshowPaused(true);
-  await ensureFreshImage(image);
   let index=slideImages.findIndex(item=>item._historyId===image._historyId);
   if(index<0){
     slideImages.splice(slideIndex+1,0,image);
@@ -2074,7 +2744,7 @@ function renderSlideshow(){
   scheduleSlideshow();
 }
 
-async function loadSlideshow(reset){
+async function loadSlideshow(reset,generation=renderGeneration){
   clearSlideTimer();
   if(reset){
     slideImages=[];
@@ -2083,10 +2753,11 @@ async function loadSlideshow(reset){
     slideHistory=[];
     slideHistorySequence=0;
     slidePreloads.clear();
-    await appendSlideImages(SLIDE_INITIAL_LOAD);
+    await appendSlideImages(SLIDE_INITIAL_LOAD,generation);
   }
-  await ensureSlideBuffer();
-  renderSlideshow();
+  if(generation!==renderGeneration) return;
+  await ensureSlideBuffer(generation);
+  if(generation===renderGeneration) renderSlideshow();
 }
 
 async function nextSlide(){
@@ -2097,7 +2768,6 @@ async function nextSlide(){
   }else if(slideExhausted){
     setSlideshowPaused(true);
   }
-  await ensureFreshImage(slideImages[slideIndex]);
   if(slideIndex>80){slideImages=slideImages.slice(slideIndex-60);slideIndex=60;}
   renderSlideshow();
   ensureSlideBuffer().then(()=>{updateSlideshowStatus();renderSlideHistory();}).catch(showError);
@@ -2111,36 +2781,33 @@ function previousSlide(){
 
 function clearWaterfallPrefetch(){
   waterfallPrefetch=[];
-  waterfallPrefetching=false;
+  waterfallPrefetchPromise=null;
   waterfallPrefetchToken+=1;
 }
 
-async function prefetchNextWaterfallBatch(){
-  if(waterfallPrefetching||waterfallExhausted||waterfallPrefetch.length) return;
+function prefetchNextWaterfallBatch(){
+  if(waterfallPrefetchPromise||waterfallExhausted||waterfallPrefetch.length) return waterfallPrefetchPromise;
   const token=waterfallPrefetchToken;
-  waterfallPrefetching=true;
-  try{
-    const images=await requestImages(WATERFALL_BATCH_SIZE);
-    if(token!==waterfallPrefetchToken) return;
-    if(!images.length){
-      waterfallExhausted=true;
-      return;
-    }
-    await refreshImageUrls(images,false).catch(()=>{});
-    if(token!==waterfallPrefetchToken) return;
+  waterfallPrefetchPromise=requestImages(WATERFALL_BATCH_SIZE).then(images=>{
+    if(token!==waterfallPrefetchToken) return [];
+    if(!images.length){waterfallExhausted=true;return [];}
     waterfallPrefetch=images;
-  }catch(error){
+    return images;
+  }).catch(()=>{
     if(token===waterfallPrefetchToken) waterfallPrefetch=[];
-  }finally{
-    if(token===waterfallPrefetchToken) waterfallPrefetching=false;
-  }
+    return [];
+  }).finally(()=>{
+    if(token===waterfallPrefetchToken) waterfallPrefetchPromise=null;
+  });
+  return waterfallPrefetchPromise;
 }
 
-async function loadWaterfallBatch(reset){
+async function loadWaterfallBatch(reset,generation=renderGeneration){
   if(waterfallLoading) return;
   if(!reset&&waterfallExhausted) return;
   waterfallLoading=true;
   refreshButton.disabled=true;
+  gallery.setAttribute('aria-busy','true');
   try{
     if(reset){
       clearWaterfallPrefetch();
@@ -2151,8 +2818,10 @@ async function loadWaterfallBatch(reset){
       gallery.replaceChildren();
       setupWaterfallColumns();
     }
+    if(generation!==renderGeneration) return;
+    if(!waterfallPrefetch.length&&waterfallPrefetchPromise) await waterfallPrefetchPromise;
     let images=waterfallPrefetch.length?waterfallPrefetch.splice(0,waterfallPrefetch.length):await requestImages(WATERFALL_BATCH_SIZE);
-    await refreshImageUrls(images,false).catch(()=>{});
+    if(generation!==renderGeneration) return;
     if(!images.length){
       waterfallExhausted=true;
       if(loadedCount===0){
@@ -2172,10 +2841,10 @@ async function loadWaterfallBatch(reset){
       loadedCount+=images.length;
       if(images.length<WATERFALL_BATCH_SIZE) waterfallExhausted=true;
       statusEl.textContent='瀑布流 · 已加载 '+loadedCount+' 张';
-      await Promise.allSettled(cards.map(card=>card._ready||Promise.resolve()));
       prefetchNextWaterfallBatch();
     }
   }catch(error){
+    if(generation!==renderGeneration) return;
     if(loadedCount===0){
       gallery.replaceChildren();
       const empty=document.createElement('p');
@@ -2188,9 +2857,12 @@ async function loadWaterfallBatch(reset){
       statusEl.textContent='瀑布流 · 已加载 '+loadedCount+' 张';
     }
   }finally{
-    waterfallLoading=false;
-    refreshButton.disabled=false;
-    maybeLoadMoreWaterfall();
+    if(generation===renderGeneration){
+      waterfallLoading=false;
+      refreshButton.disabled=false;
+      gallery.setAttribute('aria-busy','false');
+      maybeLoadMoreWaterfall();
+    }
   }
 }
 
@@ -2240,6 +2912,13 @@ async function recoverAfterIdle(){
 
 async function render(){
   clearSlideTimer();
+  cancelUrlResolveTasks();
+  lightboxResolveToken+=1;
+  const generation=++renderGeneration;
+  slideLoadPromise=null;
+  waterfallLoading=false;
+  gallery.setAttribute('aria-busy','true');
+  refreshButton.disabled=true;
   const restricted=settings.maintenance_enabled&&!maintenanceAccessToken;
   maintenance.classList.toggle('hidden',!restricted);
   gallery.classList.toggle('hidden',restricted);
@@ -2256,20 +2935,26 @@ async function render(){
   slideHistoryPanel.classList.toggle('hidden',restricted||settings.view_layout!=='slideshow');
   document.body.classList.toggle('has-slide-history',!restricted&&settings.view_layout==='slideshow');
   updateSlideshowToggle();
-  refreshButton.disabled=restricted;
-  if(restricted){statusEl.textContent='维护中';return;}
+  if(restricted){statusEl.textContent='维护中';gallery.setAttribute('aria-busy','false');return;}
+  statusEl.textContent='正在加载…';
   applyGridStyle();
-  if(settings.view_layout==='slideshow'){
-    await loadSlideshow(true);
-  }else{
-    gallery.className='gallery waterfall';
-    await loadWaterfallBatch(true);
+  try{
+    if(settings.view_layout==='slideshow'){
+      await loadSlideshow(true,generation);
+    }else{
+      gallery.className='gallery waterfall';
+      await loadWaterfallBatch(true,generation);
+    }
+  }finally{
+    if(generation===renderGeneration){gallery.setAttribute('aria-busy','false');refreshButton.disabled=false;}
   }
 }
 
 function showError(error){
+  if(error&&error.name==='AbortError') return;
   statusEl.textContent='加载失败：'+error.message;
   refreshButton.disabled=false;
+  gallery.setAttribute('aria-busy','false');
   if(settings&&settings.view_layout==='slideshow'&&!slideshowPaused&&activeTagFilters.length===0) scheduleSlideshow(15000);
 }
 
@@ -2296,8 +2981,9 @@ announcementButton.onclick=()=>showAnnouncement(true);
 const headerMenuToggle=document.querySelector('#header-menu-toggle');
 const headerMenu=document.querySelector('#header-menu');
 const headerMenuBackdrop=document.querySelector('#header-menu-backdrop');
-function openHeaderMenu(){if(headerMenu.classList.contains('open')){closeHeaderMenu();return;}clearSlideTimer();headerMenu.style.setProperty('--menu-top',Math.round(document.querySelector('header').getBoundingClientRect().bottom)+'px');headerMenu.classList.add('open');headerMenuBackdrop.classList.add('open');headerMenuToggle.setAttribute('aria-expanded','true');}
-function closeHeaderMenu(){headerMenu.classList.remove('open');headerMenuBackdrop.classList.remove('open');headerMenuToggle.setAttribute('aria-expanded','false');scheduleSlideshow();}
+function openHeaderMenu(){if(headerMenu.classList.contains('open')){closeHeaderMenu();return;}clearSlideTimer();headerMenuReturnFocus=document.activeElement;headerMenu.style.setProperty('--menu-top',Math.round(pageHeader.getBoundingClientRect().bottom)+'px');headerMenu.classList.add('open');headerMenuBackdrop.classList.add('open');headerMenuToggle.setAttribute('aria-expanded','true');const first=focusableWithin(headerMenu)[0];if(first)first.focus();}
+let headerMenuReturnFocus=null;
+function closeHeaderMenu(returnFocus=false){headerMenu.classList.remove('open');headerMenuBackdrop.classList.remove('open');headerMenuToggle.setAttribute('aria-expanded','false');if(returnFocus&&headerMenuReturnFocus&&headerMenuReturnFocus.focus)headerMenuReturnFocus.focus();headerMenuReturnFocus=null;scheduleSlideshow();}
 headerMenuToggle.onclick=openHeaderMenu;
 headerMenuBackdrop.onclick=closeHeaderMenu;
 document.querySelector('#menu-previous').onclick=()=>{closeHeaderMenu();previousSlide();};
@@ -2320,7 +3006,7 @@ rotateLeftButton.onclick=()=>{zoomRotation-=90;applyZoom();};
 rotateRightButton.onclick=()=>{zoomRotation+=90;applyZoom();};
 document.querySelector('#lightbox-close').onclick=()=>lightbox.close();
 lightbox.addEventListener('click',event=>{if(event.target===lightbox)lightbox.close();});
-lightbox.addEventListener('close',()=>{activePointers.clear();dragStart=null;pinchStart=null;lightboxStage.classList.remove('is-dragging');scheduleSlideshow();});
+lightbox.addEventListener('close',()=>{activePointers.clear();dragStart=null;pinchStart=null;lightboxResolveToken+=1;lightboxStage.classList.remove('is-dragging');if(lightboxReturnFocus&&lightboxReturnFocus.focus)lightboxReturnFocus.focus();lightboxReturnFocus=null;scheduleSlideshow();});
 lightboxStage.addEventListener('wheel',event=>{event.preventDefault();changeZoom(zoomScale*(event.deltaY<0?1.15:.87),event.clientX,event.clientY);},{passive:false});
 lightboxStage.addEventListener('dblclick',event=>{event.preventDefault();if(zoomScale>1)resetZoom();else changeZoom(2,event.clientX,event.clientY);});
 lightboxStage.addEventListener('pointerdown',event=>{
@@ -2357,8 +3043,14 @@ function finishPointer(event){
 lightboxStage.addEventListener('pointerup',finishPointer);
 lightboxStage.addEventListener('pointercancel',finishPointer);
 window.addEventListener('keydown',event=>{
+  if(event.key==='Escape'&&!preferencesPanel.classList.contains('hidden')){closePreferences();return;}
+  if(event.key==='Escape'&&headerMenu.classList.contains('open')){closeHeaderMenu(true);return;}
+  if(!preferencesPanel.classList.contains('hidden')){trapFocus(preferencesPanel,event);return;}
+  if(headerMenu.classList.contains('open')){if(event.key==='Escape')closeHeaderMenu(true);else trapFocus(headerMenu,event);return;}
   if(!lightbox.open) return;
   if(event.key==='Escape') lightbox.close();
+  else if(event.key==='ArrowLeft'){event.preventDefault();previousSlide();}
+  else if(event.key==='ArrowRight'){event.preventDefault();nextSlide().catch(showError);}
   else if(event.key==='+'||event.key==='=') changeZoom(zoomScale+.25);
   else if(event.key==='-') changeZoom(zoomScale-.25);
   else if(event.key==='0') resetZoom();
@@ -2371,6 +3063,7 @@ window.addEventListener('resize',()=>{
   clearTimeout(resizeTimer);
   resizeTimer=setTimeout(()=>{
     if(!settings)return;
+    if(pageHeader)document.documentElement.style.setProperty('--header-h',Math.ceil(pageHeader.getBoundingClientRect().height)+'px');
     applyGridStyle();
     if(settings.view_layout==='waterfall'&&waterfallColumnCount!==preferredWaterfallColumns())setupWaterfallColumns();
     if(lightbox.open) fitLightboxImage(true);
@@ -2383,6 +3076,7 @@ document.addEventListener('visibilitychange',()=>{
   lastHiddenAt=0;
 });
 window.addEventListener('online',()=>recoverAfterIdle().catch(showError));
+if(pageHeader)document.documentElement.style.setProperty('--header-h',Math.ceil(pageHeader.getBoundingClientRect().height)+'px');
 loadSettings().then(value=>{settings=value;taggingConfig=settings.tagging;applyGalleryTheme(settings.theme);const annVisible=settings.announcement.enabled;announcementButton.classList.toggle('hidden',!annVisible);document.querySelector('#menu-announcement').classList.toggle('hidden',!annVisible);showAnnouncement();loadTagCategories();return render();}).catch(showError);
 </script>
 </body>
@@ -2394,183 +3088,169 @@ def admin_html() -> str:
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>图库管理</title>
 <style>
-:root{color-scheme:dark}
+:root{
+  color-scheme:dark;
+  --bg:#0f1115;--bg-elev:#171b22;--bg-soft:#1d232d;--line:#2a3140;--text:#e8edf5;--muted:#8b97ab;--accent:#3d8bfd;--accent-hover:#5aa0ff;--danger:#ff5d6c;--radius:14px;--shadow:0 16px 40px rgba(0,0,0,.38);
+  --font:"Segoe UI",system-ui,-apple-system,"PingFang SC","Noto Sans SC",sans-serif;
+}
 *{box-sizing:border-box}
-body{max-width:1080px;margin:auto;padding:22px;background:#10131a;color:#e7edf7;font:15px system-ui,sans-serif;transition:background .25s,color .25s}
-body.theme-light{color-scheme:light;background:#eef1f6;color:#1a2333}
-section{margin-bottom:18px;padding:18px;background:#171c27;border:1px solid #293040;border-radius:10px;transition:background .25s,border-color .25s}
-body.theme-light section{background:#fff;border-color:#dde3ee}
-h1,h2,h3{margin-top:0}
-label{display:grid;gap:6px;margin:10px 0;color:inherit}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 var(--font)}
+.wrap{max-width:980px;margin:0 auto;padding:22px 18px 80px}
+.admin-head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-bottom:18px}
+.admin-head h1{margin:0;font-size:24px}
+.admin-head a{color:var(--accent);text-decoration:none}
+section{margin-bottom:16px;padding:18px;background:var(--bg-elev);border:1px solid var(--line);border-radius:var(--radius)}
+h2,h3{margin:0 0 10px}
+h2{font-size:18px}h3{font-size:14px;color:var(--muted)}
+label{display:grid;gap:6px;margin:10px 0}
 .row{display:flex;gap:12px;flex-wrap:wrap}
 .row>label{flex:1;min-width:180px}
 input,select,textarea,button{font:inherit}
-input,select,textarea{width:100%;padding:9px;border:1px solid #3a455b;border-radius:7px;background:#0d1119;color:#fff;transition:border-color .2s,background .25s}
-body.theme-light input,body.theme-light select,body.theme-light textarea{border-color:#c8d1e0;background:#f7f9fc;color:#1a2333}
-input:focus,select:focus,textarea:focus{outline:none;border-color:#4b8cff}
+input,select,textarea{width:100%;padding:9px 10px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--text)}
+input:focus-visible,select:focus-visible,textarea:focus-visible,button:focus-visible,a:focus-visible{outline:3px solid color-mix(in srgb,var(--accent) 55%,transparent);outline-offset:2px;border-color:var(--accent)}
 textarea{min-height:80px;resize:vertical}
-button{padding:9px 16px;border:0;border-radius:7px;background:#4b8cff;color:#fff;cursor:pointer;transition:transform .12s,background .2s,box-shadow .2s}
-button:hover{background:#3a7af0;transform:translateY(-1px);box-shadow:0 4px 12px rgba(75,140,255,.35)}
-button:active{transform:translateY(0) scale(.97);box-shadow:0 1px 4px rgba(75,140,255,.3)}
-button.secondary{background:#39445a}
-button.secondary:hover{background:#445067;box-shadow:0 4px 12px rgba(0,0,0,.2)}
-.actions{margin-top:14px}
-.note{color:#a9b7cd}
-body.theme-light .note{color:#6b7689}
-.selected{display:grid;gap:5px;margin-top:10px}
-.selected-item{display:flex;gap:8px;align-items:center;justify-content:space-between;padding:8px;border:1px solid #293040;border-radius:7px}
-body.theme-light .selected-item{border-color:#dde3ee}
+button{padding:9px 16px;border:0;border-radius:10px;background:var(--accent);color:#fff;cursor:pointer}
+button:hover{background:var(--accent-hover)}
+button:disabled{opacity:.5;cursor:not-allowed}
+button.secondary,button.ghost{background:transparent;color:var(--text);border:1px solid var(--line)}
+button.danger{background:transparent;color:var(--danger);border:1px solid color-mix(in srgb,var(--danger) 45%,var(--line))}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+.note{color:var(--muted);font-size:13px}
+.selected{display:grid;gap:6px;margin-top:10px}
+.selected-item{display:flex;gap:8px;align-items:center;justify-content:space-between;padding:8px 10px;border:1px solid var(--line);border-radius:10px;background:var(--bg)}
 .check{display:flex;align-items:center;gap:8px}
 .check input{width:auto}
-.markdown-preview{min-height:80px;padding:12px;border:1px solid #3a455b;border-radius:7px;background:#0d1119;color:#fff;line-height:1.65}
-body.theme-light .markdown-preview{border-color:#c8d1e0;background:#f7f9fc;color:#1a2333}
-.markdown-preview h1,.markdown-preview h2,.markdown-preview h3,.markdown-preview h4{margin:12px 0 7px}
-.markdown-preview p{margin:7px 0}
-.markdown-preview code{padding:2px 5px;border-radius:4px;background:#293040}
-body.theme-light .markdown-preview code{background:#e8edf5}
+.markdown-preview{min-height:80px;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);line-height:1.65}
 .hidden{display:none}
 .trash-list{display:flex;flex-direction:column;gap:4px;margin-top:10px;max-height:400px;overflow-y:auto}
-.trash-item{display:flex;align-items:center;gap:8px;padding:6px 10px;border:1px solid #3a455b;border-radius:6px;background:#0d1119}
+.trash-item{display:flex;align-items:center;gap:8px;padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg)}
 .trash-item input[type=checkbox]{width:auto}
 .trash-item .trash-path{flex:1;word-break:break-all;font-size:13px}
 a{color:#b7d1ff}
-body.theme-light a{color:#2d6cf0}
-.tabs-nav{display:flex;gap:4px;flex-wrap:wrap;border-bottom:2px solid #293040;margin-bottom:20px}
-body.theme-light .tabs-nav{border-color:#dde3ee}
-.tab-button{padding:11px 20px;background:transparent;color:inherit;border:0;border-radius:8px 8px 0 0;cursor:pointer;font:inherit;position:relative;transition:background .2s,color .2s}
-.tab-button:hover{background:rgba(75,140,255,.12);transform:none;box-shadow:none}
-.tab-button.active{background:rgba(75,140,255,.18);color:#7db0ff;font-weight:600}
-.tab-button.active::after{content:'';position:absolute;left:0;right:0;bottom:-2px;height:2px;background:#4b8cff;border-radius:2px}
-body.theme-light .tab-button.active{color:#2d6cf0;background:rgba(45,108,240,.12)}
+.tabs-nav{display:flex;gap:6px;overflow-x:auto;padding-bottom:2px;margin:-4px 0 16px;border-bottom:1px solid var(--line);scrollbar-width:thin}
+.tab-button{padding:10px 14px;background:transparent;color:var(--muted);border:0;border-radius:10px 10px 0 0;white-space:nowrap}
+.tab-button.active{color:var(--text);background:color-mix(in srgb,var(--accent) 16%,transparent);box-shadow:inset 0 -2px 0 var(--accent)}
 .tab-panel{display:none}
-.tab-panel.active{display:block;animation:fadeIn .22s ease}
-@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
-.tree{max-height:440px;overflow:auto;border:1px solid #293040;border-radius:7px;padding:8px}
-body.theme-light .tree{border-color:#dde3ee}
+.tab-panel.active{display:block}
+.tree{max-height:440px;overflow:auto;border:1px solid var(--line);border-radius:10px;padding:8px;background:var(--bg)}
 .tree-node{margin:2px 0}
-.tree-row{display:flex;align-items:center;gap:6px;padding:5px 6px;border-radius:5px;cursor:pointer;transition:background .15s}
-.tree-row:hover{background:rgba(75,140,255,.1)}
-.tree-toggle{width:18px;text-align:center;cursor:pointer;user-select:none;font-size:12px;color:#7db0ff}
-.tree-toggle.tree-leaf{cursor:default}
-.tree-check{width:auto;cursor:pointer}
+.tree-row{display:flex;align-items:center;gap:6px;padding:6px;border-radius:8px}
+.tree-row:hover{background:color-mix(in srgb,var(--accent) 10%,transparent)}
+.tree-toggle{width:24px;height:24px;padding:0;text-align:center;font-size:12px;color:var(--accent);background:transparent;border:0}
+.tree-check{width:auto}
 .tree-label{flex:1;word-break:break-all}
 .tree-children{margin-left:22px;display:none}
 .tree-node.open>.tree-children{display:block}
-.theme-toggle{position:fixed;bottom:22px;right:22px;z-index:60;width:46px;height:46px;padding:0;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:20px;box-shadow:0 6px 18px rgba(0,0,0,.35);transition:transform .15s ease,box-shadow .15s ease}
-.theme-toggle:hover{transform:translateY(-2px);box-shadow:0 10px 24px rgba(0,0,0,.45)}
-.tabs-nav{flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:thin}
-.row{flex-wrap:wrap}
-@media(max-width:560px){body{padding:14px 12px}.row.actions button{flex:1 1 auto}}
+.theme-toggle{position:fixed;bottom:max(18px,env(safe-area-inset-bottom));right:max(18px,env(safe-area-inset-right));z-index:60;width:48px;height:48px;padding:0;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:20px;box-shadow:var(--shadow)}
+.sticky-save{position:sticky;bottom:0;padding-top:14px;margin-top:18px;background:linear-gradient(transparent,var(--bg) 28%)}
+body.theme-light{color-scheme:light;--bg:#f3f5f8;--bg-elev:#fff;--bg-soft:#eef1f6;--line:#d5dbe6;--text:#1a2230;--muted:#667085;--accent:#2d6cf0;--accent-hover:#1f5ee0;--shadow:0 14px 32px rgba(30,40,60,.12)}
+body.theme-light a{color:#2d6cf0}
+@media(max-width:640px){
+  .wrap{padding:14px 12px 88px}
+  .admin-head{align-items:flex-start;flex-direction:column}
+  .row.actions button,.actions button{flex:1 1 calc(50% - 8px)}
+  .tabs-nav{margin-left:-4px;margin-right:-4px}
+}
 </style>
 </head>
 <body>
-<button id="theme-toggle" class="theme-toggle secondary" type="button" title="切换明暗主题">🌙</button>
-<h1>图库管理</h1>
-<p><a href="/gallery">返回图片浏览</a></p>
+<button id="theme-toggle" class="theme-toggle secondary" type="button" title="切换明暗主题" aria-label="切换明暗主题" aria-pressed="false">🌙</button>
+<div class="wrap">
+<header class="admin-head">
+  <div><h1>图库管理</h1><p class="note" style="margin:6px 0 0">改这里会影响所有访客。</p></div>
+  <a href="/gallery">返回浏览</a>
+</header>
 <section>
-  <h2>服务器管理认证</h2>
-  <label>WebUI 管理令牌<input id="token" type="password" autocomplete="current-password"></label>
-  <button id="load" type="button">加载服务器配置</button>
+  <h2>登录</h2>
+  <label>管理令牌<input id="token" type="password" autocomplete="current-password"></label>
+  <div class="actions"><button id="load" type="button">加载配置</button></div>
   <p class="note hidden" id="admin-status" aria-live="polite"></p>
 </section>
 <section id="protected" class="hidden">
-  <div class="tabs-nav">
-    <button class="tab-button active" data-tab="directories" type="button">目录配置</button>
-    <button class="tab-button" data-tab="display" type="button">显示与主题</button>
-    <button class="tab-button" data-tab="announcement" type="button">网站公告</button>
-    <button class="tab-button" data-tab="maintenance" type="button">维护模式</button>
-    <button class="tab-button" data-tab="tags" type="button">标签管理</button>
-    <button class="tab-button" data-tab="tools" type="button">索引与备份</button>
+  <div class="tabs-nav" role="tablist" aria-label="管理设置">
+    <button id="tab-button-directories" class="tab-button active" data-tab="directories" type="button" role="tab" aria-selected="true" aria-controls="tab-directories" tabindex="0">目录</button>
+    <button id="tab-button-display" class="tab-button" data-tab="display" type="button" role="tab" aria-selected="false" aria-controls="tab-display" tabindex="-1">显示</button>
+    <button id="tab-button-announcement" class="tab-button" data-tab="announcement" type="button" role="tab" aria-selected="false" aria-controls="tab-announcement" tabindex="-1">公告</button>
+    <button id="tab-button-tags" class="tab-button" data-tab="tags" type="button" role="tab" aria-selected="false" aria-controls="tab-tags" tabindex="-1">标签</button>
+    <button id="tab-button-tools" class="tab-button" data-tab="tools" type="button" role="tab" aria-selected="false" aria-controls="tab-tools" tabindex="-1">维护</button>
   </div>
-  <p class="note">以下选项影响所有设备。并发浏览不会互相修改配置；若多名管理员同时保存，以最后一次保存为准。</p>
+  <p class="note">多名管理员同时保存时，以最后一次为准。</p>
 
-  <div id="tab-directories" class="tab-panel active">
+  <div id="tab-directories" class="tab-panel active" role="tabpanel" aria-labelledby="tab-button-directories">
     <h2>浏览 OpenList 目录</h2>
-    <div class="row actions">
+    <div class="row">
       <label style="flex:2">当前路径<input id="path" value="/"></label>
-      <button id="browse" type="button" style="align-self:flex-end">加载目录树</button>
     </div>
-    <p class="note">目录树实时读取自 OpenList，总是最新状态，无需刷新缓存。勾选目录前的复选框即可加入已选列表；点击目录名可展开/折叠子目录。</p>
+    <div class="actions"><button id="browse" type="button">加载目录树</button></div>
+    <p class="note">目录树实时读取自 OpenList，总是最新状态，无需刷新缓存。勾选即可加入已选列表；点目录名展开子目录。</p>
     <div id="directories" class="tree"><p class="note">点击“加载目录树”开始浏览。</p></div>
     <h3>已选目录</h3>
     <div id="selected" class="selected"></div>
   </div>
 
-  <div id="tab-display" class="tab-panel">
-    <h2>显示设置</h2>
-    <label>新访客的图片文字默认值<select id="default-caption"><option value="path">完整路径</option><option value="name">仅图片名称</option><option value="hidden">不展示</option></select></label>
-    <h3>目录展示</h3>
-    <label class="check"><input id="directory-display-enabled" type="checkbox">允许访客在“完整路径”模式下看到目录</label>
-    <label>隐藏前 N 层目录（0 表示完整展示）<input id="directory-display-depth" type="number" min="0" max="64" step="1"></label>
-    <p class="note">示例：路径 1/2/3/4，层级 1 显示为 2/3/4；层级 0 显示完整路径。</p>
-    <h3>主题</h3>
-    <label>管理页与浏览页默认主题<select id="theme"><option value="dark">暗色</option><option value="light">浅色</option></select></label>
-    <p class="note">访客仍可在浏览页临时切换明暗；此选项仅决定默认主题。</p>
+  <div id="tab-display" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-display">
+    <h2>显示与主题</h2>
+    <label>新访客的图片文字<select id="default-caption"><option value="path">完整路径</option><option value="name">仅图片名称</option><option value="hidden">不展示</option></select></label>
+    <label class="check"><input id="directory-display-enabled" type="checkbox">完整路径模式下显示目录</label>
+    <label>隐藏前 N 层目录<input id="directory-display-depth" type="number" min="0" max="64" step="1"></label>
+    <p class="note">路径 1/2/3/4，隐藏 1 层后显示 2/3/4。</p>
+    <label>默认主题<select id="theme"><option value="dark">暗色</option><option value="light">浅色</option></select></label>
+    <p class="note">访客仍可用右下角按钮临时切换。</p>
   </div>
 
-  <div id="tab-announcement" class="tab-panel">
+  <div id="tab-announcement" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-announcement">
     <h2>网站公告</h2>
     <label class="check"><input id="announcement-enabled" type="checkbox">启用公告弹窗</label>
     <label>公告标题<input id="announcement-title" maxlength="120"></label>
     <label>公告内容（Markdown）<textarea id="announcement-content" maxlength="4000" placeholder="# 标题&#10;支持 **加粗**、*斜体*、`代码`、链接和代码块"></textarea></label>
-    <button id="announcement-preview-button" class="secondary" type="button">预览公告</button>
+    <div class="actions"><button id="announcement-preview-button" class="secondary" type="button">预览</button></div>
     <div id="announcement-preview" class="markdown-preview"></div>
-    <label>强制阅读秒数（0–3600）<input id="announcement-required-seconds" type="number" min="0" max="3600" step="1"></label>
-    <p class="note">启用后，访客必须等待指定秒数，才能关闭或设置当前公告版本不再显示。修改标题、内容、开关或秒数都会生成新公告版本。</p>
-  </div>
-
-  <div id="tab-maintenance" class="tab-panel">
-    <h2>维护模式</h2>
+    <label>强制阅读秒数<input id="announcement-required-seconds" type="number" min="0" max="3600" step="1"></label>
+    <p class="note">修改标题、内容、开关或秒数都会生成新公告版本。</p>
+    <h3>维护模式</h3>
     <label class="check"><input id="maintenance-enabled" type="checkbox">启用维护模式</label>
-    <p class="note">开启后主界面仅显示“维护中”；输入管理密钥并验证成功后，当前浏览会临时解锁图片查看和下载。</p>
+    <p class="note">开启后主界面只显示“维护中”，管理员可用令牌临时解锁。</p>
   </div>
 
-  <div id="tab-tags" class="tab-panel">
-    <h2>标签功能</h2>
-    <label class="check"><input id="tagging-enabled" type="checkbox">启用标签功能</label>
-    <label>投票范围<select id="tagging-scope"><option value="disabled">禁用</option><option value="anonymous">匿名（按 IP+UA）</option><option value="token">仅管理员令牌持有者</option></select></label>
-    <p class="note">匿名模式下，每个访客的投票记录基于 IP 和浏览器指纹去重；令牌模式下，只有持有管理令牌的用户可投票。</p>
-    <h3>标签分类</h3>
-    <p class="note">每行一个分类名称（最多 32 个），如：男生、女生、AI、风景、动漫。访客可点击为图片打上分类标签。</p>
-    <textarea id="tagging-categories" rows="5" placeholder="男生&#10;女生&#10;AI&#10;风景&#10;动漫" style="width:100%;font:inherit;padding:9px;border:1px solid #3a455b;border-radius:7px;background:#0d1119;color:#fff"></textarea>
-    <h3>筛选功能</h3>
-    <label class="check"><input id="filter-enabled" type="checkbox">允许访客使用标签筛选功能</label>
-    <h3>日志记录</h3>
-    <p class="note">设置运行时日志级别。日志输出到 systemd journal（journalctl -u openlist-image-api）。</p>
-    <label>日志级别<select id="log-level"><option value="DEBUG">DEBUG（详细调试）</option><option value="INFO">INFO（常规信息，默认）</option><option value="WARNING">WARNING（仅警告）</option><option value="ERROR">ERROR（仅错误）</option></select></label>
-    <div class="row actions">
-      <button id="log-view" class="secondary" type="button">查看最近日志</button>
-    </div>
-    <pre id="log-view-result" class="markdown-preview" style="max-height:300px;overflow:auto;font-size:12px;white-space:pre-wrap;word-break:break-all"></pre>
-    <h3>标签数据管理</h3>
-    <div class="row actions">
-      <button id="tagging-stats" class="secondary" type="button">查看标签统计</button>
-      <button id="tagging-reset-path" class="secondary" type="button">清除指定图片标签</button>
-      <button id="tagging-reset-all" class="secondary" type="button" style="border-color:#ff6b6b;color:#ff6b6b">清除全部标签数据</button>
+  <div id="tab-tags" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-tags">
+    <h2>标签</h2>
+    <label class="check"><input id="tagging-enabled" type="checkbox">启用标签</label>
+    <label>谁可以投票<select id="tagging-scope"><option value="disabled">禁用</option><option value="anonymous">匿名访客</option><option value="token">仅管理员</option></select></label>
+    <label>分类名称（每行一个）<textarea id="tagging-categories" rows="5" placeholder="男生&#10;女生&#10;AI&#10;风景&#10;动漫"></textarea></label>
+    <label class="check"><input id="filter-enabled" type="checkbox">允许访客按标签筛选</label>
+    <div class="actions">
+      <button id="tagging-stats" class="secondary" type="button">查看统计</button>
+      <button id="tagging-reset-path" class="secondary" type="button">清除指定图片</button>
+      <button id="tagging-reset-all" class="danger" type="button">清除全部标签</button>
     </div>
     <div id="tagging-stats-result" class="markdown-preview"></div>
-    <h3>🗑️ 垃圾桶管理</h3>
-    <p class="note">访客在图片上点击 🗑️ 按钮可将图片标记为垃圾图片。以下列出所有被标记的图片，可选择性删除或全部删除。<strong>删除操作会从 OpenList 永久删除原始图片文件，不可撤销！</strong></p>
-    <div class="row actions">
-      <button id="trash-load" class="secondary" type="button">刷新垃圾列表</button>
-      <button id="trash-delete-selected" class="secondary" type="button" style="border-color:#ff6b6b;color:#ff6b6b">删除选中图片</button>
-      <button id="trash-delete-all" class="secondary" type="button" style="border-color:#ff6b6b;color:#ff6b6b">删除全部垃圾图片</button>
+    <h3>垃圾桶</h3>
+    <p class="note">删除会从 OpenList 永久去掉原图，不可撤销。</p>
+    <div class="actions">
+      <button id="trash-load" class="secondary" type="button">刷新列表</button>
+      <button id="trash-delete-selected" class="danger" type="button">删除选中</button>
+      <button id="trash-delete-all" class="danger" type="button">删除全部</button>
     </div>
-    <div id="trash-list" class="trash-list"><p class="note">点击"刷新垃圾列表"加载。</p></div>
+    <div id="trash-list" class="trash-list"><p class="note">点击“刷新列表”加载。</p></div>
     <div id="trash-result" class="markdown-preview"></div>
   </div>
 
-  <div id="tab-tools" class="tab-panel">
-    <h2>索引与备份</h2>
-    <div class="row actions"><button id="save-server" type="button">保存服务器配置</button><button id="rebuild" type="button">后台重建图片索引</button><button id="backup" type="button">下载配置备份</button></div>
-    <div class="row actions"><label>上传备份配置（ZIP）<input id="backup-file" type="file" accept=".zip,application/zip"></label><button id="restore-backup" class="secondary" type="button">上传并恢复备份</button></div>
-    <p class="note">恢复仅覆盖可在本页面编辑的配置，不恢复管理密钥、OpenList 令牌、端口等系统设置。</p>
+  <div id="tab-tools" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-tools">
+    <h2>索引、备份与日志</h2>
+    <label>日志级别<select id="log-level"><option value="DEBUG">DEBUG</option><option value="INFO">INFO</option><option value="WARNING">WARNING</option><option value="ERROR">ERROR</option></select></label>
+    <div class="actions"><button id="log-view" class="secondary" type="button">查看最近日志</button></div>
+    <pre id="log-view-result" class="markdown-preview" style="max-height:300px;overflow:auto;font-size:12px;white-space:pre-wrap;word-break:break-all"></pre>
+    <div class="actions"><button id="rebuild" type="button">后台重建图片索引</button><button id="backup" class="secondary" type="button">下载配置备份</button></div>
+    <label>上传备份（ZIP）<input id="backup-file" type="file" accept=".zip,application/zip"></label>
+    <div class="actions"><button id="restore-backup" class="secondary" type="button">恢复备份</button></div>
+    <p class="note">恢复只覆盖本页可编辑项，不含管理密钥和 OpenList 令牌。</p>
   </div>
-  <div class="actions" style="margin-top:20px;border-top:1px solid #293040;padding-top:16px"><button id="save-server-bottom" type="button">保存服务器配置</button></div>
+  <div class="sticky-save actions"><button id="save-server" type="button">保存服务器配置</button></div>
 </section>
+</div>
 <script>
 let config=null;
 let rebuildTimer=null;
@@ -2592,24 +3272,32 @@ function buildTreeNode(name,path,isDir,hasChildren){
   const row=document.createElement('div');
   row.className='tree-row';
   if(isDir){
-    const toggle=document.createElement('span');
+    const toggle=document.createElement('button');
+    toggle.type='button';
     toggle.className='tree-toggle';
-    if(hasChildren===false){toggle.textContent='';toggle.classList.add('tree-leaf');}
+    toggle.setAttribute('aria-label','展开 '+name);
+    toggle.setAttribute('aria-expanded','false');
+    if(hasChildren===false){toggle.textContent='';toggle.classList.add('tree-leaf');toggle.disabled=true;}
     else{toggle.textContent='▶';}
     const check=document.createElement('input');
     check.type='checkbox';
     check.className='tree-check';
+    const checkId='directory-'+Math.random().toString(36).slice(2);
+    check.id=checkId;
     check.checked=config.directories.includes(path);
     check.onchange=()=>{if(check.checked)addDirectory(path);else removeDirectory(path);};
-    const label=document.createElement('span');
+    const label=document.createElement('label');
     label.className='tree-label';
+    label.htmlFor=checkId;
     label.textContent=name;
-    label.onclick=()=>{
+    toggle.onclick=()=>{
       if(hasChildren===false)return;
       node.classList.toggle('open');
-      toggle.textContent=node.classList.contains('open')?'▼':'▶';
-      if(node.classList.contains('open')&&!node.querySelector('.tree-children').children.length){
-        loadTreeChildren(path,node).catch(report);
+      const expanded=node.classList.contains('open');
+      toggle.textContent=expanded?'▼':'▶';
+      toggle.setAttribute('aria-expanded',String(expanded));
+      if(expanded&&!node.querySelector('.tree-children').children.length){
+        loadTreeChildren(path,node).catch(error=>{node.querySelector('.tree-children').innerHTML='<p class="note">加载失败，请折叠后重试。</p>';report(error);});
       }
     };
     row.append(toggle,check,label);
@@ -2665,30 +3353,31 @@ async function rebuild(){const statusResponse=await fetch('/api/status',{cache:'
 async function backup(){const response=await fetch('/api/admin/backup',{headers:auth()});if(!response.ok)throw new Error(await errorText(response,'备份下载失败'));const blob=await response.blob();const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download='openlist-image-api-backup.zip';link.click();setTimeout(()=>URL.revokeObjectURL(link.href),1000);setAdminStatus('配置备份已下载（不含 token）');}
 async function restoreBackup(){const file=document.querySelector('#backup-file').files[0];if(!file)throw new Error('请先选择 ZIP 备份文件');if(!window.confirm('确定恢复该备份中的可编辑配置吗？'))return;const response=await fetch('/api/admin/backup',{method:'POST',headers:{'X-OpenList-Admin-Token':document.querySelector('#token').value},body:file});if(!response.ok)throw new Error(await errorText(response,'备份恢复失败'));config=await response.json();showAdmin();setAdminStatus('备份配置已恢复，请按需保存或重建图片索引。');}
 function report(error){setAdminStatus('操作失败：'+error.message);}
-document.querySelectorAll('.tab-button').forEach(btn=>{btn.onclick=()=>{document.querySelectorAll('.tab-button').forEach(b=>b.classList.remove('active'));document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));btn.classList.add('active');document.getElementById('tab-'+btn.dataset.tab).classList.add('active');};});
-function applyTheme(theme){document.body.classList.toggle('theme-light',theme==='light');document.body.classList.toggle('theme-dark',theme!=='light');document.querySelector('#theme-toggle').textContent=theme==='light'?'☀':'🌙';try{localStorage.setItem('openlist-admin-theme',theme);}catch(e){}}
+function activateTab(btn){document.querySelectorAll('.tab-button').forEach(b=>{const active=b===btn;b.classList.toggle('active',active);b.setAttribute('aria-selected',String(active));b.tabIndex=active?0:-1;});document.querySelectorAll('.tab-panel').forEach(p=>p.classList.toggle('active',p.id==='tab-'+btn.dataset.tab));}
+document.querySelectorAll('.tab-button').forEach(btn=>{btn.onclick=()=>activateTab(btn);btn.onkeydown=event=>{if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;event.preventDefault();const tabs=[...document.querySelectorAll('.tab-button')];let index=tabs.indexOf(btn);if(event.key==='Home')index=0;else if(event.key==='End')index=tabs.length-1;else index=(index+(event.key==='ArrowRight'?1:-1)+tabs.length)%tabs.length;activateTab(tabs[index]);tabs[index].focus();};});
+function applyTheme(theme){document.body.classList.toggle('theme-light',theme==='light');document.body.classList.toggle('theme-dark',theme!=='light');const button=document.querySelector('#theme-toggle');button.textContent=theme==='light'?'☀':'🌙';button.setAttribute('aria-pressed',String(theme==='light'));try{localStorage.setItem('openlist-admin-theme',theme);}catch(e){}}
 function toggleTheme(){applyTheme(document.body.classList.contains('theme-light')?'dark':'light');}
 document.querySelector('#theme-toggle').onclick=toggleTheme;
 (function(){let saved='dark';try{saved=localStorage.getItem('openlist-admin-theme')||'dark';}catch(e){}applyTheme(saved);})();
-document.querySelector('#load').onclick=()=>load().catch(report);
+async function runButtonAction(button,action){if(button.disabled)return;button.disabled=true;button.setAttribute('aria-busy','true');try{await action();}catch(error){report(error);}finally{button.disabled=false;button.removeAttribute('aria-busy');}}
+document.querySelector('#load').onclick=event=>runButtonAction(event.currentTarget,load);
 document.querySelector('#announcement-preview-button').onclick=previewAnnouncement;
-document.querySelector('#browse').onclick=()=>browse().catch(report);
-document.querySelector('#save-server').onclick=()=>saveServer().catch(report);
-document.querySelector('#save-server-bottom').onclick=()=>saveServer().catch(report);
-document.querySelector('#rebuild').onclick=()=>rebuild().catch(report);
-document.querySelector('#backup').onclick=()=>backup().catch(report);
-document.querySelector('#restore-backup').onclick=()=>restoreBackup().catch(report);
-document.querySelector('#tagging-stats').onclick=()=>loadTagStats().catch(report);
-document.querySelector('#log-view').onclick=async()=>{try{setAdminStatus('正在加载日志…');const response=await fetch('/api/admin/logs?lines=100',{headers:auth(),cache:'no-store'});if(!response.ok)throw new Error(await errorText(response,'加载日志失败'));const data=await response.json();document.querySelector('#log-view-result').textContent=data.logs||'(无日志)';setAdminStatus('日志已加载');}catch(error){report(error);}};
-document.querySelector('#tagging-reset-path').onclick=()=>resetTagPath().catch(report);
-document.querySelector('#tagging-reset-all').onclick=()=>resetTagAll().catch(report);
-document.querySelector('#trash-load').onclick=()=>loadTrashList().catch(report);
-document.querySelector('#trash-delete-selected').onclick=()=>deleteTrashSelected().catch(report);
-document.querySelector('#trash-delete-all').onclick=()=>deleteTrashAll().catch(report);
+document.querySelector('#browse').onclick=event=>runButtonAction(event.currentTarget,browse);
+document.querySelector('#save-server').onclick=event=>runButtonAction(event.currentTarget,saveServer);
+document.querySelector('#rebuild').onclick=event=>runButtonAction(event.currentTarget,rebuild);
+document.querySelector('#backup').onclick=event=>runButtonAction(event.currentTarget,backup);
+document.querySelector('#restore-backup').onclick=event=>runButtonAction(event.currentTarget,restoreBackup);
+document.querySelector('#tagging-stats').onclick=event=>runButtonAction(event.currentTarget,loadTagStats);
+document.querySelector('#log-view').onclick=event=>runButtonAction(event.currentTarget,async()=>{setAdminStatus('正在加载日志…');const response=await fetch('/api/admin/logs?lines=100',{headers:auth(),cache:'no-store'});if(!response.ok)throw new Error(await errorText(response,'加载日志失败'));const data=await response.json();document.querySelector('#log-view-result').textContent=data.logs||'(无日志)';setAdminStatus('日志已加载');});
+document.querySelector('#tagging-reset-path').onclick=event=>runButtonAction(event.currentTarget,resetTagPath);
+document.querySelector('#tagging-reset-all').onclick=event=>runButtonAction(event.currentTarget,resetTagAll);
+document.querySelector('#trash-load').onclick=event=>runButtonAction(event.currentTarget,loadTrashList);
+document.querySelector('#trash-delete-selected').onclick=event=>runButtonAction(event.currentTarget,deleteTrashSelected);
+document.querySelector('#trash-delete-all').onclick=event=>runButtonAction(event.currentTarget,deleteTrashAll);
 async function loadTagStats(){const response=await fetch('/api/tagging/categories',{headers:auth(),cache:'no-store'});if(!response.ok)throw new Error(await errorText(response,'获取统计失败'));const data=await response.json();const result=document.querySelector('#tagging-stats-result');const cats=data.categories||{};const keys=Object.keys(cats);if(!keys.length){result.innerHTML='<p class="note">暂无标签数据。访客投票或打分类后，这里会显示统计。</p>';setAdminStatus('标签统计：暂无数据');return;}const items=keys.map(k=>'<li>'+escapeHtml(k)+'：'+cats[k]+' 张图片</li>').join('');result.innerHTML='<p>当前标签使用情况：</p><ul>'+items+'</ul>';setAdminStatus('标签统计已加载');}
 async function resetTagPath(){const path=prompt('请输入要清除标签的图片路径：');if(!path)return;const response=await fetch('/api/admin/tagging/reset?path='+encodeURIComponent(path),{method:'POST',headers:auth()});if(!response.ok)throw new Error(await errorText(response,'清除失败'));setAdminStatus('已清除 '+path+' 的标签数据');}
 async function resetTagAll(){if(!confirm('确定清除全部标签数据吗？此操作不可撤销！'))return;const response=await fetch('/api/admin/tagging/reset',{method:'POST',headers:auth()});if(!response.ok)throw new Error(await errorText(response,'清除失败'));setAdminStatus('全部标签数据已清除');}
-async function loadTrashList(){const response=await fetch('/api/admin/tagging/trash',{headers:auth(),cache:'no-store'});if(!response.ok)throw new Error(await errorText(response,'获取垃圾列表失败'));const data=await response.json();const list=document.querySelector('#trash-list');const paths=data.paths||[];if(!paths.length){list.innerHTML='<p class="note">暂无垃圾图片标记。</p>';setAdminStatus('垃圾列表：暂无数据');return;}list.replaceChildren();paths.forEach(p=>{const item=document.createElement('div');item.className='trash-item';const check=document.createElement('input');check.type='checkbox';check.value=p;const label=document.createElement('span');label.className='trash-path';label.textContent=p;item.append(check,label);list.append(item);});setAdminStatus('垃圾列表已加载，共 '+paths.length+' 张图片');}
+async function loadTrashList(){const response=await fetch('/api/admin/tagging/trash',{headers:auth(),cache:'no-store'});if(!response.ok)throw new Error(await errorText(response,'获取垃圾列表失败'));const data=await response.json();const list=document.querySelector('#trash-list');const paths=data.paths||[];if(!paths.length){list.innerHTML='<p class="note">暂无垃圾图片标记。</p>';setAdminStatus('垃圾列表：暂无数据');return;}list.replaceChildren();paths.forEach(p=>{const item=document.createElement('div');item.className='trash-item';const check=document.createElement('input');check.type='checkbox';check.value=p;const id='trash-'+Math.random().toString(36).slice(2);check.id=id;const label=document.createElement('label');label.htmlFor=id;label.className='trash-path';label.textContent=p;item.append(check,label);list.append(item);});setAdminStatus('垃圾列表已加载，共 '+paths.length+' 张图片');}
 async function deleteTrashSelected(){const checks=document.querySelectorAll('#trash-list .trash-item input[type=checkbox]:checked');if(!checks.length){setAdminStatus('请先勾选要删除的图片');return;}const paths=Array.from(checks).map(c=>c.value);if(!confirm('确定删除选中的 '+paths.length+' 张图片吗？此操作会从 OpenList 永久删除原始图片文件，不可撤销！'))return;const response=await fetch('/api/admin/tagging/trash/delete',{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({paths:paths})});if(!response.ok)throw new Error(await errorText(response,'删除失败'));const result=await response.json();const resultEl=document.querySelector('#trash-result');resultEl.innerHTML='<p>删除完成：成功 '+result.deleted+' 张，失败 '+result.failed+' 张。</p>'+(result.errors&&result.errors.length?'<ul>'+result.errors.map(e=>'<li>'+escapeHtml(e.path)+'：'+escapeHtml(e.error)+'</li>').join('')+'</ul>':'');setAdminStatus('删除完成：成功 '+result.deleted+'，失败 '+result.failed);return loadTrashList();}
 async function deleteTrashAll(){const response=await fetch('/api/admin/tagging/trash',{headers:auth(),cache:'no-store'});if(!response.ok)throw new Error(await errorText(response,'获取垃圾列表失败'));const data=await response.json();const paths=data.paths||[];if(!paths.length){setAdminStatus('暂无垃圾图片可删除');return;}if(!confirm('确定删除全部 '+paths.length+' 张垃圾图片吗？此操作会从 OpenList 永久删除原始图片文件，不可撤销！'))return;const delResponse=await fetch('/api/admin/tagging/trash/delete',{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({})});if(!delResponse.ok)throw new Error(await errorText(delResponse,'删除失败'));const result=await delResponse.json();const resultEl=document.querySelector('#trash-result');resultEl.innerHTML='<p>删除完成：成功 '+result.deleted+' 张，失败 '+result.failed+' 张。</p>'+(result.errors&&result.errors.length?'<ul>'+result.errors.map(e=>'<li>'+escapeHtml(e.path)+'：'+escapeHtml(e.error)+'</li>').join('')+'</ul>':'');setAdminStatus('删除完成：成功 '+result.deleted+'，失败 '+result.failed);return loadTrashList();}
 </script>
@@ -2827,9 +3516,15 @@ def make_handler(application: Application):
                         return
                     raw_path = params.get("path", [""])[0]
                     refresh = params.get("fresh", ["0"])[0].lower() in {"1", "true", "yes"}
+                    preview = params.get("preview", ["0"])[0].lower() in {"1", "true", "yes"}
                     image = application.indexed_image(raw_path)
-                    resolved = application.resolve_images([image], refresh=refresh)[0]
-                    return self._send_json(HTTPStatus.OK, {"url": resolved["url"], "thumbnail": resolved.get("thumbnail", "")})
+                    if preview:
+                        resolved = application.resolve_preview_urls([raw_path], refresh=refresh)[0]
+                    else:
+                        resolved = application.resolve_images([image], refresh=refresh)[0]
+                    if resolved.get("error"):
+                        return self._send_json(HTTPStatus.BAD_GATEWAY, {"error": resolved["error"]})
+                    return self._send_json(HTTPStatus.OK, {"url": resolved.get("url", ""), "thumbnail": resolved.get("thumbnail", "")})
                 if parsed.path == "/download":
                     if self._maintenance_access_required():
                         return
@@ -2973,7 +3668,17 @@ def make_handler(application: Application):
                     refresh = refresh.lower() in {"1", "true", "yes"}
                 else:
                     refresh = bool(refresh)
-                return self._send_json(HTTPStatus.OK, {"images": application.resolve_download_urls(paths, refresh=refresh)})
+                preview = payload.get("preview")
+                if isinstance(preview, str):
+                    preview = preview.lower() in {"1", "true", "yes"}
+                else:
+                    preview = bool(preview)
+                resolved = (
+                    application.resolve_preview_urls(paths, refresh=refresh)
+                    if preview
+                    else application.resolve_download_urls(paths, refresh=refresh)
+                )
+                return self._send_json(HTTPStatus.OK, {"images": resolved})
             except (ValueError, RuntimeError, json.JSONDecodeError) as error:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
             except Exception:

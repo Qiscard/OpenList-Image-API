@@ -302,11 +302,24 @@ def cleanup_legacy_residuals() -> None:
 def cleanup_residuals_and_runtime_cache() -> None:
     require_root()
     cleanup_legacy_residuals()
+    cache_path: Path | None = None
+    try:
+        cache_path = Path(read_config()["state_dir"]) / "url_cache.json"
+    except (OSError, KeyError, TypeError, ValueError):
+        pass
+    if cache_path is not None:
+        try:
+            cache_path.unlink()
+            print(f"已清理: {cache_path}")
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            print(f"无法清理 {cache_path}: {error}")
     if command_output(["systemctl", "is-active", SERVICE_NAME]) == "active":
         run(["systemctl", "restart", SERVICE_NAME])
-        print("已重启图片 API，运行时签名链接缓存已清理。")
+        print("已重启图片 API，内存和持久化签名链接缓存已清理。")
     else:
-        print("图片 API 当前未运行；其运行时缓存会在下次启动时为空。")
+        print("图片 API 当前未运行；持久化缓存已清理（如文件存在）。")
 
 
 def request_status(config: dict[str, Any]) -> dict[str, Any]:

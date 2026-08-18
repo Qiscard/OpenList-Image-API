@@ -91,18 +91,21 @@ systemd 启动命令：
 
 ### 3.2 索引模型
 
-`build_index()` 对配置的虚拟目录执行广度优先遍历：
+`build_index()` 对配置的虚拟目录执行有界并发的广度优先遍历：
 
-1. `OpenListClient.list_directory()` 分页读取目录，每页 1000 条；
-2. 子目录加入 `deque`，图片按扩展名过滤；
-3. 记录图片路径、大小、遍历目录数、错误和耗时；
-4. `IndexRepository.save()` 原子写入 `index.json`。
+1. `OpenListClient.list_directory()` 分页读取目录，每页 1000 条；单目录分页保持串行，索引列表请求使用 10 秒超时；
+2. 正常轮次最多使用 4 个目录扫描 worker，子目录加入 `deque`，图片按扩展名过滤；
+3. 首轮失败目录记录后，在扫描末尾以单 worker 串行重试一次；仍失败的目录写入最终 `errors`，不阻塞其他目录；
+4. `state_dir/index.checkpoint.json` 以原子方式记录队列、已访问目录、图片、失败目录和配置指纹；进程中断后仅在目录与扩展名指纹匹配时恢复，损坏或过期 checkpoint 自动忽略；
+5. 成功后 `IndexRepository.save()` 原子写入 `index.json`，再删除 checkpoint；重建期间旧 `index.json` 始终可读。
 
 目录选择器不使用持久目录索引。`Application.list_directories()` 每次直接请求 OpenList，根目录请求失败时才回退到当前已配置目录。
 
 ### 3.3 URL 解析模型
 
-随机图片接口先返回索引元数据；已缓存图片带 URL，未缓存图片带 `needs_url: true`。浏览器随后批量调用 `POST /api/download-url`，由共享 20 线程执行器解析签名 URL。
+随机图片接口先返回索引元数据和已有缓存；未缓存项带 `needs_url: true`。浏览器随后通过 `POST /api/download-url` 的 `preview:true` 一次解析当前批次的缩略图，预览响应的 `url` 为空；批量失败时退回最多 3 路并发的单图请求。灯箱和下载再按需解析原图签名 URL。
+
+服务端共享 20 个 URL 解析线程，批量接口最多接收 50 个有效去重路径，并在 8 秒后为未完成项返回 `url resolve timed out`。未索引路径和上游失败按路径返回独立错误。
 
 `UrlCache.resolve()` 维护：
 
@@ -164,8 +167,10 @@ TUI 从核心模块复用 `atomic_write_json()`、`load_config()` 和 `write_sec
 | 配置 | `/etc/openlist-image-api/config.json` | JSON，原子写，权限 `0600`。 |
 | OpenList token | `/etc/openlist-image-api/openlist.token` | 纯文本，权限 `0600`。 |
 | 管理令牌 | `/etc/openlist-image-api/admin.token` | `secrets.token_urlsafe(32)`，权限 `0600`。 |
-| 图片索引 | `/var/lib/openlist-image-api/index.json` | 图片路径、大小、统计、耗时和错误。 |
+| 图片索引 | `/var/lib/openlist-image-api/index.json` | 图片路径、大小、统计、耗时和错误；重建成功后原子替换。 |
+| 索引 checkpoint | `/var/lib/openlist-image-api/index.checkpoint.json` | 重建中的队列、已访问目录、图片和失败项；配置指纹不匹配或文件损坏时忽略。 |
 | 标签数据 | `/var/lib/openlist-image-api/tags.json` | schema version 1，原子写。 |
+| URL 缓存 | `/var/lib/openlist-image-api/url_cache.json` | `url_cache_size > 0` 时保存 TTL 内的 URL/缩略图；容量为 0 时不写入。 |
 | 重建日志 | `/var/lib/openlist-image-api/rebuild.log` | TUI 后台 `refresh` 输出。 |
 | 重建 PID | `/run/openlist-image-api/rebuild.pid` | 防止重复 TUI 后台任务。 |
 
@@ -228,11 +233,11 @@ TUI 从核心模块复用 `atomic_write_json()`、`load_config()` 和 `write_sec
 | GET | `/`、`/gallery` | 公共 | 返回浏览页 HTML；页面根据公共配置显示维护状态。 |
 | GET | `/admin` | 公共 HTML | 返回管理页；后续管理接口需令牌。 |
 | GET | `/health` | 公共 | `{"status":"ok"}`。 |
-| GET | `/api/status` | 公共 | 索引、缓存、刷新和公共配置。 |
+| GET | `/api/status` | 公共 | 索引、缓存、刷新和公共配置；包含最近构建耗时/错误及 `index_progress`。 |
 | GET | `/api/public-config` | 公共 | 浏览默认值、公告、维护、目录和标签配置。 |
-| GET | `/api/images/random` | 维护模式门控 | 过滤索引并返回随机图片元数据。 |
-| GET | `/api/download-url` | 维护模式门控 | 解析一张已索引图片。 |
-| POST | `/api/download-url` | 维护模式门控 | 解析最多 50 张已索引图片。 |
+| GET | `/api/images/random` | 维护模式门控 | 过滤索引并返回随机图片元数据及缓存结果。 |
+| GET | `/api/download-url` | 维护模式门控 | 解析一张已索引图片；`preview=1` 时只返回缩略图。 |
+| POST | `/api/download-url` | 维护模式门控 | 解析最多 50 张已索引图片；`preview:true` 时只返回缩略图。 |
 | GET | `/download` | 维护模式门控 | 服务端流式代理已索引原图附件。 |
 | GET | `/random` | 维护模式门控 | 302 到随机签名 URL。 |
 | GET | `/api/tagging/stats` | 公共 | 最多 50 个路径的标签统计。 |
@@ -270,8 +275,9 @@ GET /api/images/random
   → 路径/大小/标签过滤
   → random.sample 或 random.choice 回填
   → Application.resolve_images_lazy()
-  → 已缓存 URL 直接返回，未缓存项标记 needs_url
-  → 后台预热未解析项
+  → 返回缓存中的 URL/缩略图，未缓存项标记 needs_url
+  → 浏览器 POST /api/download-url {preview:true}
+  → 当前批次并发解析缩略图，失败时按单图补偿
 ```
 
 文档中不应出现 `min_likes`、`min_ratio` 或 `sort`，当前处理器不解析这些参数。
@@ -281,10 +287,10 @@ GET /api/images/random
 POST 请求体：
 
 ```json
-{"paths":["/gallery/a.jpg","/gallery/b.jpg"],"fresh":false}
+{"paths":["/gallery/a.jpg","/gallery/b.jpg"],"fresh":false,"preview":true}
 ```
 
-`Application.indexed_images()` 一次扫描索引并保留有效去重顺序。未索引路径返回 `image is not in the current index`；上游解析错误返回 `unable to resolve image URL`。接口不会解析索引外的任意 OpenList 路径。
+`preview:true` 只返回缩略图，响应中的 `url` 为空；省略时返回原图签名 URL。`Application.indexed_images()` 一次扫描索引并保留有效去重顺序，最多处理 50 个路径。未索引路径返回 `image is not in the current index`；上游解析错误返回 `unable to resolve image URL`；超过 8 秒仍未完成的项目返回 `url resolve timed out`。接口不会解析索引外的任意 OpenList 路径。
 
 ### 6.4 下载
 
@@ -315,8 +321,8 @@ POST 请求体：
 
 `gallery_html()` 包含：
 
-- **幻灯片**：首批 6 张、预加载 3 张、历史上限 60、自动播放、页面按钮、菜单按钮和触屏滑动；页面隐藏、灯箱、设置面板或公告打开时暂停。
-- **瀑布流**：宽屏 3 列、900 px 及以下 2 列；按估算高度放入最矮列，`IntersectionObserver` 负责接近视口时加载，滚动到 60% 后拉取下一批。
+- **幻灯片**：首批 6 张、预加载 2 张、历史上限 60、自动播放、页面按钮、菜单按钮和触屏滑动；页面隐藏、灯箱、设置面板或公告打开时暂停。
+- **瀑布流**：900 px 以上 3 列、561–900 px 2 列、560 px 以下 1 列；按估算高度放入最矮列，`IntersectionObserver` 负责接近视口时加载，滚动到 60% 后拉取下一批。
 - **灯箱**：0.5–4 倍缩放、90° 旋转、拖拽、捏合、双击复位和失效 URL 恢复。
 - **画质**：`sizedThumb()` 只改写已包含 `width`/`height` 参数的缩略图 URL，否则原样返回。
 - **公告**：受限 Markdown 转换、阅读倒计时和版本化关闭状态。
@@ -346,7 +352,7 @@ POST 请求体：
 ```text
 /opt/openlist-image-api/{install.sh,openlist_image_api.py,openlist_tui.py,VERSION}
 /etc/openlist-image-api/{config.json,admin.token,openlist.token}
-/var/lib/openlist-image-api/{index.json,tags.json,rebuild.log}
+/var/lib/openlist-image-api/{index.json,index.checkpoint.json,tags.json,url_cache.json,rebuild.log}
 /etc/systemd/system/openlist-image-api.service
 /usr/local/bin/openlist-image-api
 ```
@@ -372,7 +378,9 @@ sudo -u openlist-image /usr/bin/python3 \
   --config /etc/openlist-image-api/config.json refresh
 ```
 
-推荐使用 TUI 菜单 5 在后台重建。运行时 URL 缓存不持久化，重启服务即可清空。
+推荐使用 TUI 菜单 5 在后台重建。`/api/status` 的 `index_progress` 包含 `completed`、`queued`、`active`、`failed`、`directory_count`、`image_count`、`elapsed_seconds`、`retry_round` 和 `complete`，可据此区分正常扫描、失败重试和已完成状态；`last_build_duration_seconds` 与 `last_refresh_error` 分别记录最近一次成功耗时和错误。
+
+当 `url_cache_size > 0` 时，URL/缩略图缓存会持久化到 `url_cache.json` 并按 TTL 复用；TUI 菜单 7 的“清理残留与缓存”会删除该文件后重启服务。仅重启服务不会删除持久化缓存。
 
 ### 8.3 缓存默认值与迁移
 
