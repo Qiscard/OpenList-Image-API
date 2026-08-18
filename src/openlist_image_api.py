@@ -1614,11 +1614,11 @@ dialog::backdrop{background:#000c}
 .lightbox-caption,.lightbox-directory{margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .lightbox-directory{color:var(--muted);font-size:13px}
 .modal-backdrop{position:fixed;z-index:4;inset:0;background:#0008}
-#announcement-backdrop{position:fixed!important;z-index:1000!important;inset:0!important;background:#10131a!important;opacity:1!important;pointer-events:auto!important;animation:backdrop-in .25s ease both}
-.announcement{z-index:1001!important;pointer-events:auto!important}
-body.announcement-open{overflow:hidden}
-body.announcement-open>header,body.announcement-open>main,body.announcement-open>#maintenance{pointer-events:none!important;user-select:none}
-body.announcement-open>#announcement-backdrop,body.announcement-open>#announcement{display:block!important;visibility:visible!important}
+#announcement-backdrop,#help-backdrop{position:fixed!important;z-index:1000!important;inset:0!important;background:#10131a!important;opacity:1!important;pointer-events:auto!important;animation:backdrop-in .25s ease both}
+.announcement,.help-panel{z-index:1001!important;pointer-events:auto!important}
+body.announcement-open,body.help-open{overflow:hidden}
+body.announcement-open>header,body.announcement-open>main,body.announcement-open>#maintenance,body.help-open>header,body.help-open>main,body.help-open>#maintenance{pointer-events:none!important;user-select:none}
+body.announcement-open>#announcement-backdrop,body.announcement-open>#announcement,body.help-open>#help-backdrop,body.help-open>#help{display:block!important;visibility:visible!important}
 .preferences{
   position:fixed;z-index:5;top:50%;left:50%;width:min(92vw,460px);max-height:86vh;overflow:auto;
   padding:22px;border:1px solid var(--line);border-radius:18px;background:var(--bg-elev);color:var(--text);
@@ -1633,8 +1633,8 @@ body.announcement-open>#announcement-backdrop,body.announcement-open>#announceme
 .preferences .check{display:flex;align-items:center;gap:8px;margin:12px 0}
 .preferences .check input{width:auto;margin:0}
 .preferences-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px;flex-wrap:wrap}
-.announcement{position:fixed;z-index:5;top:50%;left:50%;width:min(94vw,680px);max-height:min(78vh,680px);height:auto;padding:0;border:0;border-radius:22px;background:linear-gradient(145deg,#fffdf8 0%,#fff 54%,#fff0e3 100%);color:#282828;box-shadow:0 1.5rem 3rem rgba(0,0,0,.38);overflow:hidden;transform:translate(-50%,-50%);animation:announcement-in .32s cubic-bezier(.2,.8,.2,1) both;display:flex;flex-direction:column}
-.announcement.is-closing{animation:announcement-out .22s ease-in both}
+.announcement,.help-panel{position:fixed;z-index:5;top:50%;left:50%;width:min(94vw,680px);max-height:min(78vh,680px);height:auto;padding:0;border:0;border-radius:22px;background:linear-gradient(145deg,#fffdf8 0%,#fff 54%,#fff0e3 100%);color:#282828;box-shadow:0 1.5rem 3rem rgba(0,0,0,.38);overflow:hidden;transform:translate(-50%,-50%);animation:announcement-in .32s cubic-bezier(.2,.8,.2,1) both;display:flex;flex-direction:column}
+.announcement.is-closing,.help-panel.is-closing{animation:announcement-out .22s ease-in both}
 @keyframes backdrop-in{from{opacity:0}to{opacity:1}}
 @keyframes announcement-in{from{opacity:0;transform:translate(-50%,-46%) scale(.96)}to{opacity:1;transform:translate(-50%,-50%) scale(1)}}
 @keyframes announcement-out{from{opacity:1;transform:translate(-50%,-50%) scale(1)}to{opacity:0;transform:translate(-50%,-46%) scale(.97)}}
@@ -1714,10 +1714,10 @@ body.theme-light .card img,body.theme-light .lightbox-stage,body.theme-light .sl
   .lightbox-meta{flex:1 1 100%}
   .slide-nav.prev{left:6px;width:36px;height:56px;font-size:26px}
   .slide-nav.next{right:6px;width:36px;height:56px;font-size:26px}
-  .announcement{width:92vw;max-height:68vh;border-radius:14px}
-  .announcement-main{padding:16px 18px 8px}
-  .announcement-title{font-size:18px}
-  .announcement-footer{padding:8px 18px 14px}
+  .announcement,.help-panel{width:92vw;max-height:68vh;border-radius:14px}
+  .announcement-main,.help-main{padding:16px 18px 8px}
+  .announcement-title,.help-title{font-size:18px}
+  .announcement-footer,.help-footer{padding:8px 18px 14px}
 }
 @media(max-width:400px){.preferences-grid{grid-template-columns:1fr}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
@@ -1732,7 +1732,8 @@ body.theme-light .card img,body.theme-light .lightbox-stage,body.theme-light .sl
     <button id="next" class="hidden ghost" type="button">下一张</button>
     <button id="refresh" class="ghost" type="button">刷新</button>
     <button id="settings" type="button">设置</button>
-    <button id="announcement-button" class="hidden ghost" type="button">公告</button>
+    <button id="announcement-button" class="hidden ghost" type="button">📣 公告</button>
+    <button id="help-button" class="ghost" type="button">❔ 帮助</button>
     <a href="/admin" class="button ghost">管理</a>
   </nav>
   <button id="header-menu-toggle" type="button" aria-label="菜单" aria-expanded="false">☰</button>
@@ -1744,7 +1745,8 @@ body.theme-light .card img,body.theme-light .lightbox-stage,body.theme-light .sl
   <button id="menu-next" class="hidden ghost" type="button">下一张</button>
   <button id="menu-refresh" class="ghost" type="button">刷新</button>
   <button id="menu-settings" type="button">设置</button>
-  <button id="menu-announcement" class="hidden ghost" type="button">公告</button>
+  <button id="menu-announcement" class="hidden ghost" type="button">📣 公告</button>
+  <button id="menu-help" class="ghost" type="button">❔ 帮助</button>
   <a href="/admin" class="button ghost">管理</a>
 </aside>
 <div id="tag-bar" class="tag-bar hidden"></div>
@@ -1767,6 +1769,7 @@ body.theme-light .card img,body.theme-light .lightbox-stage,body.theme-light .sl
     <h3>浏览</h3>
     <div class="preferences-grid">
       <label>视图<select id="layout-mode"><option value="slideshow">幻灯片</option><option value="waterfall">瀑布流</option></select></label>
+      <label class="waterfall-only">手机瀑布流列数<select id="mobile-waterfall-columns"><option value="1">单列</option><option value="2">双列</option></select></label>
       <label>图片名称<select id="caption-mode"><option value="path">完整路径</option><option value="name">仅名称</option><option value="hidden">不展示</option></select></label>
       <label class="slideshow-only">自动播放（秒）<input id="slideshow-interval" type="number" min="0" max="300" step="1"></label>
     </div>
@@ -1791,6 +1794,11 @@ body.theme-light .card img,body.theme-light .lightbox-stage,body.theme-light .sl
   <div class="announcement-main"><h2 id="announcement-title" class="announcement-title"></h2><div id="announcement-content" class="announcement-content"></div></div>
   <div class="announcement-footer"><p id="announcement-reading" class="meta"></p><div class="announcement-actions"><button id="announcement-close-once" type="button">本次关闭</button><button id="announcement-close-forever" type="button">不再显示</button></div></div>
 </section>
+<div id="help-backdrop" class="modal-backdrop hidden"></div>
+<section id="help" class="help-panel hidden" role="dialog" aria-modal="true" aria-labelledby="help-title" tabindex="-1">
+  <div class="help-main"><h2 id="help-title" class="help-title">❔ 使用帮助</h2><div id="help-content" class="announcement-content"></div></div>
+  <div class="help-footer"><div class="announcement-actions"><button id="help-close" type="button">知道了</button></div></div>
+</section>
 <button id="theme-fab" type="button" title="切换明暗主题" aria-label="切换明暗主题">🌙</button>
 <script>
 const PREFERENCE_KEY='openlist-image-preferences-v2';
@@ -1804,12 +1812,14 @@ const slideshowToggle=document.querySelector('#slideshow-toggle');
 const refreshButton=document.querySelector('#refresh');
 const settingsButton=document.querySelector('#settings');
 const announcementButton=document.querySelector('#announcement-button');
+const helpButton=document.querySelector('#help-button');
 const maintenance=document.querySelector('#maintenance');
 const maintenanceToken=document.querySelector('#maintenance-token');
 const maintenanceMessage=document.querySelector('#maintenance-message');
 const preferencesPanel=document.querySelector('#preferences');
 const preferencesBackdrop=document.querySelector('#preferences-backdrop');
 const layoutMode=document.querySelector('#layout-mode');
+const mobileWaterfallColumns=document.querySelector('#mobile-waterfall-columns');
 const slideshowInterval=document.querySelector('#slideshow-interval');
 const captionMode=document.querySelector('#caption-mode');
 const previewQuality=document.querySelector('#preview-quality');
@@ -1827,6 +1837,10 @@ const announcementContent=document.querySelector('#announcement-content');
 const announcementReading=document.querySelector('#announcement-reading');
 const announcementCloseOnce=document.querySelector('#announcement-close-once');
 const announcementCloseForever=document.querySelector('#announcement-close-forever');
+const helpPanel=document.querySelector('#help');
+const helpBackdrop=document.querySelector('#help-backdrop');
+const helpContent=document.querySelector('#help-content');
+const helpClose=document.querySelector('#help-close');
 const lightbox=document.querySelector('#lightbox');
 const lightboxStage=document.querySelector('#lightbox-stage');
 const lightboxImage=document.querySelector('#lightbox-image');
@@ -1843,6 +1857,7 @@ let maintenanceAccessToken='';
 let activeImage=null;
 let lightboxReturnFocus=null;
 let announcementTimer=null;
+let helpReturnFocus=null;
 let slideImages=[];
 let slideIndex=0;
 let slideLoadPromise=null;
@@ -1904,11 +1919,12 @@ function normalizedPreferences(value,defaults){
   const stored=value&&typeof value==='object'?value:{};
   const defaultLayout=defaults.view_layout==='waterfall'?'waterfall':'slideshow';
   const storedLayout=['single','grid'].includes(stored.view_layout)?'slideshow':stored.view_layout;
-  const result={view_layout:storedLayout,slideshow_interval:stored.slideshow_interval,grid_gap:stored.grid_gap,caption_mode:stored.caption_mode,show_tags_enabled:stored.show_tags_enabled,theme:stored.theme,filter_mode:stored.filter_mode,preview_quality:stored.preview_quality,lightbox_quality:stored.lightbox_quality};
+  const result={view_layout:storedLayout,slideshow_interval:stored.slideshow_interval,grid_gap:stored.grid_gap,mobile_waterfall_columns:stored.mobile_waterfall_columns,caption_mode:stored.caption_mode,show_tags_enabled:stored.show_tags_enabled,theme:stored.theme,filter_mode:stored.filter_mode,preview_quality:stored.preview_quality,lightbox_quality:stored.lightbox_quality};
   if(!['slideshow','waterfall'].includes(result.view_layout)) result.view_layout=defaultLayout;
   if(!['path','name','hidden'].includes(result.caption_mode)) result.caption_mode=defaults.caption_mode;
   result.slideshow_interval=Math.max(0,Math.min(300,Number(stored.slideshow_interval??8)||0));
   result.grid_gap=Math.max(0,Math.min(48,Number(stored.grid_gap??defaults.grid_gap)||0));
+  result.mobile_waterfall_columns=['1','2'].includes(String(result.mobile_waterfall_columns))?String(result.mobile_waterfall_columns):'1';
   result.show_tags_enabled=result.show_tags_enabled!==false;
   if(!['dark','light'].includes(result.theme)) result.theme=['dark','light'].includes(defaults.theme)?defaults.theme:'dark';
   if(!['union','intersect'].includes(result.filter_mode)) result.filter_mode='union';
@@ -2004,7 +2020,48 @@ function showAnnouncement(force=false){
   if(first) first.focus();
 }
 
-function persistPreferences(){try{localStorage.setItem(PREFERENCE_KEY,JSON.stringify({view_layout:settings.view_layout,slideshow_interval:settings.slideshow_interval,grid_gap:settings.grid_gap,caption_mode:settings.caption_mode,show_tags_enabled:settings.show_tags_enabled,theme:settings.theme,filter_mode:settings.filter_mode,preview_quality:settings.preview_quality,lightbox_quality:settings.lightbox_quality}));}catch(error){statusEl.textContent='设置无法保存到当前浏览器';}}
+const HELP_MARKDOWN=`## 📖 快速开始
+- **幻灯片**：按左右按钮、键盘方向键或手机左右滑动切换图片。
+- **瀑布流**：滚动浏览更多图片，接近页面底部时会自动加载下一批。
+- **刷新**：重新获取图片列表；筛选条件会继续保留。
+
+## 🖼️ 图片查看
+点击图片打开灯箱，可使用 **放大**、**缩小**、**复位** 和旋转按钮，也支持滚轮、双指缩放和拖拽。灯箱中的“下载”会获取当前图片原图或所选画质。
+
+## ⚙️ 显示设置
+“设置”只保存在当前浏览器：
+- 选择幻灯片或瀑布流，并调整自动播放间隔、图片名称显示方式和列表画质。
+- 手机瀑布流可选择 **单列** 或 **双列**；桌面端会按屏幕宽度使用两列或三列。
+- 标签功能启用后，可以选择任意匹配或全部匹配，并在图片上显示标签。
+- 页面右下角按钮可快速切换明暗主题。
+
+## 🏷️ 标签与筛选
+启用标签后，点击标签栏即可筛选图片；再次点击可取消，使用“清除筛选”恢复全部图片。图片上的点赞、分类和垃圾桶操作取决于管理员开启的权限。
+
+## 🔐 维护与管理
+维护模式下普通访客会看到维护提示。管理员可在提示框中输入管理密钥临时查看图片。管理页用于配置目录展示、公告、维护模式和标签策略；图片索引需要管理员主动重建。
+
+## ℹ️ 小提示
+图片加载速度会受到 OpenList 缩略图生成、网络和所选画质影响。列表预览建议从较低画质开始，需要查看细节时再打开灯箱。`;
+
+function closeHelp(){
+  helpPanel.classList.add('is-closing');
+  setTimeout(()=>{helpPanel.classList.add('hidden');helpPanel.classList.remove('is-closing');helpBackdrop.classList.add('hidden');document.body.classList.remove('help-open');if(helpReturnFocus&&helpReturnFocus.focus)helpReturnFocus.focus();helpReturnFocus=null;scheduleSlideshow();},220);
+}
+
+function showHelp(){
+  clearSlideTimer();
+  helpReturnFocus=document.activeElement;
+  helpContent.innerHTML='<p>'+renderMarkdown(HELP_MARKDOWN)+'</p>';
+  document.body.classList.add('help-open');
+  helpPanel.classList.remove('hidden');
+  helpPanel.classList.remove('is-closing');
+  helpBackdrop.classList.remove('hidden');
+  const first=focusableWithin(helpPanel)[0];
+  if(first) first.focus();
+}
+
+function persistPreferences(){try{localStorage.setItem(PREFERENCE_KEY,JSON.stringify({view_layout:settings.view_layout,slideshow_interval:settings.slideshow_interval,grid_gap:settings.grid_gap,mobile_waterfall_columns:settings.mobile_waterfall_columns,caption_mode:settings.caption_mode,show_tags_enabled:settings.show_tags_enabled,theme:settings.theme,filter_mode:settings.filter_mode,preview_quality:settings.preview_quality,lightbox_quality:settings.lightbox_quality}));}catch(error){statusEl.textContent='设置无法保存到当前浏览器';}}
 
 let preferencesReturnFocus=null;
 function focusableWithin(root){return [...root.querySelectorAll('button:not([disabled]),a[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])')].filter(element=>!element.closest('.hidden'));}
@@ -2027,6 +2084,8 @@ function openPreferences(){
   captionMode.value=settings.caption_mode;
   filterMode.value=settings.filter_mode;
   showTagsEnabled.checked=settings.show_tags_enabled;
+  mobileWaterfallColumns.value=settings.mobile_waterfall_columns;
+  syncWaterfallOption();
   preferencesPanel.classList.remove('hidden');
   preferencesBackdrop.classList.remove('hidden');
   preferencesPanel.focus();
@@ -2035,7 +2094,8 @@ function openPreferences(){
 function closePreferences(){preferencesPanel.classList.add('hidden');preferencesBackdrop.classList.add('hidden');if(preferencesReturnFocus&&preferencesReturnFocus.focus)preferencesReturnFocus.focus();preferencesReturnFocus=null;scheduleSlideshow();}
 
 function syncSlideshowOption(){document.querySelector('.slideshow-only').classList.toggle('hidden',layoutMode.value!=='slideshow');}
-layoutMode.addEventListener('change',syncSlideshowOption);
+function syncWaterfallOption(){document.querySelector('.waterfall-only').classList.toggle('hidden',layoutMode.value!=='waterfall');}
+layoutMode.addEventListener('change',()=>{syncSlideshowOption();syncWaterfallOption();});
 
 function applyGalleryTheme(theme){document.body.classList.toggle('theme-light',theme==='light');document.body.classList.toggle('theme-dark',theme!=='light');if(themeFab)themeFab.textContent=theme==='light'?'☀':'🌙';}
 
@@ -2531,7 +2591,7 @@ function renderTagBar(){
 
 function preferredWaterfallColumns(){
   const width=gallery.clientWidth||window.innerWidth;
-  if(width<=560) return 1;
+  if(width<=560) return Number(settings&&settings.mobile_waterfall_columns)||1;
   return width>900?3:2;
 }
 
@@ -2992,10 +3052,15 @@ document.querySelector('#menu-slideshow-toggle').onclick=()=>{closeHeaderMenu();
 document.querySelector('#menu-refresh').onclick=()=>{closeHeaderMenu();render().catch(showError);};
 document.querySelector('#menu-settings').onclick=()=>{closeHeaderMenu();openPreferences();};
 document.querySelector('#menu-announcement').onclick=()=>{closeHeaderMenu();showAnnouncement(true);};
+helpButton.onclick=showHelp;
+helpClose.onclick=closeHelp;
+helpBackdrop.onclick=closeHelp;
+document.querySelector('#menu-help').onclick=()=>{closeHeaderMenu();showHelp();};
 document.querySelector('#maintenance-unlock').onclick=async()=>{const token=maintenanceToken.value.trim();if(!token){maintenanceMessage.textContent='请输入管理密钥。';return;}maintenanceMessage.textContent='正在验证…';const response=await fetch('/api/admin/config',{headers:{'X-OpenList-Admin-Token':token},cache:'no-store'});if(!response.ok){maintenanceMessage.textContent='管理密钥无效。';return;}maintenanceAccessToken=token;maintenanceMessage.textContent='';render().catch(showError);};
 lightboxDownload.onclick=()=>downloadImage().catch(showError);
-document.querySelector('#preferences-save').onclick=()=>{settings.view_layout=layoutMode.value;settings.slideshow_interval=Math.max(0,Math.min(300,Number(slideshowInterval.value)||0));settings.caption_mode=captionMode.value;settings.show_tags_enabled=showTagsEnabled.checked;settings.filter_mode=filterMode.value;settings.preview_quality=previewQuality.value;settings.lightbox_quality=lightboxQuality.value;persistPreferences();location.reload();};
+document.querySelector('#preferences-save').onclick=()=>{settings.view_layout=layoutMode.value;settings.slideshow_interval=Math.max(0,Math.min(300,Number(slideshowInterval.value)||0));settings.mobile_waterfall_columns=['1','2'].includes(mobileWaterfallColumns.value)?mobileWaterfallColumns.value:'1';settings.caption_mode=captionMode.value;settings.show_tags_enabled=showTagsEnabled.checked;settings.filter_mode=filterMode.value;settings.preview_quality=previewQuality.value;settings.lightbox_quality=lightboxQuality.value;persistPreferences();location.reload();};
 document.querySelector('#preferences-reset').onclick=()=>{localStorage.removeItem(PREFERENCE_KEY);location.reload();};
+helpClose.setAttribute('aria-label','关闭帮助');
 themeFab.onclick=()=>{if(!settings)return;settings.theme=settings.theme==='light'?'dark':'light';applyGalleryTheme(settings.theme);persistPreferences();};
 document.querySelector('#preferences-close').onclick=closePreferences;
 preferencesBackdrop.onclick=closePreferences;
@@ -3044,8 +3109,10 @@ lightboxStage.addEventListener('pointerup',finishPointer);
 lightboxStage.addEventListener('pointercancel',finishPointer);
 window.addEventListener('keydown',event=>{
   if(event.key==='Escape'&&!preferencesPanel.classList.contains('hidden')){closePreferences();return;}
+  if(event.key==='Escape'&&!helpPanel.classList.contains('hidden')){closeHelp();return;}
   if(event.key==='Escape'&&headerMenu.classList.contains('open')){closeHeaderMenu(true);return;}
   if(!preferencesPanel.classList.contains('hidden')){trapFocus(preferencesPanel,event);return;}
+  if(!helpPanel.classList.contains('hidden')){trapFocus(helpPanel,event);return;}
   if(headerMenu.classList.contains('open')){if(event.key==='Escape')closeHeaderMenu(true);else trapFocus(headerMenu,event);return;}
   if(!lightbox.open) return;
   if(event.key==='Escape') lightbox.close();

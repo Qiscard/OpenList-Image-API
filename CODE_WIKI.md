@@ -216,7 +216,8 @@ TUI 从核心模块复用 `atomic_write_json()`、`load_config()` 和 `write_sec
 - `view_layout`、`slideshow_interval`、`grid_gap`；
 - `caption_mode`、`show_tags_enabled`；
 - `theme`、`filter_mode`；
-- `preview_quality`、`lightbox_quality`。
+- `preview_quality`、`lightbox_quality`；
+- `mobile_waterfall_columns`（`1` 或 `2`，仅在 ≤560 px 时生效）。
 
 管理页主题使用独立键 `openlist-admin-theme`，默认暗色。公告关闭状态按 `openlist-image-announcement-v2-<version>` 保存：“本次关闭”保存到当天，“不再显示”永久隐藏该版本。
 
@@ -322,10 +323,10 @@ POST 请求体：
 `gallery_html()` 包含：
 
 - **幻灯片**：首批 6 张、预加载 2 张、历史上限 60、自动播放、页面按钮、菜单按钮和触屏滑动；页面隐藏、灯箱、设置面板或公告打开时暂停。
-- **瀑布流**：900 px 以上 3 列、561–900 px 2 列、560 px 以下 1 列；按估算高度放入最矮列，`IntersectionObserver` 负责接近视口时加载，滚动到 60% 后拉取下一批。
+- **瀑布流**：900 px 以上 3 列、561–900 px 2 列、560 px 以下按浏览器偏好使用 1 或 2 列；按估算高度放入最矮列，`IntersectionObserver` 负责接近视口时加载，滚动到 60% 后拉取下一批。
 - **灯箱**：0.5–4 倍缩放、90° 旋转、拖拽、捏合、双击复位和失效 URL 恢复。
 - **画质**：`sizedThumb()` 只改写已包含 `width`/`height` 参数的缩略图 URL，否则原样返回。
-- **公告**：受限 Markdown 转换、阅读倒计时和版本化关闭状态。
+- **公告与帮助**：公告使用受限 Markdown 转换、阅读倒计时和版本化关闭状态；帮助使用同一安全 Markdown 渲染器，仅由用户点击打开并带焦点陷阱。
 - **维护**：验证管理令牌后将其暂存在页面内存，并附加到受门控请求。
 
 旧本地偏好中的 `single`/`grid` 会迁移为 `slideshow`。当前实际渲染类只有 `gallery slideshow` 和 `gallery waterfall`。
