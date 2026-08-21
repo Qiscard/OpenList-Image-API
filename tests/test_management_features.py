@@ -56,6 +56,11 @@ class AdminConfigurationTests(unittest.TestCase):
                     "announcement_content",
                     "announcement_required_seconds",
                     "announcement_version",
+                    "contact_enabled",
+                    "contact_label",
+                    "contact_qq_number",
+                    "contact_qq_url",
+                    "contact_qr_url",
                     "maintenance_enabled",
                     "tagging_enabled",
                     "tagging_scope",
@@ -76,6 +81,7 @@ class AdminConfigurationTests(unittest.TestCase):
                     "directory_display_depth",
                     "theme",
                     "announcement",
+                    "contact",
                     "maintenance_enabled",
                     "filter_enabled",
                     "tagging",
@@ -152,6 +158,14 @@ class WebUiMarkupTests(unittest.TestCase):
         self.assertIn("className='image-error'", page)
         self.assertIn("openlist-image-preferences-v2", page)
         self.assertIn("openlist-image-announcement-v2-", page)
+        self.assertIn("id=\"contact-button\"", page)
+        self.assertIn("id=\"contact-popover\"", page)
+        self.assertIn("tencent://message/?uin=", page)
+        self.assertIn("mqqwpa://im/chat?chat_type=wpa&uin=", page)
+        self.assertIn("function openContact()", page)
+        self.assertIn("!\\[([^\\]]*)\\]\\((https?:\\/\\/[^\\s)]+)\\)", page)
+        self.assertIn('<img src="$2" alt="$1" loading="lazy" referrerpolicy="no-referrer">', page)
+        self.assertIn(".announcement-content img{display:block;max-width:100%", page)
         self.assertIn("themeFab.textContent=theme==='light'?'☀':'🌙'", page)
         self.assertIn("navPause.textContent=slideshowPaused?'播放':'暂停'", page)
         self.assertIn("like.innerHTML='❤ <span class=\"tag-vote-count\">'", page)
@@ -192,7 +206,16 @@ class WebUiMarkupTests(unittest.TestCase):
         self.assertIn("#announcement-enabled", page)
         self.assertIn("#announcement-title", page)
         self.assertIn("#announcement-content", page)
+        self.assertIn("!\\[([^\\]]*)\\]\\((https?:\\/\\/[^\\s)]+)\\)", page)
+        self.assertIn('<img src="$2" alt="$1" loading="lazy" referrerpolicy="no-referrer">', page)
+        self.assertIn(".markdown-preview img{display:block;max-width:100%", page)
+        self.assertIn("图片请使用公网 http/https 地址", page)
         self.assertIn("#announcement-required-seconds", page)
+        self.assertIn("#contact-enabled", page)
+        self.assertIn("#contact-qq-number", page)
+        self.assertIn("#contact-qq-url", page)
+        self.assertIn("#contact-qr-url", page)
+        self.assertIn("contact_qr_url", page)
         self.assertIn("#maintenance-enabled", page)
         self.assertGreater(page.find('id="maintenance-enabled"'), page.find('id="tab-tools"'))
         self.assertIn("id=\"rebuild-status\"", page)

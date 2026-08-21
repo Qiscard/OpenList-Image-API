@@ -192,6 +192,7 @@ TUI 从核心模块复用 `atomic_write_json()`、`load_config()` 和 `write_sec
 | `url_cache_size` | `0` | 0–5000；安装器生成配置为 1000。 |
 | `url_cache_ttl_seconds` | `1800` | 0–3600 秒。 |
 | `announcement_*` | 关闭/空内容/0 秒 | 标题 ≤120，内容 ≤4000，强制阅读 0–3600 秒。 |
+| `contact_*` | 关闭/空 | 联系按钮、QQ 号（5–12 位）、电脑端 `http(s)` 加好友链接和二维码图片地址。 |
 | `maintenance_enabled` | `false` | 维护模式总开关。 |
 | `tagging_enabled` | `false` | 标签总开关。 |
 | `tagging_scope` | `anonymous` | `disabled`/`anonymous`/`token`。 |
@@ -324,7 +325,8 @@ POST 请求体：
 - **瀑布流**：900 px 以上 3 列、561–900 px 2 列、560 px 以下按浏览器偏好使用 1 或 2 列；按估算高度放入最矮列，`IntersectionObserver` 负责接近视口时加载，滚动到 60% 后拉取下一批。
 - **灯箱**：0.5–4 倍缩放、90° 旋转、拖拽、捏合、双击复位和失效 URL 恢复。
 - **画质**：`sizedThumb()` 只改写已包含 `width`/`height` 参数的缩略图 URL，否则原样返回。
-- **公告**：使用受限 Markdown 转换、阅读倒计时和版本化关闭状态。
+- **公告**：使用受限 Markdown 转换、阅读倒计时和版本化关闭状态。`![说明](https://...)` 会渲染为图片，只接受 `http://` 或 `https://` 地址。
+- **联系**：顶栏/菜单/公告底部共用一个 QQ 联系按钮。电脑悬停显示二维码、点击走 `tencent://`；手机长按显示二维码、点击走 `mqqwpa://`。二维码来自管理页配置的公网图片地址。
 - **维护**：验证管理令牌后将其暂存在页面内存，并附加到受门控请求。
 
 旧本地偏好中的 `single`/`grid` 会迁移为 `slideshow`。当前实际渲染类只有 `gallery slideshow` 和 `gallery waterfall`。
@@ -341,7 +343,7 @@ POST 请求体：
 
 目录树通过 `GET /api/admin/directories?path=...` 延迟展开。保存使用 `PUT /api/admin/config`；索引重建使用 `POST /api/admin/rebuild` 并轮询 `/api/status` 显示无数据、日期数据、重建中或重建完毕；配置 ZIP 可下载和上传恢复。内置垃圾桶标签名为 `垃圾桶`，读取旧数据时会把 `🗑️ 垃圾桶` 归一到该名称。管理页垃圾桶列表通过 `POST /api/download-url` 的 `preview:true` 加载缩略图。暗色主题会在页面上叠加半透明黑色遮罩以降低整体亮度。
 
-明暗主题悬浮按钮位于右下角，只保存在当前浏览器。
+明暗主题悬浮按钮位于右下角，只保存在当前浏览器。公告预览与浏览页使用同一套受限 Markdown，支持 `![说明](https://...)` 公网图片。
 
 ## 8. 安装与运维
 

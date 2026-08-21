@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import random
+import re
 import secrets
 import socket
 import threading
@@ -45,6 +46,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "announcement_content": "",
     "announcement_required_seconds": 0,
     "announcement_version": 0,
+    "contact_enabled": False,
+    "contact_label": "联系",
+    "contact_qq_number": "",
+    "contact_qq_url": "",
+    "contact_qr_url": "",
     "maintenance_enabled": False,
     "theme": "dark",
     "grid_gap": 12,
@@ -142,6 +148,38 @@ def validate_config(candidate: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("announcement_required_seconds must be between 0 and 3600")
     if not isinstance(config["announcement_version"], int) or config["announcement_version"] < 0:
         raise ValueError("announcement_version must be a non-negative integer")
+    if not isinstance(config["contact_enabled"], bool):
+        raise ValueError("contact_enabled must be a boolean")
+    if not isinstance(config["contact_label"], str):
+        raise ValueError("contact_label must be a string")
+    config["contact_label"] = config["contact_label"].strip() or "联系"
+    if len(config["contact_label"]) > 20:
+        raise ValueError("contact_label is too long")
+    if not isinstance(config["contact_qq_number"], str):
+        raise ValueError("contact_qq_number must be a string")
+    config["contact_qq_number"] = config["contact_qq_number"].strip()
+    if config["contact_qq_number"] and not re.fullmatch(r"\d{5,12}", config["contact_qq_number"]):
+        raise ValueError("contact_qq_number must be 5-12 digits")
+    if not isinstance(config["contact_qq_url"], str):
+        raise ValueError("contact_qq_url must be a string")
+    config["contact_qq_url"] = config["contact_qq_url"].strip()
+    if config["contact_qq_url"]:
+        parsed_contact = urlparse(config["contact_qq_url"])
+        if parsed_contact.scheme not in {"http", "https"} or not parsed_contact.netloc:
+            raise ValueError("contact_qq_url must be an http or https URL")
+        if len(config["contact_qq_url"]) > 300:
+            raise ValueError("contact_qq_url is too long")
+    if not isinstance(config["contact_qr_url"], str):
+        raise ValueError("contact_qr_url must be a string")
+    config["contact_qr_url"] = config["contact_qr_url"].strip()
+    if config["contact_qr_url"]:
+        parsed_qr = urlparse(config["contact_qr_url"])
+        if parsed_qr.scheme not in {"http", "https"} or not parsed_qr.netloc:
+            raise ValueError("contact_qr_url must be an http or https URL")
+        if len(config["contact_qr_url"]) > 300:
+            raise ValueError("contact_qr_url is too long")
+    if config["contact_enabled"] and not config["contact_qq_number"] and not config["contact_qq_url"]:
+        raise ValueError("contact requires a QQ number or a desktop URL")
     if not isinstance(config["maintenance_enabled"], bool):
         raise ValueError("maintenance_enabled must be a boolean")
     if config["theme"] not in {"light", "dark"}:
@@ -1061,6 +1099,13 @@ class Application:
             "required_seconds": self.config["announcement_required_seconds"] if self.config["announcement_enabled"] else 0,
             "version": self.config["announcement_version"],
         }
+        config["contact"] = {
+            "enabled": self.config["contact_enabled"] and bool(self.config["contact_qq_number"] or self.config["contact_qq_url"]),
+            "label": self.config["contact_label"],
+            "qq_number": self.config["contact_qq_number"] if self.config["contact_enabled"] else "",
+            "qq_url": self.config["contact_qq_url"] if self.config["contact_enabled"] else "",
+            "qr_url": self.config["contact_qr_url"] if self.config["contact_enabled"] else "",
+        }
         config["maintenance_enabled"] = self.config["maintenance_enabled"]
         config["filter_enabled"] = self.config["filter_enabled"]
         config["tagging"] = {
@@ -1088,6 +1133,11 @@ class Application:
             "announcement_content": self.config["announcement_content"],
             "announcement_required_seconds": self.config["announcement_required_seconds"],
             "announcement_version": self.config["announcement_version"],
+            "contact_enabled": self.config["contact_enabled"],
+            "contact_label": self.config["contact_label"],
+            "contact_qq_number": self.config["contact_qq_number"],
+            "contact_qq_url": self.config["contact_qq_url"],
+            "contact_qr_url": self.config["contact_qr_url"],
             "maintenance_enabled": self.config["maintenance_enabled"],
             "tagging_enabled": self.config["tagging_enabled"],
             "tagging_scope": self.config["tagging_scope"],
@@ -1109,6 +1159,11 @@ class Application:
             "announcement_title",
             "announcement_content",
             "announcement_required_seconds",
+            "contact_enabled",
+            "contact_label",
+            "contact_qq_number",
+            "contact_qq_url",
+            "contact_qr_url",
             "maintenance_enabled",
             "tagging_enabled",
             "tagging_scope",
@@ -1148,6 +1203,11 @@ class Application:
                 "announcement_content": self.config["announcement_content"],
                 "announcement_required_seconds": self.config["announcement_required_seconds"],
                 "announcement_version": self.config["announcement_version"],
+                "contact_enabled": self.config["contact_enabled"],
+                "contact_label": self.config["contact_label"],
+                "contact_qq_number": self.config["contact_qq_number"],
+                "contact_qq_url": self.config["contact_qq_url"],
+                "contact_qr_url": self.config["contact_qr_url"],
                 "maintenance_enabled": self.config["maintenance_enabled"],
                 "tagging_enabled": self.config["tagging_enabled"],
                 "tagging_scope": self.config["tagging_scope"],
@@ -1189,6 +1249,11 @@ class Application:
             "announcement_title",
             "announcement_content",
             "announcement_required_seconds",
+            "contact_enabled",
+            "contact_label",
+            "contact_qq_number",
+            "contact_qq_url",
+            "contact_qr_url",
             "maintenance_enabled",
             "tagging_enabled",
             "tagging_scope",
@@ -1676,6 +1741,7 @@ body.announcement-open>#announcement-backdrop,body.announcement-open>#announceme
 .announcement-content pre{overflow:auto;padding:12px;border-radius:8px;background:#f3f5f7}
 .announcement-content pre code{padding:0}
 .announcement-content a{color:#b63813}
+.announcement-content img{display:block;max-width:100%;height:auto;margin:12px auto;border-radius:10px}
 .announcement-actions{display:flex;justify-content:center;gap:10px;flex-wrap:wrap}
 .announcement-footer{padding:12px 30px 28px;text-align:center;background:linear-gradient(170deg,#fff 0%,#fff 38%,#fbeecd 100%);flex:0 0 auto}
 .announcement-footer button{border-radius:50px;background:linear-gradient(to right,#ff711f,#e50914);box-shadow:0 10px 12px -4px rgba(229,9,20,.25)}
@@ -1719,6 +1785,11 @@ body.has-slide-history .slide-nav.pause{bottom:calc(124px + env(safe-area-inset-
 body.theme-light{color-scheme:light;--bg:#f3f5f8;--bg-elev:#fff;--bg-soft:#eef1f6;--line:#d5dbe6;--text:#1a2230;--muted:#667085;--accent:#2d6cf0;--accent-hover:#1f5ee0;--shadow:0 14px 32px rgba(30,40,60,.12)}
 body.theme-light .card img,body.theme-light .lightbox-stage,body.theme-light .slide-thumbnail{background:#e8edf5}
 body:not(.theme-light)::after{content:'';position:fixed;inset:0;z-index:10000;pointer-events:none;background:rgba(0,0,0,.32)}
+.contact-wrap{position:relative;display:inline-flex}
+#contact-popover{position:absolute;z-index:12;top:calc(100% + 8px);right:0;width:196px;padding:10px;border:1px solid var(--line);border-radius:14px;background:var(--bg-elev);box-shadow:var(--shadow);text-align:center}
+#contact-popover img{display:block;width:176px;height:176px;object-fit:contain;border-radius:10px;background:#fff}
+#contact-popover .meta{margin:8px 0 0}
+.header-menu #contact-popover{right:auto;left:12px;top:auto;bottom:calc(100% + 8px)}
 @media(max-width:760px){
   header{padding:8px 12px}
   .header-actions{display:none}
@@ -1766,6 +1837,13 @@ body:not(.theme-light)::after{content:'';position:fixed;inset:0;z-index:10000;po
     <button id="refresh" class="ghost" type="button">刷新</button>
     <button id="settings" type="button">设置</button>
     <button id="announcement-button" class="hidden ghost" type="button">公告</button>
+    <span class="contact-wrap hidden" id="contact-wrap">
+      <button id="contact-button" class="ghost" type="button">联系</button>
+      <div id="contact-popover" class="hidden" role="tooltip">
+        <img id="contact-qr" alt="QQ 二维码">
+        <p class="meta">扫码添加 QQ</p>
+      </div>
+    </span>
     <a href="/admin" class="button ghost">管理</a>
   </nav>
   <button id="header-menu-toggle" type="button" aria-label="菜单" aria-expanded="false">菜单</button>
@@ -1778,6 +1856,7 @@ body:not(.theme-light)::after{content:'';position:fixed;inset:0;z-index:10000;po
   <button id="menu-refresh" class="ghost" type="button">刷新</button>
   <button id="menu-settings" type="button">设置</button>
   <button id="menu-announcement" class="hidden ghost" type="button">公告</button>
+  <button id="menu-contact" class="hidden ghost" type="button">联系</button>
   <a href="/admin" class="button ghost">管理</a>
 </aside>
 <div id="tag-bar" class="tag-bar hidden"></div>
@@ -1823,7 +1902,7 @@ body:not(.theme-light)::after{content:'';position:fixed;inset:0;z-index:10000;po
 <div id="announcement-backdrop" class="modal-backdrop announcement-backdrop hidden"></div>
 <section id="announcement" class="announcement hidden" role="dialog" aria-modal="true" aria-labelledby="announcement-title">
   <div class="announcement-main"><h2 id="announcement-title" class="announcement-title"></h2><div id="announcement-content" class="announcement-content"></div></div>
-  <div class="announcement-footer"><p id="announcement-reading" class="meta"></p><div class="announcement-actions"><button id="announcement-close-once" type="button">本次关闭</button><button id="announcement-close-forever" type="button">不再显示</button></div></div>
+  <div class="announcement-footer"><p id="announcement-reading" class="meta"></p><div class="announcement-actions"><button id="announcement-contact" class="hidden ghost" type="button">联系</button><button id="announcement-close-once" type="button">本次关闭</button><button id="announcement-close-forever" type="button">不再显示</button></div></div>
 </section>
 <button id="theme-fab" type="button" title="切换明暗主题" aria-label="切换明暗主题">🌙</button>
 <script>
@@ -1838,6 +1917,12 @@ const slideshowToggle=document.querySelector('#slideshow-toggle');
 const refreshButton=document.querySelector('#refresh');
 const settingsButton=document.querySelector('#settings');
 const announcementButton=document.querySelector('#announcement-button');
+const contactWrap=document.querySelector('#contact-wrap');
+const contactButton=document.querySelector('#contact-button');
+const contactPopover=document.querySelector('#contact-popover');
+const contactQr=document.querySelector('#contact-qr');
+const menuContact=document.querySelector('#menu-contact');
+const announcementContact=document.querySelector('#announcement-contact');
 const maintenance=document.querySelector('#maintenance');
 const maintenanceToken=document.querySelector('#maintenance-token');
 const maintenanceMessage=document.querySelector('#maintenance-message');
@@ -1961,6 +2046,7 @@ async function loadSettings(){
   try{stored=JSON.parse(localStorage.getItem(PREFERENCE_KEY)||'{}');}catch(error){localStorage.removeItem(PREFERENCE_KEY);}
   const preferences=normalizedPreferences(stored,defaults);
   preferences.announcement=defaults.announcement;
+  preferences.contact=defaults.contact||{enabled:false,label:'联系',qq_number:'',qq_url:'',qr_url:''};
   preferences.maintenance_enabled=defaults.maintenance_enabled;
   preferences.directory_display_enabled=defaults.directory_display_enabled;
   preferences.directory_display_depth=defaults.directory_display_depth;
@@ -1988,7 +2074,7 @@ function captionFor(image){
 function escapeHtml(value){return value.replace(/[&<>"']/g,character=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));}
 
 function renderMarkdown(value){
-  return escapeHtml(value).replace(/&lt;font\s+color=(?:&quot;|&#39;)?(#[0-9a-f]{3,8}|[a-z]+)(?:&quot;|&#39;)?\s*&gt;/gi,'<span style="color:$1">').replace(/&lt;\/font&gt;/gi,'</span>').replace(/```([\s\S]*?)```/g,'<pre><code>$1</code></pre>').replace(/^#### (.*)$/gm,'<h4>$1</h4>').replace(/^### (.*)$/gm,'<h3>$1</h3>').replace(/^## (.*)$/gm,'<h2>$1</h2>').replace(/^# (.*)$/gm,'<h1>$1</h1>').replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>').replace(/\*([^*]+)\*/g,'<em>$1</em>').replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>').replace(/\n\n/g,'</p><p>').replace(/\n/g,'<br>');
+  return escapeHtml(value).replace(/&lt;font\s+color=(?:&quot;|&#39;)?(#[0-9a-f]{3,8}|[a-z]+)(?:&quot;|&#39;)?\s*&gt;/gi,'<span style="color:$1">').replace(/&lt;\/font&gt;/gi,'</span>').replace(/```([\s\S]*?)```/g,'<pre><code>$1</code></pre>').replace(/^#### (.*)$/gm,'<h4>$1</h4>').replace(/^### (.*)$/gm,'<h3>$1</h3>').replace(/^## (.*)$/gm,'<h2>$1</h2>').replace(/^# (.*)$/gm,'<h1>$1</h1>').replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>').replace(/\*([^*]+)\*/g,'<em>$1</em>').replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g,'<img src="$2" alt="$1" loading="lazy" referrerpolicy="no-referrer">').replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>').replace(/\n\n/g,'</p><p>').replace(/\n/g,'<br>');
 }
 
 function todayKey(){const now=new Date();return now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(now.getDate()).padStart(2,'0');}
@@ -2022,6 +2108,41 @@ function setAnnouncementCountdown(seconds,key){
 }
 
 let announcementReturnFocus=null;
+function isMobileContact(){return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);}
+function contactConfig(){return settings&&settings.contact&&settings.contact.enabled?settings.contact:null;}
+function contactHref(){
+  const contact=contactConfig();
+  if(!contact) return '';
+  if(isMobileContact()){
+    if(contact.qq_number) return 'mqqwpa://im/chat?chat_type=wpa&uin='+encodeURIComponent(contact.qq_number)+'&version=1&src_type=web&web_src=oicqzone.com';
+    return contact.qq_url||'';
+  }
+  if(contact.qq_url) return contact.qq_url;
+  if(contact.qq_number) return 'tencent://message/?uin='+encodeURIComponent(contact.qq_number)+'&Site=OpenList&Menu=yes';
+  return '';
+}
+function syncContactControls(){
+  const contact=contactConfig();
+  const enabled=!!contact;
+  const label=(contact&&contact.label)||'联系';
+  if(contactWrap) contactWrap.classList.toggle('hidden',!enabled);
+  if(contactButton) contactButton.textContent=label;
+  if(menuContact){menuContact.classList.toggle('hidden',!enabled);menuContact.textContent=label;}
+  if(announcementContact){announcementContact.classList.toggle('hidden',!enabled);announcementContact.textContent=label;}
+  if(contactQr){
+    if(contact&&contact.qr_url){contactQr.src=contact.qr_url;contactQr.alt=label+' 二维码';}
+    else {contactQr.removeAttribute('src');contactQr.alt='';}
+  }
+}
+function hideContactPopover(){if(contactPopover) contactPopover.classList.add('hidden');}
+function showContactPopover(){if(!contactConfig()||!contactConfig().qr_url||!contactPopover) return;contactPopover.classList.remove('hidden');}
+function openContact(){
+  const href=contactHref();
+  if(!href) return;
+  hideContactPopover();
+  window.open(href,'_blank');
+}
+
 function showAnnouncement(force=false){
   const announcement=settings.announcement;
   if(!announcement||!announcement.enabled||!announcement.content.trim()) return;
@@ -3020,6 +3141,19 @@ slideHistoryLatest.onclick=()=>{const latest=slideHistory[slideHistory.length-1]
 refreshButton.onclick=()=>render().catch(showError);
 settingsButton.onclick=openPreferences;
 announcementButton.onclick=()=>showAnnouncement(true);
+if(contactButton){
+  contactButton.onclick=event=>{event.preventDefault();openContact();};
+  contactButton.addEventListener('mouseenter',()=>{if(!isMobileContact()) showContactPopover();});
+  contactButton.addEventListener('mouseleave',()=>{if(!isMobileContact()) hideContactPopover();});
+  if(contactWrap) contactWrap.addEventListener('mouseleave',()=>{if(!isMobileContact()) hideContactPopover();});
+  let contactPressTimer=null;
+  const clearContactPress=()=>{if(contactPressTimer){clearTimeout(contactPressTimer);contactPressTimer=null;}};
+  contactButton.addEventListener('touchstart',()=>{if(!isMobileContact()) return;clearContactPress();contactPressTimer=setTimeout(()=>showContactPopover(),420);},{passive:true});
+  contactButton.addEventListener('touchend',clearContactPress,{passive:true});
+  contactButton.addEventListener('touchcancel',clearContactPress,{passive:true});
+  contactButton.addEventListener('touchmove',clearContactPress,{passive:true});
+}
+if(announcementContact) announcementContact.onclick=event=>{event.preventDefault();openContact();};
 const headerMenuToggle=document.querySelector('#header-menu-toggle');
 const headerMenu=document.querySelector('#header-menu');
 const headerMenuBackdrop=document.querySelector('#header-menu-backdrop');
@@ -3034,6 +3168,7 @@ document.querySelector('#menu-slideshow-toggle').onclick=()=>{closeHeaderMenu();
 document.querySelector('#menu-refresh').onclick=()=>{closeHeaderMenu();render().catch(showError);};
 document.querySelector('#menu-settings').onclick=()=>{closeHeaderMenu();openPreferences();};
 document.querySelector('#menu-announcement').onclick=()=>{closeHeaderMenu();showAnnouncement(true);};
+if(menuContact) menuContact.onclick=()=>{closeHeaderMenu();openContact();};
 document.querySelector('#maintenance-unlock').onclick=async()=>{const token=maintenanceToken.value.trim();if(!token){maintenanceMessage.textContent='请输入管理密钥。';return;}maintenanceMessage.textContent='正在验证…';const response=await fetch('/api/admin/config',{headers:{'X-OpenList-Admin-Token':token},cache:'no-store'});if(!response.ok){maintenanceMessage.textContent='管理密钥无效。';return;}maintenanceAccessToken=token;maintenanceMessage.textContent='';render().catch(showError);};
 lightboxDownload.onclick=()=>downloadImage().catch(showError);
 document.querySelector('#preferences-save').onclick=()=>{settings.view_layout=layoutMode.value;settings.slideshow_interval=Math.max(0,Math.min(300,Number(slideshowInterval.value)||0));settings.mobile_waterfall_columns=['1','2'].includes(mobileWaterfallColumns.value)?mobileWaterfallColumns.value:'1';settings.caption_mode=captionMode.value;settings.show_tags_enabled=showTagsEnabled.checked;settings.filter_mode=filterMode.value;settings.preview_quality=previewQuality.value;settings.lightbox_quality=lightboxQuality.value;persistPreferences();location.reload();};
@@ -3119,7 +3254,7 @@ document.addEventListener('visibilitychange',()=>{
 });
 window.addEventListener('online',()=>recoverAfterIdle().catch(showError));
 if(pageHeader)document.documentElement.style.setProperty('--header-h',Math.ceil(pageHeader.getBoundingClientRect().height)+'px');
-loadSettings().then(value=>{settings=value;taggingConfig=settings.tagging;applyGalleryTheme(settings.theme);const annVisible=settings.announcement.enabled;announcementButton.classList.toggle('hidden',!annVisible);document.querySelector('#menu-announcement').classList.toggle('hidden',!annVisible);showAnnouncement();loadTagCategories();return render();}).catch(showError);
+loadSettings().then(value=>{settings=value;taggingConfig=settings.tagging;applyGalleryTheme(settings.theme);const annVisible=settings.announcement.enabled;announcementButton.classList.toggle('hidden',!annVisible);document.querySelector('#menu-announcement').classList.toggle('hidden',!annVisible);syncContactControls();showAnnouncement();loadTagCategories();return render();}).catch(showError);
 </script>
 </body>
 </html>"""
@@ -3166,6 +3301,7 @@ button.danger{background:transparent;color:var(--danger);border:1px solid color-
 .check{display:flex;align-items:center;gap:8px}
 .check input{width:auto}
 .markdown-preview{min-height:80px;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);line-height:1.65}
+.markdown-preview img{display:block;max-width:100%;height:auto;margin:12px auto;border-radius:10px}
 .hidden{display:none}
 .trash-list{display:flex;flex-direction:column;gap:8px;margin-top:10px;max-height:520px;overflow-y:auto}
 .trash-item{display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg)}
@@ -3249,11 +3385,19 @@ body:not(.theme-light)::after{content:'';position:fixed;inset:0;z-index:10000;po
     <h2>网站公告</h2>
     <label class="check"><input id="announcement-enabled" type="checkbox">启用公告弹窗</label>
     <label>公告标题<input id="announcement-title" maxlength="120"></label>
-    <label>公告内容（Markdown）<textarea id="announcement-content" maxlength="4000" placeholder="# 标题&#10;支持 **加粗**、*斜体*、`代码`、链接和代码块"></textarea></label>
+    <label>公告内容（Markdown）<textarea id="announcement-content" maxlength="4000" placeholder="# 标题&#10;支持 **加粗**、*斜体*、`代码`、链接、图片和代码块&#10;![说明](https://example.com/notice.png)"></textarea></label>
+    <p class="note">图片请使用公网 http/https 地址，例如 ![说明](https://example.com/notice.png)。不支持 OpenList 签名链接。</p>
     <div class="actions"><button id="announcement-preview-button" class="secondary" type="button">预览</button></div>
     <div id="announcement-preview" class="markdown-preview"></div>
     <label>强制阅读秒数<input id="announcement-required-seconds" type="number" min="0" max="3600" step="1"></label>
     <p class="note">修改标题、内容、开关或秒数都会生成新公告版本。</p>
+    <h3>联系方式</h3>
+    <label class="check"><input id="contact-enabled" type="checkbox">显示联系按钮</label>
+    <label>按钮文字<input id="contact-label" maxlength="20" placeholder="联系"></label>
+    <label>QQ 号码<input id="contact-qq-number" inputmode="numeric" maxlength="12" placeholder="3473905540"></label>
+    <label>电脑端加好友链接<input id="contact-qq-url" maxlength="300" placeholder="https://qm.qq.com/q/..."></label>
+    <label>二维码图片地址<input id="contact-qr-url" maxlength="300" placeholder="https://example.com/qq-qr.png"></label>
+    <p class="note">电脑悬停显示二维码，点击打开 QQ；手机长按显示二维码，点击跳转加好友。二维码需使用公网图片地址。</p>
   </div>
 
   <div id="tab-tags" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-tags">
@@ -3307,9 +3451,9 @@ function setAdminStatus(text){adminStatus.textContent=text;adminStatus.classList
 function auth(){return {'Content-Type':'application/json','X-OpenList-Admin-Token':document.querySelector('#token').value};}
 function showSelected(){const root=document.querySelector('#selected');root.replaceChildren(...config.directories.map(path=>{const item=document.createElement('div');item.className='selected-item';const text=document.createElement('span');text.textContent=path;const remove=document.createElement('button');remove.className='secondary';remove.type='button';remove.textContent='移除';remove.onclick=()=>{config.directories=config.directories.filter(value=>value!==path);showSelected();};item.append(text,remove);return item;}));}
 function escapeHtml(value){return value.replace(/[&<>"']/g,character=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));}
-function renderMarkdown(value){return escapeHtml(value).replace(/&lt;font\s+color=(?:&quot;|&#39;)?(#[0-9a-f]{3,8}|[a-z]+)(?:&quot;|&#39;)?\s*&gt;/gi,'<span style="color:$1">').replace(/&lt;\/font&gt;/gi,'</span>').replace(/```([\s\S]*?)```/g,'<pre><code>$1</code></pre>').replace(/^### (.*)$/gm,'<h3>$1</h3>').replace(/^## (.*)$/gm,'<h2>$1</h2>').replace(/^# (.*)$/gm,'<h1>$1</h1>').replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>').replace(/\*([^*]+)\*/g,'<em>$1</em>').replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>').replace(/\n\n/g,'</p><p>').replace(/\n/g,'<br>');}
+function renderMarkdown(value){return escapeHtml(value).replace(/&lt;font\s+color=(?:&quot;|&#39;)?(#[0-9a-f]{3,8}|[a-z]+)(?:&quot;|&#39;)?\s*&gt;/gi,'<span style="color:$1">').replace(/&lt;\/font&gt;/gi,'</span>').replace(/```([\s\S]*?)```/g,'<pre><code>$1</code></pre>').replace(/^### (.*)$/gm,'<h3>$1</h3>').replace(/^## (.*)$/gm,'<h2>$1</h2>').replace(/^# (.*)$/gm,'<h1>$1</h1>').replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>').replace(/\*([^*]+)\*/g,'<em>$1</em>').replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g,'<img src="$2" alt="$1" loading="lazy" referrerpolicy="no-referrer">').replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>').replace(/\n\n/g,'</p><p>').replace(/\n/g,'<br>');}
 function previewAnnouncement(){document.querySelector('#announcement-preview').innerHTML='<p>'+renderMarkdown(document.querySelector('#announcement-content').value)+'</p>';}
-function showAdmin(){document.querySelector('#default-caption').value=config.caption_mode;document.querySelector('#directory-display-enabled').checked=config.directory_display_enabled;document.querySelector('#directory-display-depth').value=config.directory_display_depth;document.querySelector('#theme').value=config.theme||'dark';document.querySelector('#announcement-enabled').checked=config.announcement_enabled;document.querySelector('#announcement-title').value=config.announcement_title;document.querySelector('#announcement-content').value=config.announcement_content;document.querySelector('#announcement-required-seconds').value=config.announcement_required_seconds;document.querySelector('#maintenance-enabled').checked=config.maintenance_enabled;document.querySelector('#tagging-enabled').checked=config.tagging_enabled||false;document.querySelector('#tagging-scope').value=config.tagging_scope||'disabled';document.querySelector('#tagging-categories').value=(config.tagging_categories||[]).join('\n');document.querySelector('#filter-enabled').checked=config.filter_enabled!==false;document.querySelector('#log-level').value=config.log_level||'INFO';document.querySelector('#protected').classList.remove('hidden');showSelected();previewAnnouncement();refreshRebuildStatus().catch(report);}
+function showAdmin(){document.querySelector('#default-caption').value=config.caption_mode;document.querySelector('#directory-display-enabled').checked=config.directory_display_enabled;document.querySelector('#directory-display-depth').value=config.directory_display_depth;document.querySelector('#theme').value=config.theme||'dark';document.querySelector('#announcement-enabled').checked=config.announcement_enabled;document.querySelector('#announcement-title').value=config.announcement_title;document.querySelector('#announcement-content').value=config.announcement_content;document.querySelector('#announcement-required-seconds').value=config.announcement_required_seconds;document.querySelector('#contact-enabled').checked=config.contact_enabled||false;document.querySelector('#contact-label').value=config.contact_label||'联系';document.querySelector('#contact-qq-number').value=config.contact_qq_number||'';document.querySelector('#contact-qq-url').value=config.contact_qq_url||'';document.querySelector('#contact-qr-url').value=config.contact_qr_url||'';document.querySelector('#maintenance-enabled').checked=config.maintenance_enabled;document.querySelector('#tagging-enabled').checked=config.tagging_enabled||false;document.querySelector('#tagging-scope').value=config.tagging_scope||'disabled';document.querySelector('#tagging-categories').value=(config.tagging_categories||[]).join('\n');document.querySelector('#filter-enabled').checked=config.filter_enabled!==false;document.querySelector('#log-level').value=config.log_level||'INFO';document.querySelector('#protected').classList.remove('hidden');showSelected();previewAnnouncement();refreshRebuildStatus().catch(report);}
 async function errorText(response,fallback){try{const data=await response.json();return data.error||fallback;}catch(error){return fallback;}}
 async function load(){const response=await fetch('/api/admin/config',{headers:auth(),cache:'no-store'});if(!response.ok)throw new Error(await errorText(response,'令牌无效或服务不可用'));config=await response.json();showAdmin();setAdminStatus('服务器配置已加载');}
 function addDirectory(path){if(!config.directories.includes(path)){config.directories.push(path);showSelected();setAdminStatus('已添加目录：'+path+'，请保存服务器配置');}}
@@ -3394,7 +3538,7 @@ async function browse(){
   if(!data.directories.length){container.innerHTML='<p class="note">当前目录没有子目录。</p>';}
   else{data.directories.forEach(item=>{const child=buildTreeNode(item.name,item.path,true,item.has_children);container.append(child);});}
 }
-async function saveServer(){if(!config)throw new Error('请先加载服务器配置');const payload={directories:config.directories,caption_mode:document.querySelector('#default-caption').value,directory_display_enabled:document.querySelector('#directory-display-enabled').checked,directory_display_depth:Number(document.querySelector('#directory-display-depth').value),theme:document.querySelector('#theme').value,announcement_enabled:document.querySelector('#announcement-enabled').checked,announcement_title:document.querySelector('#announcement-title').value,announcement_content:document.querySelector('#announcement-content').value,announcement_required_seconds:Number(document.querySelector('#announcement-required-seconds').value),maintenance_enabled:document.querySelector('#maintenance-enabled').checked,tagging_enabled:document.querySelector('#tagging-enabled').checked,tagging_scope:document.querySelector('#tagging-scope').value,tagging_categories:document.querySelector('#tagging-categories').value.split('\n').map(s=>s.trim()).filter(Boolean),filter_enabled:document.querySelector('#filter-enabled').checked,log_level:document.querySelector('#log-level').value};const response=await fetch('/api/admin/config',{method:'PUT',headers:auth(),body:JSON.stringify(payload)});if(!response.ok)throw new Error(await errorText(response,'保存失败'));config=await response.json();showAdmin();setAdminStatus('全局服务器配置已保存；公告修改后将向访客显示新版本。');}
+async function saveServer(){if(!config)throw new Error('请先加载服务器配置');const payload={directories:config.directories,caption_mode:document.querySelector('#default-caption').value,directory_display_enabled:document.querySelector('#directory-display-enabled').checked,directory_display_depth:Number(document.querySelector('#directory-display-depth').value),theme:document.querySelector('#theme').value,announcement_enabled:document.querySelector('#announcement-enabled').checked,announcement_title:document.querySelector('#announcement-title').value,announcement_content:document.querySelector('#announcement-content').value,announcement_required_seconds:Number(document.querySelector('#announcement-required-seconds').value),contact_enabled:document.querySelector('#contact-enabled').checked,contact_label:document.querySelector('#contact-label').value,contact_qq_number:document.querySelector('#contact-qq-number').value,contact_qq_url:document.querySelector('#contact-qq-url').value,contact_qr_url:document.querySelector('#contact-qr-url').value,maintenance_enabled:document.querySelector('#maintenance-enabled').checked,tagging_enabled:document.querySelector('#tagging-enabled').checked,tagging_scope:document.querySelector('#tagging-scope').value,tagging_categories:document.querySelector('#tagging-categories').value.split('\n').map(s=>s.trim()).filter(Boolean),filter_enabled:document.querySelector('#filter-enabled').checked,log_level:document.querySelector('#log-level').value};const response=await fetch('/api/admin/config',{method:'PUT',headers:auth(),body:JSON.stringify(payload)});if(!response.ok)throw new Error(await errorText(response,'保存失败'));config=await response.json();showAdmin();setAdminStatus('全局服务器配置已保存；公告修改后将向访客显示新版本。');}
 function formatClock(value){const seconds=Math.max(0,Math.round(Number(value)||0));const minutes=String(Math.floor(seconds/60)).padStart(2,'0');const rest=String(seconds%60).padStart(2,'0');return minutes+':'+rest;}
 function formatIndexDate(unix){const date=new Date(Number(unix)*1000);if(!unix||Number.isNaN(date.getTime()))return '';const month=String(date.getMonth()+1).padStart(2,'0');const day=String(date.getDate()).padStart(2,'0');return month+'.'+day+' 数据';}
 function applyRebuildStatus(status){
