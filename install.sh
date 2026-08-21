@@ -40,7 +40,9 @@ fetch_from() {
   local base="$1"
   local remote_path="$2"
   local local_path="$3"
-  curl --fail --location --silent --show-error --retry 2 --retry-all-errors --connect-timeout 15 \
+  curl --fail --location --silent --show-error \
+    --connect-timeout 20 --max-time 20 \
+    --retry 2 --retry-all-errors \
     "${base}/${remote_path}" --output "${local_path}"
 }
 
@@ -55,9 +57,9 @@ download() {
       fetch_from "${GITEE_RAW_BASE}" "${remote_path}" "${local_path}"
       ;;
     auto)
-      if ! fetch_from "${GITEE_RAW_BASE}" "${remote_path}" "${local_path}"; then
-        log "Gitee source unavailable; falling back to GitHub"
-        fetch_from "${GITHUB_RAW_BASE}" "${remote_path}" "${local_path}"
+      if ! fetch_from "${GITHUB_RAW_BASE}" "${remote_path}" "${local_path}"; then
+        log "GitHub source unavailable; falling back to Gitee"
+        fetch_from "${GITEE_RAW_BASE}" "${remote_path}" "${local_path}"
       fi
       ;;
     *)

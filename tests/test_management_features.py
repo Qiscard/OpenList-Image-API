@@ -11,13 +11,13 @@ import zipfile
 from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from openlist_image_api import Application, admin_html, gallery_html, make_handler  # noqa: E402
+from openlist_image_api import TRASH_TAG, Application, admin_html, gallery_html, make_handler  # noqa: E402
 import openlist_tui  # noqa: E402
 
 
@@ -137,8 +137,14 @@ class WebUiMarkupTests(unittest.TestCase):
         self.assertIn(".tag-bar{display:flex", page)
         self.assertIn("linear-gradient(180deg,rgba(0,0,0,.78)", page)
         self.assertIn(".tag-chip{gap:3px;padding:3px 8px;font-size:11px}", page)
-        self.assertIn(".help-panel{height:min(78vh,680px)}", page)
-        self.assertIn(".help-main .announcement-content{flex:1", page)
+        self.assertNotIn(".help-panel", page)
+        self.assertNotIn("HELP_MARKDOWN", page)
+        self.assertNotIn("id=\"help\"", page)
+        self.assertNotIn("id=\"help-button\"", page)
+        self.assertIn("❤", page)
+        self.assertIn("🌙", page)
+        self.assertIn("☀", page)
+        self.assertIn("🗑️", page)
         self.assertIn(".gallery.waterfall .card img{max-height:none;min-height:0;height:auto}", page)
         self.assertIn("scroll-snap-type:x proximity", page)
         self.assertIn("role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"preferences-title\"", page)
@@ -146,11 +152,14 @@ class WebUiMarkupTests(unittest.TestCase):
         self.assertIn("className='image-error'", page)
         self.assertIn("openlist-image-preferences-v2", page)
         self.assertIn("openlist-image-announcement-v2-", page)
-        self.assertIn("id=\"help\" class=\"help-panel hidden\" role=\"dialog\"", page)
-        self.assertIn("HELP_MARKDOWN", page)
-        self.assertIn("helpButton.onclick=showHelp", page)
-        self.assertIn("helpClose.onclick=closeHelp", page)
-        self.assertIn("if(event.key==='Escape'&&!helpPanel.classList.contains('hidden'))", page)
+        self.assertIn("themeFab.textContent=theme==='light'?'☀':'🌙'", page)
+        self.assertIn("navPause.textContent=slideshowPaused?'播放':'暂停'", page)
+        self.assertIn("like.innerHTML='❤ <span class=\"tag-vote-count\">'", page)
+        self.assertIn("card.className='card is-loading'", page)
+        self.assertIn("picture.alt=''", page)
+        self.assertIn(".card.is-loading img", page)
+        self.assertIn("body:not(.theme-light)::after", page)
+        self.assertEqual(TRASH_TAG, "垃圾桶")
         self.assertIn("waterfall-column", page)
         self.assertIn("shortestWaterfallColumn", page)
         self.assertIn("prioritizeWaterfallImages", page)
@@ -185,6 +194,20 @@ class WebUiMarkupTests(unittest.TestCase):
         self.assertIn("#announcement-content", page)
         self.assertIn("#announcement-required-seconds", page)
         self.assertIn("#maintenance-enabled", page)
+        self.assertGreater(page.find('id="maintenance-enabled"'), page.find('id="tab-tools"'))
+        self.assertIn("id=\"rebuild-status\"", page)
+        self.assertIn("重建中（预计需要", page)
+        self.assertIn("重建完毕", page)
+        self.assertIn("if(Number(status.image_count||0)<=0)", page)
+        self.assertIn("rebuildStatus.textContent='无数据'", page)
+        self.assertNotIn("/api/admin/logs", page)
+        self.assertNotIn("id=\"log-view\"", page)
+        self.assertIn("🌙", page)
+        self.assertIn("☀", page)
+        self.assertIn("className='trash-thumb'", page)
+        self.assertIn("preview:true", page)
+        self.assertIn("offset+=50", page)
+        self.assertIn("body:not(.theme-light)::after", page)
         self.assertIn("#browse", page)
         self.assertIn("实时读取自 OpenList", page)
         self.assertNotIn("refresh-directory-cache", page)
@@ -196,6 +219,7 @@ class WebUiMarkupTests(unittest.TestCase):
         self.assertNotIn("id=\"caption\"", page)
         self.assertNotIn("tagging-sort-default", page)
         self.assertIn("后台重建图片索引", page)
+        self.assertIn("维护模式 / 索引 / 备份", page)
         self.assertIn("role=\"tablist\"", page)
         self.assertIn("role=\"tab\" aria-selected=\"true\"", page)
         self.assertIn("role=\"tabpanel\"", page)
@@ -407,8 +431,15 @@ class TuiManagementTests(unittest.TestCase):
                 patch.object(openlist_tui, "require_root"),
                 patch.object(openlist_tui, "run") as run_command,
             ):
-                openlist_tui.update_application()
-        run_command.assert_called_once_with(["bash", str(installer), "--update"])
+                openlist_tui.update_application("github")
+                openlist_tui.update_application("gitee")
+        self.assertEqual(
+            run_command.call_args_list,
+            [
+                call(["bash", str(installer), "--source", "github", "--update"]),
+                call(["bash", str(installer), "--source", "gitee", "--update"]),
+            ],
+        )
 
     def test_api_uninstall_uses_scoped_installer_action(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -435,9 +466,15 @@ class TuiManagementTests(unittest.TestCase):
     def test_main_menu_uses_grouped_actions(self) -> None:
         menu_source = inspect.getsource(openlist_tui.main_menu)
         self.assertIn('"4": service_management', menu_source)
-        self.assertIn('"6": show_status_with_admin_token', menu_source)
-        self.assertIn('"7": maintenance_menu', menu_source)
+        self.assertIn('"5": show_status_with_admin_token', menu_source)
+        self.assertIn('"6": maintenance_menu', menu_source)
+        self.assertNotIn("rebuild_index", menu_source)
+        self.assertNotIn('"7": maintenance_menu', menu_source)
         self.assertNotIn('"12": print_admin_token', menu_source)
+        maintenance_source = inspect.getsource(openlist_tui.maintenance_menu)
+        self.assertIn("更新项目（github）", maintenance_source)
+        self.assertIn("更新项目（gitee）", maintenance_source)
+        self.assertIn("全局迁移", maintenance_source)
 
     def test_cache_cleanup_removes_persisted_url_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -452,6 +489,44 @@ class TuiManagementTests(unittest.TestCase):
                 openlist_tui.cleanup_residuals_and_runtime_cache()
             self.assertFalse(cache_path.exists())
 
+    def test_global_migration_packs_placeholders_without_token_contents(self) -> None:
+        import tarfile
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_path = root / "config.json"
+            config_path.write_text('{"state_dir": "%s"}\n' % root.as_posix(), encoding="utf-8")
+            (root / "index.json").write_text('{"images":[]}\n', encoding="utf-8")
+            (root / "tags.json").write_text("{}\n", encoding="utf-8")
+            (root / "url_cache.json").write_text("{}\n", encoding="utf-8")
+            (root / "index.checkpoint.json").write_text("{}\n", encoding="utf-8")
+            (root / "rebuild.log").write_text("should-not-pack\n", encoding="utf-8")
+            token_path = root / "openlist.token"
+            admin_path = root / "admin.token"
+            token_path.write_text("secret-openlist-token\n", encoding="utf-8")
+            admin_path.write_text("secret-admin-token\n", encoding="utf-8")
+            output_dir = root / "out"
+            output_dir.mkdir()
+            with (
+                patch.object(openlist_tui, "require_root"),
+                patch.object(openlist_tui, "CONFIG_PATH", config_path),
+                patch.object(openlist_tui, "TOKEN_PATH", token_path),
+                patch.object(openlist_tui, "ADMIN_TOKEN_PATH", admin_path),
+                patch.object(openlist_tui, "MIGRATION_DIR", output_dir),
+                patch.object(openlist_tui, "read_config", return_value={"state_dir": str(root)}),
+            ):
+                archive_path = openlist_tui.export_global_migration()
+            self.assertTrue(archive_path.is_file())
+            with tarfile.open(archive_path, "r:gz") as archive:
+                names = set(archive.getnames())
+                self.assertTrue({"config.json", "index.json", "tags.json", "url_cache.json", "index.checkpoint.json", "openlist.token", "admin.token"} <= names)
+                self.assertNotIn("rebuild.log", names)
+                self.assertEqual(archive.extractfile("openlist.token").read(), b"")
+                self.assertEqual(archive.extractfile("admin.token").read(), b"")
+                packed = archive.extractfile("config.json").read()
+                self.assertNotIn(b"secret-openlist-token", packed)
+                self.assertNotIn(b"secret-admin-token", packed)
+
 
 class InstallerTests(unittest.TestCase):
     def test_embedded_installer_uses_fixed_proxy_candidates(self) -> None:
@@ -464,6 +539,15 @@ class InstallerTests(unittest.TestCase):
         ):
             self.assertIn(proxy, installer)
         self.assertIn("--retry 2 --retry-all-errors", installer)
+        self.assertIn("--connect-timeout 20", installer)
+        self.assertIn("--max-time 20", installer)
+        self.assertIn("GitHub source unavailable; falling back to Gitee", installer)
+        self.assertNotIn("Gitee source unavailable; falling back to GitHub", installer)
+        auto_idx = installer.find("auto)")
+        github_fetch = installer.find('fetch_from "${GITHUB_RAW_BASE}"', auto_idx)
+        gitee_fetch = installer.find('fetch_from "${GITEE_RAW_BASE}"', auto_idx)
+        self.assertGreater(github_fetch, auto_idx)
+        self.assertGreater(gitee_fetch, github_fetch)
         self.assertIn("--install-openlist", installer)
         self.assertIn("--update", installer)
         self.assertIn("--uninstall api|complete", installer)

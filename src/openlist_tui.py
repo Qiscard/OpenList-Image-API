@@ -5,12 +5,15 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +39,7 @@ LEGACY_ARTIFACTS = (
     Path("/tmp/index_build.log"),
 )
 LEGACY_NGINX_DIRS = (Path("/etc/nginx/conf.d"), Path("/www/server/panel/vhost/nginx"))
-REBUILD_PID_PATH = Path("/run/openlist-image-api/rebuild.pid")
+MIGRATION_DIR = Path("/tmp")
 
 
 def require_root() -> None:
@@ -109,12 +112,14 @@ def install_openlist() -> None:
     print("OpenList 内置安装流程已完成。请在 OpenList 初始化完成后回到本菜单设置 token。")
 
 
-def update_application() -> None:
+def update_application(source: str) -> None:
     require_root()
+    if source not in {"github", "gitee"}:
+        raise ValueError("无效的更新来源")
     if not APP_INSTALLER_PATH.is_file():
         raise RuntimeError("内置安装器缺失，请重新运行本项目安装命令")
-    print("正在拉取最新脚本并更新图片 API；服务会恢复到更新前的启用和运行状态。")
-    run(["bash", str(APP_INSTALLER_PATH), "--update"])
+    print(f"正在从 {source} 拉取最新脚本并更新图片 API；服务会恢复到更新前的启用和运行状态。")
+    run(["bash", str(APP_INSTALLER_PATH), "--source", source, "--update"])
     print("更新完成。当前 TUI 会话仍使用旧代码；退出后重新运行即可使用新菜单。")
 
 
@@ -141,19 +146,25 @@ def maintenance_menu() -> None:
     while True:
         clear()
         print("维护工具")
-        print("  1. 更新图片 API")
-        print("  2. 卸载")
-        print("  3. 清理旧 API 残留 / 运行缓存")
+        print("  1. 更新项目（github）")
+        print("  2. 更新项目（gitee）")
+        print("  3. 卸载")
+        print("  4. 清理旧 API 残留 / 运行缓存")
+        print("  5. 全局迁移")
         print("  0. 返回")
-        choice = input("选择 [0-3]: ").strip()
+        choice = input("选择 [0-5]: ").strip()
         if choice == "0":
             return
         if choice == "1":
-            update_application()
+            update_application("github")
         elif choice == "2":
-            uninstall_application()
+            update_application("gitee")
         elif choice == "3":
+            uninstall_application()
+        elif choice == "4":
             cleanup_residuals_and_runtime_cache()
+        elif choice == "5":
+            export_global_migration()
         else:
             raise ValueError("无效的维护操作")
         pause()
@@ -358,48 +369,30 @@ def show_status_with_admin_token() -> None:
     print(f"WebUI 管理令牌: {token}")
 
 
-def rebuild_index() -> None:
+def export_global_migration() -> Path:
     require_root()
-    config = read_config()
-    if REBUILD_PID_PATH.exists():
-        try:
-            previous_pid = int(REBUILD_PID_PATH.read_text(encoding="utf-8").strip())
-            os.kill(previous_pid, 0)
-            raise RuntimeError("已有索引重建任务正在后台运行")
-        except ProcessLookupError:
-            REBUILD_PID_PATH.unlink(missing_ok=True)
-        except ValueError:
-            REBUILD_PID_PATH.unlink(missing_ok=True)
-    state_dir = Path(config["state_dir"])
-    state_dir.mkdir(parents=True, exist_ok=True)
-    log_path = state_dir / "rebuild.log"
-    log_path.touch(exist_ok=True)
-    make_service_owned(log_path)
-    REBUILD_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
-    refresh_command = [sys.executable, str(APP_PATH), "--config", str(CONFIG_PATH), "refresh"]
-    if not shutil.which("runuser"):
-        raise RuntimeError("缺少 runuser，无法以图片 API 服务用户安全重建索引")
-    with log_path.open("a", encoding="utf-8") as log_file:
-        process = subprocess.Popen(
-            ["runuser", "-u", SERVICE_USER, "--", *refresh_command],
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    REBUILD_PID_PATH.write_text(str(process.pid), encoding="utf-8")
-    estimate = 0.0
-    index_path = state_dir / "index.json"
-    if index_path.exists():
-        try:
-            estimate = float(json.loads(index_path.read_text(encoding="utf-8")).get("build_duration_seconds") or 0)
-        except (OSError, ValueError, json.JSONDecodeError):
-            estimate = 0.0
-    print(f"索引重建已在后台启动（PID: {process.pid}）。")
-    if estimate:
-        print(f"预计耗时约 {estimate:.1f} 秒（基于上次重建）。")
-    else:
-        print("首次重建暂无可用耗时估计；可在状态页查看后续耗时。")
-    print(f"日志: {log_path}")
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    archive_path = MIGRATION_DIR / f"openlist-image-api-migration-{timestamp}.tar.gz"
+    MIGRATION_DIR.mkdir(parents=True, exist_ok=True)
+    state_dir = Path("/var/lib/openlist-image-api")
+    try:
+        state_dir = Path(read_config()["state_dir"])
+    except (OSError, KeyError, TypeError, ValueError):
+        pass
+    with tarfile.open(archive_path, "w:gz") as archive:
+        if CONFIG_PATH.is_file():
+            archive.add(CONFIG_PATH, arcname="config.json")
+        for name in ("index.json", "tags.json", "url_cache.json", "index.checkpoint.json"):
+            path = state_dir / name
+            if path.is_file():
+                archive.add(path, arcname=name)
+        for name in ("openlist.token", "admin.token"):
+            info = tarfile.TarInfo(name)
+            info.size = 0
+            info.mode = 0o600
+            archive.addfile(info, io.BytesIO(b""))
+    print(f"迁移包已写入: {archive_path}")
+    return archive_path
 
 
 def print_admin_token() -> None:
@@ -420,9 +413,8 @@ def main_menu() -> None:
         "2": set_openlist_token,
         "3": configure_port,
         "4": service_management,
-        "5": rebuild_index,
-        "6": show_status_with_admin_token,
-        "7": maintenance_menu,
+        "5": show_status_with_admin_token,
+        "6": maintenance_menu,
     }
     while True:
         clear()
@@ -433,12 +425,11 @@ def main_menu() -> None:
         print("║  2. 设置 OpenList API token                   ║")
         print("║  3. 设置图片 API 端口                         ║")
         print("║  4. 图片 API 服务管理                         ║")
-        print("║  5. 后台重建图片索引                          ║")
-        print("║  6. 查看状态 / WebUI 管理令牌                 ║")
-        print("║  7. 维护（更新 / 卸载 / 清理残留与缓存）      ║")
+        print("║  5. 查看状态 / WebUI 管理令牌                 ║")
+        print("║  6. 维护（更新 / 卸载 / 清理 / 全局迁移）     ║")
         print("║  0. 退出                                      ║")
         print("╚══════════════════════════════════════════════╝")
-        choice = input("选择 [0-7]: ").strip()
+        choice = input("选择 [0-6]: ").strip()
         if choice == "0":
             return
         action = actions.get(choice)

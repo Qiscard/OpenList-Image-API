@@ -25,7 +25,7 @@ OpenList Image API 为本机 OpenList 中选定目录的图片建立轻量索引
 - 随机图片元数据与签名 URL 解析；
 - 服务端附件代理下载；
 - 图片点赞、分类和垃圾桶管理；
-- 公告、维护模式、配置备份和日志查看；
+- 公告、维护模式、配置备份和全局迁移打包；
 - systemd 部署与交互式终端管理。
 
 生产端没有 Python 第三方依赖，前端 HTML/CSS/JavaScript 由 [`src/openlist_image_api.py`](src/openlist_image_api.py) 直接内嵌返回。
@@ -137,11 +137,11 @@ systemd 启动命令：
 TUI 从核心模块复用 `atomic_write_json()`、`load_config()` 和 `write_secret()`，负责：
 
 - 读写配置和 token，并设置服务用户属主；
-- 通过内置 `install.sh` 安装 OpenList、更新或卸载应用；
+- 通过内置 `install.sh` 安装 OpenList、按 GitHub 或 Gitee 更新、卸载应用；
 - 通过 `systemctl` 管理图片服务；
 - 使用 `ss`/`lsof` 检查端口；
 - 检测并清理旧 `openlist-random-image` 文件、服务和 Nginx 配置；
-- 使用 `runuser` 在后台执行 `refresh`，记录 PID 和日志；
+- 导出不含真实令牌的全局迁移包；
 - 显示状态和管理令牌。
 
 ### 4.3 `install.sh`
@@ -156,7 +156,7 @@ TUI 从核心模块复用 `atomic_write_json()`、`load_config()` 和 `write_sec
 --uninstall api|complete
 ```
 
-职责包括下载与 SHA-256 校验、用户/目录创建、systemd 单元生成、全局 TUI 命令生成、固定代理测速、更新时恢复原服务状态，以及配置默认值迁移。
+默认 `--source auto` 先请求 GitHub，连接超时和整体超时均为 20 秒，失败后重试 2 次，再回退到 Gitee。职责还包括下载与 SHA-256 校验、用户/目录创建、systemd 单元生成、全局 TUI 命令生成、固定代理测速、更新时恢复原服务状态，以及配置默认值迁移。
 
 ## 5. 配置与持久化
 
@@ -171,8 +171,7 @@ TUI 从核心模块复用 `atomic_write_json()`、`load_config()` 和 `write_sec
 | 索引 checkpoint | `/var/lib/openlist-image-api/index.checkpoint.json` | 重建中的队列、已访问目录、图片和失败项；配置指纹不匹配或文件损坏时忽略。 |
 | 标签数据 | `/var/lib/openlist-image-api/tags.json` | schema version 1，原子写。 |
 | URL 缓存 | `/var/lib/openlist-image-api/url_cache.json` | `url_cache_size > 0` 时保存 TTL 内的 URL/缩略图；容量为 0 时不写入。 |
-| 重建日志 | `/var/lib/openlist-image-api/rebuild.log` | TUI 后台 `refresh` 输出。 |
-| 重建 PID | `/run/openlist-image-api/rebuild.pid` | 防止重复 TUI 后台任务。 |
+| 重建日志 | `/var/lib/openlist-image-api/rebuild.log` | 旧 TUI 后台重建可能留下的日志；当前重建入口在管理页。 |
 
 ### 5.2 当前配置项
 
@@ -248,7 +247,6 @@ TUI 从核心模块复用 `atomic_write_json()`、`load_config()` 和 `write_sec
 | GET | `/api/admin/directories` | 管理令牌 | 直接读取 OpenList 子目录。 |
 | POST | `/api/admin/rebuild` | 管理令牌 | 启动后台图片索引重建。 |
 | GET/POST | `/api/admin/backup` | 管理令牌 | 下载/恢复配置 ZIP。 |
-| GET | `/api/admin/logs` | 管理令牌 | 读取 journalctl。 |
 | GET | `/api/admin/tagging/trash` | 管理令牌 | 查看垃圾桶路径。 |
 | POST | `/api/admin/tagging/trash/delete` | 管理令牌 | 永久删除 OpenList 文件。 |
 | POST | `/api/admin/tagging/reset` | 管理令牌 | 重置单图或全部标签。 |
@@ -312,7 +310,7 @@ POST 请求体：
 }
 ```
 
-匿名点赞/踩使用 IP+User-Agent 的 HMAC 标识去重；token 范围先验证管理令牌，再生成令牌标识。分类是图片级共享状态，不按投票者分别保存。浏览页当前展示点赞按钮、预定义分类和垃圾桶按钮；后端仍接受 `dislike` 类型，供 API 调用方使用。
+匿名点赞/踩使用 IP+User-Agent 的 HMAC 标识去重；token 范围先验证管理令牌，再生成令牌标识。分类是图片级共享状态，不按投票者分别保存。浏览页当前展示点赞（❤）、预定义分类和垃圾桶（🗑️）按钮；明暗切换按钮使用 🌙/☀。后端仍接受 `dislike` 类型，供 API 调用方使用。未加载完成的瀑布流占位卡不显示文件名或标签。
 
 索引重建后会将标签路径迁移到当前有效路径：先精确匹配，再尝试不区分大小写和末三段路径匹配。
 
@@ -326,23 +324,22 @@ POST 请求体：
 - **瀑布流**：900 px 以上 3 列、561–900 px 2 列、560 px 以下按浏览器偏好使用 1 或 2 列；按估算高度放入最矮列，`IntersectionObserver` 负责接近视口时加载，滚动到 60% 后拉取下一批。
 - **灯箱**：0.5–4 倍缩放、90° 旋转、拖拽、捏合、双击复位和失效 URL 恢复。
 - **画质**：`sizedThumb()` 只改写已包含 `width`/`height` 参数的缩略图 URL，否则原样返回。
-- **公告与帮助**：公告使用受限 Markdown 转换、阅读倒计时和版本化关闭状态；帮助使用同一安全 Markdown 渲染器，仅由用户点击打开并带焦点陷阱。
+- **公告**：使用受限 Markdown 转换、阅读倒计时和版本化关闭状态。
 - **维护**：验证管理令牌后将其暂存在页面内存，并附加到受门控请求。
 
 旧本地偏好中的 `single`/`grid` 会迁移为 `slideshow`。当前实际渲染类只有 `gallery slideshow` 和 `gallery waterfall`。
 
 ### 7.2 管理页
 
-`admin_html()` 使用六个页签：
+`admin_html()` 使用五个页签：
 
 1. 目录配置；
 2. 显示与主题；
 3. 网站公告；
-4. 维护模式；
-5. 标签与日志；
-6. 图片索引和备份。
+4. 标签；
+5. 维护（维护模式、索引重建状态和配置备份）。
 
-目录树通过 `GET /api/admin/directories?path=...` 延迟展开。保存使用 `PUT /api/admin/config`；索引重建使用 `POST /api/admin/rebuild` 并轮询 `/api/status`；配置 ZIP 可下载和上传恢复。
+目录树通过 `GET /api/admin/directories?path=...` 延迟展开。保存使用 `PUT /api/admin/config`；索引重建使用 `POST /api/admin/rebuild` 并轮询 `/api/status` 显示无数据、日期数据、重建中或重建完毕；配置 ZIP 可下载和上传恢复。内置垃圾桶标签名为 `垃圾桶`，读取旧数据时会把 `🗑️ 垃圾桶` 归一到该名称。管理页垃圾桶列表通过 `POST /api/download-url` 的 `preview:true` 加载缩略图。暗色主题会在页面上叠加半透明黑色遮罩以降低整体亮度。
 
 明暗主题悬浮按钮位于右下角，只保存在当前浏览器。
 
@@ -379,9 +376,9 @@ sudo -u openlist-image /usr/bin/python3 \
   --config /etc/openlist-image-api/config.json refresh
 ```
 
-推荐使用 TUI 菜单 5 在后台重建。`/api/status` 的 `index_progress` 包含 `completed`、`queued`、`active`、`failed`、`directory_count`、`image_count`、`elapsed_seconds`、`retry_round` 和 `complete`，可据此区分正常扫描、失败重试和已完成状态；`last_build_duration_seconds` 与 `last_refresh_error` 分别记录最近一次成功耗时和错误。
+图片索引请在管理页重建。`/api/status` 的 `index_progress` 包含 `completed`、`queued`、`active`、`failed`、`directory_count`、`image_count`、`elapsed_seconds`、`retry_round` 和 `complete`，可据此区分正常扫描、失败重试和已完成状态；`last_build_duration_seconds` 与 `last_refresh_error` 分别记录最近一次成功耗时和错误。
 
-当 `url_cache_size > 0` 时，URL/缩略图缓存会持久化到 `url_cache.json` 并按 TTL 复用；TUI 菜单 7 的“清理残留与缓存”会删除该文件后重启服务。仅重启服务不会删除持久化缓存。
+当 `url_cache_size > 0` 时，URL/缩略图缓存会持久化到 `url_cache.json` 并按 TTL 复用；TUI 菜单 6 的“清理残留与缓存”会删除该文件后重启服务。仅重启服务不会删除持久化缓存。维护菜单中的“全局迁移”会在 `/tmp` 生成 `openlist-image-api-migration-YYYYMMDD-HHMMSS.tar.gz`，包含配置、索引/标签/缓存数据以及空的 token 占位文件，不包含真实令牌。
 
 ### 8.3 缓存默认值与迁移
 
@@ -456,7 +453,7 @@ GitHub Actions 在 push 和 pull request 时使用 Ubuntu 与 Python 3.11 执行
 - 管理字段白名单、公告版本和备份秘密排除；
 - token 标签范围的管理令牌验证；
 - 浏览/管理页关键结构；
-- TUI 状态、服务、更新、卸载和安装器约束。
+- TUI 状态、服务、按来源更新、卸载、全局迁移和安装器约束。
 
 前端测试主要是生成 HTML/JavaScript 的字符串断言，不等于完整浏览器端到端覆盖。涉及布局、触控、主题、公告或灯箱的改动还需实际浏览器冒烟验证。
 

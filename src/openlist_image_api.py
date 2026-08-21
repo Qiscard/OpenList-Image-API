@@ -14,7 +14,6 @@ import os
 import random
 import secrets
 import socket
-import subprocess
 import threading
 import time
 import zipfile
@@ -405,6 +404,10 @@ class IndexRepository:
             self._cache_mtime = self.path.stat().st_mtime if self.path.exists() else 0
 
 
+TRASH_TAG = "垃圾桶"
+LEGACY_TRASH_TAG = "🗑️ 垃圾桶"
+
+
 class TagRepository:
     def __init__(self, state_dir: Path):
         self.path = state_dir / "tags.json"
@@ -430,8 +433,31 @@ class TagRepository:
             data.setdefault("schema_version", 1)
             data.setdefault("tags", {})
             data.setdefault("updated_at", 0)
+            changed = self._normalize_trash_tag(data)
             self._cache = data
+            if changed:
+                self.save(data)
             return self._cache
+
+    def _normalize_trash_tag(self, data: dict[str, Any]) -> bool:
+        changed = False
+        for entry in data.get("tags", {}).values():
+            if not isinstance(entry, dict):
+                continue
+            categories = entry.get("categories")
+            if not isinstance(categories, list) or LEGACY_TRASH_TAG not in categories:
+                continue
+            normalized: list[str] = []
+            seen: set[str] = set()
+            for item in categories:
+                name = TRASH_TAG if item == LEGACY_TRASH_TAG else item
+                if name in seen:
+                    continue
+                seen.add(name)
+                normalized.append(name)
+            entry["categories"] = normalized
+            changed = True
+        return changed
 
     def save(self, data: dict[str, Any]) -> None:
         with self._lock:
@@ -1043,7 +1069,7 @@ class Application:
             "categories": self.config["tagging_categories"],
             "allow_custom": self.config["tagging_allow_custom"],
             "sort_default": self.config["tagging_sort_default"],
-            "trash_tag": self.TRASH_TAG,
+            "trash_tag": TRASH_TAG,
         }
         return config
 
@@ -1460,7 +1486,7 @@ class Application:
         raw = (ip or "") + "|" + (user_agent or "")
         return "a:" + hmac.new(b"openlist-tag-anon", raw.encode("utf-8"), "sha256").hexdigest()[:16]
 
-    TRASH_TAG = "🗑️ 垃圾桶"
+    TRASH_TAG = TRASH_TAG
 
     def trash_paths(self) -> list[str]:
         return sorted(self.tags.paths_for_tag(self.TRASH_TAG))
@@ -1529,18 +1555,18 @@ def gallery_html() -> str:
 <style>
 :root{
   color-scheme:dark;
-  --bg:#0f1115;
-  --bg-elev:#171b22;
-  --bg-soft:#1d232d;
-  --line:#2a3140;
-  --text:#e8edf5;
-  --muted:#8b97ab;
+  --bg:#07080c;
+  --bg-elev:#0e1218;
+  --bg-soft:#141922;
+  --line:#1f2633;
+  --text:#d7deea;
+  --muted:#7b879b;
   --accent:#3d8bfd;
   --accent-hover:#5aa0ff;
   --danger:#ff5d6c;
   --radius:14px;
   --radius-sm:9px;
-  --shadow:0 16px 40px rgba(0,0,0,.38);
+  --shadow:0 16px 40px rgba(0,0,0,.5);
   --header-h:56px;
   --font:"Segoe UI",system-ui,-apple-system,"PingFang SC","Noto Sans SC",sans-serif;
 }
@@ -1570,7 +1596,7 @@ header{
 .header-actions #previous,.header-actions #next,.header-actions #slideshow-toggle{display:none!important}
 #header-menu-toggle{
   display:none;width:40px;height:40px;padding:0;border-radius:11px;
-  background:var(--bg-soft);border:1px solid var(--line);color:var(--text);font-size:18px
+  background:var(--bg-soft);border:1px solid var(--line);color:var(--text);font-size:13px
 }
 .header-menu{
   position:fixed;z-index:6;top:var(--menu-top,56px);right:10px;width:188px;
@@ -1597,7 +1623,9 @@ header{
 .card{position:relative;background:var(--bg-elev);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;transition:transform .18s ease,box-shadow .18s ease,border-color .18s ease}
 @media(hover:hover){.card:hover{transform:translateY(-3px);box-shadow:var(--shadow);border-color:var(--accent)}}
 .preview-button{display:block;width:100%;padding:0;border:0;border-radius:0;background:transparent;cursor:zoom-in}
-.card img{width:100%;display:block;max-height:82vh;object-fit:contain;background:#080a0f}
+.card img{width:100%;display:block;max-height:82vh;object-fit:contain;background:#05060a;color:transparent;font-size:0}
+.card.is-loading img,.card img:not([src]),.card img[src=""]{min-height:180px;visibility:hidden}
+.card.is-loading .card-tags{display:none}
 .image-error{display:grid;min-height:180px;place-items:center;gap:8px;padding:24px;text-align:center;color:var(--muted)}
 .image-error button{justify-self:center}
 #empty{padding:48px 20px;text-align:center;color:var(--muted)}
@@ -1614,11 +1642,11 @@ dialog::backdrop{background:#000c}
 .lightbox-caption,.lightbox-directory{margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .lightbox-directory{color:var(--muted);font-size:13px}
 .modal-backdrop{position:fixed;z-index:4;inset:0;background:#0008}
-#announcement-backdrop,#help-backdrop{position:fixed!important;z-index:1000!important;inset:0!important;background:#10131a!important;opacity:1!important;pointer-events:auto!important;animation:backdrop-in .25s ease both}
-.announcement,.help-panel{z-index:1001!important;pointer-events:auto!important}
-body.announcement-open,body.help-open{overflow:hidden}
-body.announcement-open>header,body.announcement-open>main,body.announcement-open>#maintenance,body.help-open>header,body.help-open>main,body.help-open>#maintenance{pointer-events:none!important;user-select:none}
-body.announcement-open>#announcement-backdrop,body.announcement-open>#announcement,body.help-open>#help-backdrop,body.help-open>#help{display:block!important;visibility:visible!important}
+#announcement-backdrop{position:fixed!important;z-index:1000!important;inset:0!important;background:#10131a!important;opacity:1!important;pointer-events:auto!important;animation:backdrop-in .25s ease both}
+.announcement{z-index:1001!important;pointer-events:auto!important}
+body.announcement-open{overflow:hidden}
+body.announcement-open>header,body.announcement-open>main,body.announcement-open>#maintenance{pointer-events:none!important;user-select:none}
+body.announcement-open>#announcement-backdrop,body.announcement-open>#announcement{display:block!important;visibility:visible!important}
 .preferences{
   position:fixed;z-index:5;top:50%;left:50%;width:min(92vw,460px);max-height:86vh;overflow:auto;
   padding:22px;border:1px solid var(--line);border-radius:18px;background:var(--bg-elev);color:var(--text);
@@ -1633,12 +1661,12 @@ body.announcement-open>#announcement-backdrop,body.announcement-open>#announceme
 .preferences .check{display:flex;align-items:center;gap:8px;margin:12px 0}
 .preferences .check input{width:auto;margin:0}
 .preferences-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px;flex-wrap:wrap}
-.announcement,.help-panel{position:fixed;z-index:5;top:50%;left:50%;width:min(94vw,680px);max-height:min(78vh,680px);height:auto;padding:0;border:0;border-radius:22px;background:linear-gradient(145deg,#fffdf8 0%,#fff 54%,#fff0e3 100%);color:#282828;box-shadow:0 1.5rem 3rem rgba(0,0,0,.38);overflow:hidden;transform:translate(-50%,-50%);animation:announcement-in .32s cubic-bezier(.2,.8,.2,1) both;display:flex;flex-direction:column}
-.announcement.is-closing,.help-panel.is-closing{animation:announcement-out .22s ease-in both}
+.announcement{position:fixed;z-index:5;top:50%;left:50%;width:min(94vw,680px);max-height:min(78vh,680px);height:auto;padding:0;border:0;border-radius:22px;background:linear-gradient(145deg,#fffdf8 0%,#fff 54%,#fff0e3 100%);color:#282828;box-shadow:0 1.5rem 3rem rgba(0,0,0,.38);overflow:hidden;transform:translate(-50%,-50%);animation:announcement-in .32s cubic-bezier(.2,.8,.2,1) both;display:flex;flex-direction:column}
+.announcement.is-closing{animation:announcement-out .22s ease-in both}
 @keyframes backdrop-in{from{opacity:0}to{opacity:1}}
 @keyframes announcement-in{from{opacity:0;transform:translate(-50%,-46%) scale(.96)}to{opacity:1;transform:translate(-50%,-50%) scale(1)}}
 @keyframes announcement-out{from{opacity:1;transform:translate(-50%,-50%) scale(1)}to{opacity:0;transform:translate(-50%,-46%) scale(.97)}}
-.announcement-main,.help-main{padding:26px 30px 12px;display:flex;min-height:0;flex:1;flex-direction:column}
+.announcement-main{padding:26px 30px 12px;display:flex;min-height:0;flex:1;flex-direction:column}
 .announcement-title{position:relative;z-index:0;display:inline-block;margin:0 0 18px;font-size:21px}
 .announcement-title::after{content:'';position:absolute;z-index:-1;right:-3px;bottom:2px;left:-3px;height:14px;border-radius:4px;background:#fbeecd;transform:skewX(-15deg)}
 .announcement-content{margin:0;line-height:1.7;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding-right:8px}
@@ -1647,8 +1675,6 @@ body.announcement-open>#announcement-backdrop,body.announcement-open>#announceme
 .announcement-content code{padding:2px 5px;border-radius:4px;background:#f3f5f7}
 .announcement-content pre{overflow:auto;padding:12px;border-radius:8px;background:#f3f5f7}
 .announcement-content pre code{padding:0}
-.help-panel{height:min(78vh,680px)}
-.help-main .announcement-content{flex:1;min-height:0;overflow-y:auto}
 .announcement-content a{color:#b63813}
 .announcement-actions{display:flex;justify-content:center;gap:10px;flex-wrap:wrap}
 .announcement-footer{padding:12px 30px 28px;text-align:center;background:linear-gradient(170deg,#fff 0%,#fff 38%,#fbeecd 100%);flex:0 0 auto}
@@ -1667,13 +1693,13 @@ body.announcement-open>#announcement{display:flex!important}
 .slide-thumbnail img{display:block;width:100%;height:100%;object-fit:cover}
 .slide-thumbnail.active{border-color:#fff;box-shadow:0 0 0 2px var(--accent)}
 .slide-thumbnail-index{position:absolute;right:3px;bottom:3px;min-width:19px;padding:1px 4px;border-radius:4px;background:#000b;color:#fff;font-size:11px}
-#theme-fab{position:fixed;right:max(16px,env(safe-area-inset-right));bottom:max(16px,env(safe-area-inset-bottom));z-index:60;width:48px;height:48px;padding:0;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:20px;background:var(--bg-elev);border:1px solid var(--line);color:var(--text);cursor:pointer;box-shadow:var(--shadow)}
+#theme-fab{position:fixed;right:max(16px,env(safe-area-inset-right));bottom:max(16px,env(safe-area-inset-bottom));z-index:60;width:48px;height:48px;padding:0;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:22px;background:var(--bg-elev);border:1px solid var(--line);color:var(--text);cursor:pointer;box-shadow:var(--shadow)}
 #theme-fab:hover{transform:translateY(-2px);border-color:var(--accent)}
 body.has-slide-history #theme-fab{bottom:calc(124px + env(safe-area-inset-bottom))}
 .slide-nav{position:fixed;z-index:3;display:flex;align-items:center;justify-content:center;padding:0;border:1px solid var(--line);background:color-mix(in srgb,var(--bg) 78%,transparent);color:var(--text);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);cursor:pointer}
 .slide-nav.prev{left:10px;top:50%;width:42px;height:64px;font-size:30px;border-radius:12px;transform:translateY(-50%)}
 .slide-nav.next{right:10px;top:50%;width:42px;height:64px;font-size:30px;border-radius:12px;transform:translateY(-50%)}
-.slide-nav.pause{left:50%;bottom:max(20px,env(safe-area-inset-bottom));width:46px;height:46px;font-size:16px;border-radius:50%;transform:translateX(-50%)}
+.slide-nav.pause{left:50%;bottom:max(20px,env(safe-area-inset-bottom));min-width:64px;height:36px;padding:0 12px;font-size:13px;border-radius:18px;transform:translateX(-50%)}
 body.has-slide-history .slide-nav.pause{bottom:calc(124px + env(safe-area-inset-bottom))}
 .tag-bar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:8px 16px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,rgba(0,0,0,.78) 0%,rgba(0,0,0,.38) 48%,rgba(0,0,0,.78) 100%);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
 .tag-bar-label{color:var(--muted);font-size:13px;margin-right:4px}
@@ -1692,6 +1718,7 @@ body.has-slide-history .slide-nav.pause{bottom:calc(124px + env(safe-area-inset-
 ::-webkit-scrollbar{width:9px;height:9px}::-webkit-scrollbar-thumb{background:var(--line);border-radius:6px}::-webkit-scrollbar-track{background:transparent}
 body.theme-light{color-scheme:light;--bg:#f3f5f8;--bg-elev:#fff;--bg-soft:#eef1f6;--line:#d5dbe6;--text:#1a2230;--muted:#667085;--accent:#2d6cf0;--accent-hover:#1f5ee0;--shadow:0 14px 32px rgba(30,40,60,.12)}
 body.theme-light .card img,body.theme-light .lightbox-stage,body.theme-light .slide-thumbnail{background:#e8edf5}
+body:not(.theme-light)::after{content:'';position:fixed;inset:0;z-index:10000;pointer-events:none;background:rgba(0,0,0,.32)}
 @media(max-width:760px){
   header{padding:8px 12px}
   .header-actions{display:none}
@@ -1720,10 +1747,10 @@ body.theme-light .card img,body.theme-light .lightbox-stage,body.theme-light .sl
   .lightbox-meta{flex:1 1 100%}
   .slide-nav.prev{left:6px;width:36px;height:56px;font-size:26px}
   .slide-nav.next{right:6px;width:36px;height:56px;font-size:26px}
-  .announcement,.help-panel{width:92vw;max-height:68vh;border-radius:14px}
-  .announcement-main,.help-main{padding:16px 18px 8px}
-  .announcement-title,.help-title{font-size:18px}
-  .announcement-footer,.help-footer{padding:8px 18px 14px}
+  .announcement{width:92vw;max-height:68vh;border-radius:14px}
+  .announcement-main{padding:16px 18px 8px}
+  .announcement-title{font-size:18px}
+  .announcement-footer{padding:8px 18px 14px}
 }
 @media(max-width:400px){.preferences-grid{grid-template-columns:1fr}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
@@ -1738,11 +1765,10 @@ body.theme-light .card img,body.theme-light .lightbox-stage,body.theme-light .sl
     <button id="next" class="hidden ghost" type="button">下一张</button>
     <button id="refresh" class="ghost" type="button">刷新</button>
     <button id="settings" type="button">设置</button>
-    <button id="announcement-button" class="hidden ghost" type="button">📣 公告</button>
-    <button id="help-button" class="ghost" type="button">❔ 帮助</button>
+    <button id="announcement-button" class="hidden ghost" type="button">公告</button>
     <a href="/admin" class="button ghost">管理</a>
   </nav>
-  <button id="header-menu-toggle" type="button" aria-label="菜单" aria-expanded="false">☰</button>
+  <button id="header-menu-toggle" type="button" aria-label="菜单" aria-expanded="false">菜单</button>
 </header>
 <div id="header-menu-backdrop"></div>
 <aside id="header-menu" class="header-menu" aria-label="快捷菜单">
@@ -1751,15 +1777,14 @@ body.theme-light .card img,body.theme-light .lightbox-stage,body.theme-light .sl
   <button id="menu-next" class="hidden ghost" type="button">下一张</button>
   <button id="menu-refresh" class="ghost" type="button">刷新</button>
   <button id="menu-settings" type="button">设置</button>
-  <button id="menu-announcement" class="hidden ghost" type="button">📣 公告</button>
-  <button id="menu-help" class="ghost" type="button">❔ 帮助</button>
+  <button id="menu-announcement" class="hidden ghost" type="button">公告</button>
   <a href="/admin" class="button ghost">管理</a>
 </aside>
 <div id="tag-bar" class="tag-bar hidden"></div>
 <main id="gallery" class="gallery" aria-busy="true"></main>
 <button id="slide-nav-prev" class="slide-nav prev hidden" type="button" aria-label="上一张">‹</button>
 <button id="slide-nav-next" class="slide-nav next hidden" type="button" aria-label="下一张">›</button>
-<button id="slide-nav-pause" class="slide-nav pause hidden" type="button" aria-label="暂停播放">⏸</button>
+<button id="slide-nav-pause" class="slide-nav pause hidden" type="button" aria-label="暂停播放">暂停</button>
 <section id="slide-history" class="slide-history hidden" aria-label="播放历史"><div class="slide-history-head"><span class="slide-history-title">播放历史</span><button id="slide-history-latest" class="slide-history-latest ghost" type="button">跳到最新</button></div><div id="slide-history-track" class="slide-history-track"></div></section>
 <section id="maintenance" class="maintenance hidden"><h1>维护中</h1><p>图片浏览暂时不可用，请稍后再试。</p><details><summary>管理员查看图片</summary><label>管理密钥<input id="maintenance-token" type="password" autocomplete="current-password"></label><button id="maintenance-unlock" type="button">查看图片</button><p id="maintenance-message" class="meta"></p></details></section>
 <dialog id="lightbox" aria-labelledby="lightbox-caption">
@@ -1800,11 +1825,6 @@ body.theme-light .card img,body.theme-light .lightbox-stage,body.theme-light .sl
   <div class="announcement-main"><h2 id="announcement-title" class="announcement-title"></h2><div id="announcement-content" class="announcement-content"></div></div>
   <div class="announcement-footer"><p id="announcement-reading" class="meta"></p><div class="announcement-actions"><button id="announcement-close-once" type="button">本次关闭</button><button id="announcement-close-forever" type="button">不再显示</button></div></div>
 </section>
-<div id="help-backdrop" class="modal-backdrop hidden"></div>
-<section id="help" class="help-panel hidden" role="dialog" aria-modal="true" aria-labelledby="help-title" tabindex="-1">
-  <div class="help-main"><h2 id="help-title" class="help-title">❔ 使用帮助</h2><div id="help-content" class="announcement-content"></div></div>
-  <div class="help-footer"><div class="announcement-actions"><button id="help-close" type="button">知道了</button></div></div>
-</section>
 <button id="theme-fab" type="button" title="切换明暗主题" aria-label="切换明暗主题">🌙</button>
 <script>
 const PREFERENCE_KEY='openlist-image-preferences-v2';
@@ -1818,7 +1838,6 @@ const slideshowToggle=document.querySelector('#slideshow-toggle');
 const refreshButton=document.querySelector('#refresh');
 const settingsButton=document.querySelector('#settings');
 const announcementButton=document.querySelector('#announcement-button');
-const helpButton=document.querySelector('#help-button');
 const maintenance=document.querySelector('#maintenance');
 const maintenanceToken=document.querySelector('#maintenance-token');
 const maintenanceMessage=document.querySelector('#maintenance-message');
@@ -1843,10 +1862,6 @@ const announcementContent=document.querySelector('#announcement-content');
 const announcementReading=document.querySelector('#announcement-reading');
 const announcementCloseOnce=document.querySelector('#announcement-close-once');
 const announcementCloseForever=document.querySelector('#announcement-close-forever');
-const helpPanel=document.querySelector('#help');
-const helpBackdrop=document.querySelector('#help-backdrop');
-const helpContent=document.querySelector('#help-content');
-const helpClose=document.querySelector('#help-close');
 const lightbox=document.querySelector('#lightbox');
 const lightboxStage=document.querySelector('#lightbox-stage');
 const lightboxImage=document.querySelector('#lightbox-image');
@@ -1863,7 +1878,6 @@ let maintenanceAccessToken='';
 let activeImage=null;
 let lightboxReturnFocus=null;
 let announcementTimer=null;
-let helpReturnFocus=null;
 let slideImages=[];
 let slideIndex=0;
 let slideLoadPromise=null;
@@ -2023,47 +2037,6 @@ function showAnnouncement(force=false){
   announcementBackdrop.classList.remove('hidden');
   setAnnouncementCountdown(force?0:announcement.required_seconds,key);
   const first=focusableWithin(announcementPanel)[0];
-  if(first) first.focus();
-}
-
-const HELP_MARKDOWN=`## 📖 快速开始
-- **幻灯片**：按左右按钮、键盘方向键或手机左右滑动切换图片。
-- **瀑布流**：滚动浏览更多图片，接近页面底部时会自动加载下一批。
-- **刷新**：重新获取图片列表；筛选条件会继续保留。
-
-## 🖼️ 图片查看
-点击图片打开灯箱，可使用 **放大**、**缩小**、**复位** 和旋转按钮，也支持滚轮、双指缩放和拖拽。灯箱中的“下载”会获取当前图片原图或所选画质。
-
-## ⚙️ 显示设置
-“设置”只保存在当前浏览器：
-- 选择幻灯片或瀑布流，并调整自动播放间隔、图片名称显示方式和列表画质。
-- 手机瀑布流可选择 **单列** 或 **双列**；桌面端会按屏幕宽度使用两列或三列。
-- 标签功能启用后，可以选择任意匹配或全部匹配，并在图片上显示标签。
-- 页面右下角按钮可快速切换明暗主题。
-
-## 🏷️ 标签与筛选
-启用标签后，点击标签栏即可筛选图片；再次点击可取消，使用“清除筛选”恢复全部图片。图片上的点赞、分类和垃圾桶操作取决于管理员开启的权限。
-
-## 🔐 维护与管理
-维护模式下普通访客会看到维护提示。管理员可在提示框中输入管理密钥临时查看图片。管理页用于配置目录展示、公告、维护模式和标签策略；图片索引需要管理员主动重建。
-
-## ℹ️ 小提示
-图片加载速度会受到 OpenList 缩略图生成、网络和所选画质影响。列表预览建议从较低画质开始，需要查看细节时再打开灯箱。`;
-
-function closeHelp(){
-  helpPanel.classList.add('is-closing');
-  setTimeout(()=>{helpPanel.classList.add('hidden');helpPanel.classList.remove('is-closing');helpBackdrop.classList.add('hidden');document.body.classList.remove('help-open');if(helpReturnFocus&&helpReturnFocus.focus)helpReturnFocus.focus();helpReturnFocus=null;scheduleSlideshow();},220);
-}
-
-function showHelp(){
-  clearSlideTimer();
-  helpReturnFocus=document.activeElement;
-  helpContent.innerHTML='<p>'+renderMarkdown(HELP_MARKDOWN)+'</p>';
-  document.body.classList.add('help-open');
-  helpPanel.classList.remove('hidden');
-  helpPanel.classList.remove('is-closing');
-  helpBackdrop.classList.remove('hidden');
-  const first=focusableWithin(helpPanel)[0];
   if(first) first.focus();
 }
 
@@ -2364,7 +2337,7 @@ function openLightbox(image){
 
 function createCard(image,eager=false){
   const card=document.createElement('article');
-  card.className='card';
+  card.className='card is-loading';
   card.dataset.sequence=String(cardSequence++);
   card.dataset.path=image.path||'';
   const preview=document.createElement('button');
@@ -2377,9 +2350,12 @@ function createCard(image,eager=false){
   picture.loading=eager?'eager':'lazy';
   picture.decoding='async';
   if(eager) picture.fetchPriority='high';
-  picture.alt=accessibleName;
+  picture.alt='';
   attachImageRecovery(picture,image);
+  const markCardReady=()=>{card.classList.remove('is-loading');picture.alt=accessibleName;};
+  picture.addEventListener('load',markCardReady);
   const showCardError=()=>{
+    card.classList.remove('is-loading');
     picture.classList.add('hidden');
     let error=card.querySelector('.image-error');
     if(!error){
@@ -2391,7 +2367,7 @@ function createCard(image,eager=false){
       retry.className='ghost';
       retry.type='button';
       retry.textContent='重试';
-      retry.onclick=event=>{event.stopPropagation();error.remove();picture.classList.remove('hidden');delete picture.dataset.srcApplied;queueImageResolve(image,{force:true,preview:true,priority:0}).then(()=>{picture.src=cardSrc(image);}).catch(showCardError);};
+      retry.onclick=event=>{event.stopPropagation();error.remove();picture.classList.remove('hidden');card.classList.add('is-loading');picture.alt='';delete picture.dataset.srcApplied;queueImageResolve(image,{force:true,preview:true,priority:0}).then(()=>{picture.src=cardSrc(image);}).catch(showCardError);};
       error.append(message,retry);
       card.append(error);
     }
@@ -2681,7 +2657,7 @@ function updateSlideshowToggle(){
   const menuToggle=document.querySelector('#menu-slideshow-toggle');
   if(menuToggle){menuToggle.textContent=slideshowPaused?'继续':'暂停';menuToggle.setAttribute('aria-pressed',String(slideshowPaused));}
   const navPause=document.querySelector('#slide-nav-pause');
-  if(navPause){navPause.textContent=slideshowPaused?'▶':'⏸';navPause.setAttribute('aria-label',slideshowPaused?'继续播放':'暂停播放');}
+  if(navPause){navPause.textContent=slideshowPaused?'播放':'暂停';navPause.setAttribute('aria-label',slideshowPaused?'继续播放':'暂停播放');}
 }
 
 function setSlideshowPaused(paused){
@@ -3058,15 +3034,10 @@ document.querySelector('#menu-slideshow-toggle').onclick=()=>{closeHeaderMenu();
 document.querySelector('#menu-refresh').onclick=()=>{closeHeaderMenu();render().catch(showError);};
 document.querySelector('#menu-settings').onclick=()=>{closeHeaderMenu();openPreferences();};
 document.querySelector('#menu-announcement').onclick=()=>{closeHeaderMenu();showAnnouncement(true);};
-helpButton.onclick=showHelp;
-helpClose.onclick=closeHelp;
-helpBackdrop.onclick=closeHelp;
-document.querySelector('#menu-help').onclick=()=>{closeHeaderMenu();showHelp();};
 document.querySelector('#maintenance-unlock').onclick=async()=>{const token=maintenanceToken.value.trim();if(!token){maintenanceMessage.textContent='请输入管理密钥。';return;}maintenanceMessage.textContent='正在验证…';const response=await fetch('/api/admin/config',{headers:{'X-OpenList-Admin-Token':token},cache:'no-store'});if(!response.ok){maintenanceMessage.textContent='管理密钥无效。';return;}maintenanceAccessToken=token;maintenanceMessage.textContent='';render().catch(showError);};
 lightboxDownload.onclick=()=>downloadImage().catch(showError);
 document.querySelector('#preferences-save').onclick=()=>{settings.view_layout=layoutMode.value;settings.slideshow_interval=Math.max(0,Math.min(300,Number(slideshowInterval.value)||0));settings.mobile_waterfall_columns=['1','2'].includes(mobileWaterfallColumns.value)?mobileWaterfallColumns.value:'1';settings.caption_mode=captionMode.value;settings.show_tags_enabled=showTagsEnabled.checked;settings.filter_mode=filterMode.value;settings.preview_quality=previewQuality.value;settings.lightbox_quality=lightboxQuality.value;persistPreferences();location.reload();};
 document.querySelector('#preferences-reset').onclick=()=>{localStorage.removeItem(PREFERENCE_KEY);location.reload();};
-helpClose.setAttribute('aria-label','关闭帮助');
 themeFab.onclick=()=>{if(!settings)return;settings.theme=settings.theme==='light'?'dark':'light';applyGalleryTheme(settings.theme);persistPreferences();};
 document.querySelector('#preferences-close').onclick=closePreferences;
 preferencesBackdrop.onclick=closePreferences;
@@ -3115,10 +3086,8 @@ lightboxStage.addEventListener('pointerup',finishPointer);
 lightboxStage.addEventListener('pointercancel',finishPointer);
 window.addEventListener('keydown',event=>{
   if(event.key==='Escape'&&!preferencesPanel.classList.contains('hidden')){closePreferences();return;}
-  if(event.key==='Escape'&&!helpPanel.classList.contains('hidden')){closeHelp();return;}
   if(event.key==='Escape'&&headerMenu.classList.contains('open')){closeHeaderMenu(true);return;}
   if(!preferencesPanel.classList.contains('hidden')){trapFocus(preferencesPanel,event);return;}
-  if(!helpPanel.classList.contains('hidden')){trapFocus(helpPanel,event);return;}
   if(headerMenu.classList.contains('open')){if(event.key==='Escape')closeHeaderMenu(true);else trapFocus(headerMenu,event);return;}
   if(!lightbox.open) return;
   if(event.key==='Escape') lightbox.close();
@@ -3166,7 +3135,7 @@ def admin_html() -> str:
 <style>
 :root{
   color-scheme:dark;
-  --bg:#0f1115;--bg-elev:#171b22;--bg-soft:#1d232d;--line:#2a3140;--text:#e8edf5;--muted:#8b97ab;--accent:#3d8bfd;--accent-hover:#5aa0ff;--danger:#ff5d6c;--radius:14px;--shadow:0 16px 40px rgba(0,0,0,.38);
+  --bg:#07080c;--bg-elev:#0e1218;--bg-soft:#141922;--line:#1f2633;--text:#d7deea;--muted:#7b879b;--accent:#3d8bfd;--accent-hover:#5aa0ff;--danger:#ff5d6c;--radius:14px;--shadow:0 16px 40px rgba(0,0,0,.5);
   --font:"Segoe UI",system-ui,-apple-system,"PingFang SC","Noto Sans SC",sans-serif;
 }
 *{box-sizing:border-box}
@@ -3198,10 +3167,11 @@ button.danger{background:transparent;color:var(--danger);border:1px solid color-
 .check input{width:auto}
 .markdown-preview{min-height:80px;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);line-height:1.65}
 .hidden{display:none}
-.trash-list{display:flex;flex-direction:column;gap:4px;margin-top:10px;max-height:400px;overflow-y:auto}
-.trash-item{display:flex;align-items:center;gap:8px;padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg)}
-.trash-item input[type=checkbox]{width:auto}
-.trash-item .trash-path{flex:1;word-break:break-all;font-size:13px}
+.trash-list{display:flex;flex-direction:column;gap:8px;margin-top:10px;max-height:520px;overflow-y:auto}
+.trash-item{display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg)}
+.trash-item input[type=checkbox]{width:auto;flex:0 0 auto}
+.trash-thumb{width:72px;height:72px;flex:0 0 auto;object-fit:cover;border-radius:8px;background:#05060a;display:block}
+.trash-item .trash-path{flex:1;min-width:0;word-break:break-all;font-size:13px}
 a{color:#b7d1ff}
 .tabs-nav{display:flex;gap:6px;overflow-x:auto;padding-bottom:2px;margin:-4px 0 16px;border-bottom:1px solid var(--line);scrollbar-width:thin}
 .tab-button{padding:10px 14px;background:transparent;color:var(--muted);border:0;border-radius:10px 10px 0 0;white-space:nowrap}
@@ -3217,10 +3187,11 @@ a{color:#b7d1ff}
 .tree-label{flex:1;word-break:break-all}
 .tree-children{margin-left:22px;display:none}
 .tree-node.open>.tree-children{display:block}
-.theme-toggle{position:fixed;bottom:max(18px,env(safe-area-inset-bottom));right:max(18px,env(safe-area-inset-right));z-index:60;width:48px;height:48px;padding:0;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:20px;box-shadow:var(--shadow)}
+.theme-toggle{position:fixed;bottom:max(18px,env(safe-area-inset-bottom));right:max(18px,env(safe-area-inset-right));z-index:60;width:48px;height:48px;padding:0;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:22px;box-shadow:var(--shadow)}
 .sticky-save{position:sticky;bottom:0;padding-top:14px;margin-top:18px;background:linear-gradient(transparent,var(--bg) 28%)}
 body.theme-light{color-scheme:light;--bg:#f3f5f8;--bg-elev:#fff;--bg-soft:#eef1f6;--line:#d5dbe6;--text:#1a2230;--muted:#667085;--accent:#2d6cf0;--accent-hover:#1f5ee0;--shadow:0 14px 32px rgba(30,40,60,.12)}
 body.theme-light a{color:#2d6cf0}
+body:not(.theme-light)::after{content:'';position:fixed;inset:0;z-index:10000;pointer-events:none;background:rgba(0,0,0,.32)}
 @media(max-width:640px){
   .wrap{padding:14px 12px 88px}
   .admin-head{align-items:flex-start;flex-direction:column}
@@ -3283,9 +3254,6 @@ body.theme-light a{color:#2d6cf0}
     <div id="announcement-preview" class="markdown-preview"></div>
     <label>强制阅读秒数<input id="announcement-required-seconds" type="number" min="0" max="3600" step="1"></label>
     <p class="note">修改标题、内容、开关或秒数都会生成新公告版本。</p>
-    <h3>维护模式</h3>
-    <label class="check"><input id="maintenance-enabled" type="checkbox">启用维护模式</label>
-    <p class="note">开启后主界面只显示“维护中”，管理员可用令牌临时解锁。</p>
   </div>
 
   <div id="tab-tags" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-tags">
@@ -3301,7 +3269,7 @@ body.theme-light a{color:#2d6cf0}
     </div>
     <div id="tagging-stats-result" class="markdown-preview"></div>
     <h3>垃圾桶</h3>
-    <p class="note">删除会从 OpenList 永久去掉原图，不可撤销。</p>
+    <p class="note">删除会从 OpenList 永久去掉原图，不可撤销。列表会加载缩略图预览。</p>
     <div class="actions">
       <button id="trash-load" class="secondary" type="button">刷新列表</button>
       <button id="trash-delete-selected" class="danger" type="button">删除选中</button>
@@ -3312,11 +3280,16 @@ body.theme-light a{color:#2d6cf0}
   </div>
 
   <div id="tab-tools" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-tools">
-    <h2>索引、备份与日志</h2>
+    <h2>维护模式 / 索引 / 备份</h2>
+    <h3>维护模式</h3>
+    <label class="check"><input id="maintenance-enabled" type="checkbox">启用维护模式</label>
+    <p class="note">开启后主界面只显示“维护中”，管理员可用令牌临时解锁。</p>
     <label>日志级别<select id="log-level"><option value="DEBUG">DEBUG</option><option value="INFO">INFO</option><option value="WARNING">WARNING</option><option value="ERROR">ERROR</option></select></label>
-    <div class="actions"><button id="log-view" class="secondary" type="button">查看最近日志</button></div>
-    <pre id="log-view-result" class="markdown-preview" style="max-height:300px;overflow:auto;font-size:12px;white-space:pre-wrap;word-break:break-all"></pre>
-    <div class="actions"><button id="rebuild" type="button">后台重建图片索引</button><button id="backup" class="secondary" type="button">下载配置备份</button></div>
+    <h3>图片索引</h3>
+    <p id="rebuild-status" class="note" aria-live="polite">无数据</p>
+    <div class="actions"><button id="rebuild" type="button">后台重建图片索引</button></div>
+    <h3>配置备份</h3>
+    <div class="actions"><button id="backup" class="secondary" type="button">下载配置备份</button></div>
     <label>上传备份（ZIP）<input id="backup-file" type="file" accept=".zip,application/zip"></label>
     <div class="actions"><button id="restore-backup" class="secondary" type="button">恢复备份</button></div>
     <p class="note">恢复只覆盖本页可编辑项，不含管理密钥和 OpenList 令牌。</p>
@@ -3327,14 +3300,16 @@ body.theme-light a{color:#2d6cf0}
 <script>
 let config=null;
 let rebuildTimer=null;
+let rebuildJustFinished=false;
 const adminStatus=document.querySelector('#admin-status');
+const rebuildStatus=document.querySelector('#rebuild-status');
 function setAdminStatus(text){adminStatus.textContent=text;adminStatus.classList.toggle('hidden',!text);}
 function auth(){return {'Content-Type':'application/json','X-OpenList-Admin-Token':document.querySelector('#token').value};}
 function showSelected(){const root=document.querySelector('#selected');root.replaceChildren(...config.directories.map(path=>{const item=document.createElement('div');item.className='selected-item';const text=document.createElement('span');text.textContent=path;const remove=document.createElement('button');remove.className='secondary';remove.type='button';remove.textContent='移除';remove.onclick=()=>{config.directories=config.directories.filter(value=>value!==path);showSelected();};item.append(text,remove);return item;}));}
 function escapeHtml(value){return value.replace(/[&<>"']/g,character=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));}
 function renderMarkdown(value){return escapeHtml(value).replace(/&lt;font\s+color=(?:&quot;|&#39;)?(#[0-9a-f]{3,8}|[a-z]+)(?:&quot;|&#39;)?\s*&gt;/gi,'<span style="color:$1">').replace(/&lt;\/font&gt;/gi,'</span>').replace(/```([\s\S]*?)```/g,'<pre><code>$1</code></pre>').replace(/^### (.*)$/gm,'<h3>$1</h3>').replace(/^## (.*)$/gm,'<h2>$1</h2>').replace(/^# (.*)$/gm,'<h1>$1</h1>').replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>').replace(/\*([^*]+)\*/g,'<em>$1</em>').replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>').replace(/\n\n/g,'</p><p>').replace(/\n/g,'<br>');}
 function previewAnnouncement(){document.querySelector('#announcement-preview').innerHTML='<p>'+renderMarkdown(document.querySelector('#announcement-content').value)+'</p>';}
-function showAdmin(){document.querySelector('#default-caption').value=config.caption_mode;document.querySelector('#directory-display-enabled').checked=config.directory_display_enabled;document.querySelector('#directory-display-depth').value=config.directory_display_depth;document.querySelector('#theme').value=config.theme||'dark';document.querySelector('#announcement-enabled').checked=config.announcement_enabled;document.querySelector('#announcement-title').value=config.announcement_title;document.querySelector('#announcement-content').value=config.announcement_content;document.querySelector('#announcement-required-seconds').value=config.announcement_required_seconds;document.querySelector('#maintenance-enabled').checked=config.maintenance_enabled;document.querySelector('#tagging-enabled').checked=config.tagging_enabled||false;document.querySelector('#tagging-scope').value=config.tagging_scope||'disabled';document.querySelector('#tagging-categories').value=(config.tagging_categories||[]).join('\n');document.querySelector('#filter-enabled').checked=config.filter_enabled!==false;document.querySelector('#log-level').value=config.log_level||'INFO';document.querySelector('#protected').classList.remove('hidden');showSelected();previewAnnouncement();}
+function showAdmin(){document.querySelector('#default-caption').value=config.caption_mode;document.querySelector('#directory-display-enabled').checked=config.directory_display_enabled;document.querySelector('#directory-display-depth').value=config.directory_display_depth;document.querySelector('#theme').value=config.theme||'dark';document.querySelector('#announcement-enabled').checked=config.announcement_enabled;document.querySelector('#announcement-title').value=config.announcement_title;document.querySelector('#announcement-content').value=config.announcement_content;document.querySelector('#announcement-required-seconds').value=config.announcement_required_seconds;document.querySelector('#maintenance-enabled').checked=config.maintenance_enabled;document.querySelector('#tagging-enabled').checked=config.tagging_enabled||false;document.querySelector('#tagging-scope').value=config.tagging_scope||'disabled';document.querySelector('#tagging-categories').value=(config.tagging_categories||[]).join('\n');document.querySelector('#filter-enabled').checked=config.filter_enabled!==false;document.querySelector('#log-level').value=config.log_level||'INFO';document.querySelector('#protected').classList.remove('hidden');showSelected();previewAnnouncement();refreshRebuildStatus().catch(report);}
 async function errorText(response,fallback){try{const data=await response.json();return data.error||fallback;}catch(error){return fallback;}}
 async function load(){const response=await fetch('/api/admin/config',{headers:auth(),cache:'no-store'});if(!response.ok)throw new Error(await errorText(response,'令牌无效或服务不可用'));config=await response.json();showAdmin();setAdminStatus('服务器配置已加载');}
 function addDirectory(path){if(!config.directories.includes(path)){config.directories.push(path);showSelected();setAdminStatus('已添加目录：'+path+'，请保存服务器配置');}}
@@ -3351,7 +3326,7 @@ function buildTreeNode(name,path,isDir,hasChildren){
     toggle.setAttribute('aria-label','展开 '+name);
     toggle.setAttribute('aria-expanded','false');
     if(hasChildren===false){toggle.textContent='';toggle.classList.add('tree-leaf');toggle.disabled=true;}
-    else{toggle.textContent='▶';}
+    else{toggle.textContent='+';}
     const check=document.createElement('input');
     check.type='checkbox';
     check.className='tree-check';
@@ -3367,7 +3342,7 @@ function buildTreeNode(name,path,isDir,hasChildren){
       if(hasChildren===false)return;
       node.classList.toggle('open');
       const expanded=node.classList.contains('open');
-      toggle.textContent=expanded?'▼':'▶';
+      toggle.textContent=expanded?'-':'+';
       toggle.setAttribute('aria-expanded',String(expanded));
       if(expanded&&!node.querySelector('.tree-children').children.length){
         loadTreeChildren(path,node).catch(error=>{node.querySelector('.tree-children').innerHTML='<p class="note">加载失败，请折叠后重试。</p>';report(error);});
@@ -3413,16 +3388,63 @@ async function browse(){
   const node=buildTreeNode(path||'/',path||'/',true,data.directories.length>0);
   node.classList.add('open');
   const toggle=node.querySelector('.tree-toggle');
-  if(toggle&&!toggle.classList.contains('tree-leaf'))toggle.textContent='▼';
+  if(toggle&&!toggle.classList.contains('tree-leaf'))toggle.textContent='-';
   root.append(node);
   const container=node.querySelector('.tree-children');
   if(!data.directories.length){container.innerHTML='<p class="note">当前目录没有子目录。</p>';}
   else{data.directories.forEach(item=>{const child=buildTreeNode(item.name,item.path,true,item.has_children);container.append(child);});}
 }
 async function saveServer(){if(!config)throw new Error('请先加载服务器配置');const payload={directories:config.directories,caption_mode:document.querySelector('#default-caption').value,directory_display_enabled:document.querySelector('#directory-display-enabled').checked,directory_display_depth:Number(document.querySelector('#directory-display-depth').value),theme:document.querySelector('#theme').value,announcement_enabled:document.querySelector('#announcement-enabled').checked,announcement_title:document.querySelector('#announcement-title').value,announcement_content:document.querySelector('#announcement-content').value,announcement_required_seconds:Number(document.querySelector('#announcement-required-seconds').value),maintenance_enabled:document.querySelector('#maintenance-enabled').checked,tagging_enabled:document.querySelector('#tagging-enabled').checked,tagging_scope:document.querySelector('#tagging-scope').value,tagging_categories:document.querySelector('#tagging-categories').value.split('\n').map(s=>s.trim()).filter(Boolean),filter_enabled:document.querySelector('#filter-enabled').checked,log_level:document.querySelector('#log-level').value};const response=await fetch('/api/admin/config',{method:'PUT',headers:auth(),body:JSON.stringify(payload)});if(!response.ok)throw new Error(await errorText(response,'保存失败'));config=await response.json();showAdmin();setAdminStatus('全局服务器配置已保存；公告修改后将向访客显示新版本。');}
-function formatSeconds(value){const seconds=Math.max(1,Math.round(Number(value)||0));return seconds<60?seconds+' 秒':Math.ceil(seconds/60)+' 分钟';}
-async function pollRebuild(doneMessage='索引后台重建完成'){const response=await fetch('/api/status',{cache:'no-store'});if(!response.ok)return;if((await response.json()).refreshing){rebuildTimer=setTimeout(()=>pollRebuild(doneMessage).catch(report),2000);}else{setAdminStatus(doneMessage);rebuildTimer=null;}}
-async function rebuild(){const statusResponse=await fetch('/api/status',{cache:'no-store'});const previous=statusResponse.ok?await statusResponse.json():{};const response=await fetch('/api/admin/rebuild',{method:'POST',headers:auth()});if(!response.ok)throw new Error(await errorText(response,'重建未启动'));const estimate=Number(previous.last_build_duration_seconds)||0;setAdminStatus('索引正在后台重建'+(estimate?'，预计约 '+formatSeconds(estimate):'，首次重建暂无预估时间'));clearTimeout(rebuildTimer);rebuildTimer=setTimeout(()=>pollRebuild().catch(report),2000);}
+function formatClock(value){const seconds=Math.max(0,Math.round(Number(value)||0));const minutes=String(Math.floor(seconds/60)).padStart(2,'0');const rest=String(seconds%60).padStart(2,'0');return minutes+':'+rest;}
+function formatIndexDate(unix){const date=new Date(Number(unix)*1000);if(!unix||Number.isNaN(date.getTime()))return '';const month=String(date.getMonth()+1).padStart(2,'0');const day=String(date.getDate()).padStart(2,'0');return month+'.'+day+' 数据';}
+function applyRebuildStatus(status){
+  if(!rebuildStatus)return;
+  if(status.refreshing){
+    rebuildJustFinished=false;
+    const elapsed=formatClock((status.index_progress&&status.index_progress.elapsed_seconds)||0);
+    const estimate=Number(status.last_build_duration_seconds)||0;
+    rebuildStatus.textContent=estimate?'重建中（预计需要 '+formatClock(estimate)+'，已重建 '+elapsed+'）':'重建中（已重建 '+elapsed+'）';
+    return;
+  }
+  if(rebuildJustFinished){
+    rebuildStatus.textContent='重建完毕';
+    return;
+  }
+  if(Number(status.image_count||0)<=0){
+    rebuildStatus.textContent='无数据';
+    return;
+  }
+  rebuildStatus.textContent=formatIndexDate(status.generated_at)||'无数据';
+}
+async function refreshRebuildStatus(){
+  const response=await fetch('/api/status',{cache:'no-store'});
+  if(!response.ok)return null;
+  const status=await response.json();
+  applyRebuildStatus(status);
+  if(status.refreshing&&!rebuildTimer){
+    rebuildTimer=setTimeout(()=>pollRebuild().catch(report),2000);
+  }
+  return status;
+}
+async function pollRebuild(doneMessage='索引后台重建完成'){
+  const status=await refreshRebuildStatus();
+  if(!status)return;
+  if(status.refreshing){
+    rebuildTimer=setTimeout(()=>pollRebuild(doneMessage).catch(report),2000);
+    return;
+  }
+  rebuildJustFinished=true;
+  applyRebuildStatus(status);
+  setAdminStatus(doneMessage);
+  rebuildTimer=null;
+  setTimeout(()=>{
+    if(rebuildJustFinished){
+      rebuildJustFinished=false;
+      refreshRebuildStatus().catch(report);
+    }
+  },2000);
+}
+async function rebuild(){const previous=await refreshRebuildStatus()||{};const response=await fetch('/api/admin/rebuild',{method:'POST',headers:auth()});if(!response.ok)throw new Error(await errorText(response,'重建未启动'));rebuildJustFinished=false;const estimate=Number(previous.last_build_duration_seconds)||0;setAdminStatus('索引正在后台重建'+(estimate?'，预计约 '+formatClock(estimate):'，首次重建暂无预估时间'));applyRebuildStatus({refreshing:true,last_build_duration_seconds:estimate,index_progress:{elapsed_seconds:0}});clearTimeout(rebuildTimer);rebuildTimer=setTimeout(()=>pollRebuild().catch(report),2000);}
 async function backup(){const response=await fetch('/api/admin/backup',{headers:auth()});if(!response.ok)throw new Error(await errorText(response,'备份下载失败'));const blob=await response.blob();const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download='openlist-image-api-backup.zip';link.click();setTimeout(()=>URL.revokeObjectURL(link.href),1000);setAdminStatus('配置备份已下载（不含 token）');}
 async function restoreBackup(){const file=document.querySelector('#backup-file').files[0];if(!file)throw new Error('请先选择 ZIP 备份文件');if(!window.confirm('确定恢复该备份中的可编辑配置吗？'))return;const response=await fetch('/api/admin/backup',{method:'POST',headers:{'X-OpenList-Admin-Token':document.querySelector('#token').value},body:file});if(!response.ok)throw new Error(await errorText(response,'备份恢复失败'));config=await response.json();showAdmin();setAdminStatus('备份配置已恢复，请按需保存或重建图片索引。');}
 function report(error){setAdminStatus('操作失败：'+error.message);}
@@ -3441,7 +3463,6 @@ document.querySelector('#rebuild').onclick=event=>runButtonAction(event.currentT
 document.querySelector('#backup').onclick=event=>runButtonAction(event.currentTarget,backup);
 document.querySelector('#restore-backup').onclick=event=>runButtonAction(event.currentTarget,restoreBackup);
 document.querySelector('#tagging-stats').onclick=event=>runButtonAction(event.currentTarget,loadTagStats);
-document.querySelector('#log-view').onclick=event=>runButtonAction(event.currentTarget,async()=>{setAdminStatus('正在加载日志…');const response=await fetch('/api/admin/logs?lines=100',{headers:auth(),cache:'no-store'});if(!response.ok)throw new Error(await errorText(response,'加载日志失败'));const data=await response.json();document.querySelector('#log-view-result').textContent=data.logs||'(无日志)';setAdminStatus('日志已加载');});
 document.querySelector('#tagging-reset-path').onclick=event=>runButtonAction(event.currentTarget,resetTagPath);
 document.querySelector('#tagging-reset-all').onclick=event=>runButtonAction(event.currentTarget,resetTagAll);
 document.querySelector('#trash-load').onclick=event=>runButtonAction(event.currentTarget,loadTrashList);
@@ -3450,7 +3471,7 @@ document.querySelector('#trash-delete-all').onclick=event=>runButtonAction(event
 async function loadTagStats(){const response=await fetch('/api/tagging/categories',{headers:auth(),cache:'no-store'});if(!response.ok)throw new Error(await errorText(response,'获取统计失败'));const data=await response.json();const result=document.querySelector('#tagging-stats-result');const cats=data.categories||{};const keys=Object.keys(cats);if(!keys.length){result.innerHTML='<p class="note">暂无标签数据。访客投票或打分类后，这里会显示统计。</p>';setAdminStatus('标签统计：暂无数据');return;}const items=keys.map(k=>'<li>'+escapeHtml(k)+'：'+cats[k]+' 张图片</li>').join('');result.innerHTML='<p>当前标签使用情况：</p><ul>'+items+'</ul>';setAdminStatus('标签统计已加载');}
 async function resetTagPath(){const path=prompt('请输入要清除标签的图片路径：');if(!path)return;const response=await fetch('/api/admin/tagging/reset?path='+encodeURIComponent(path),{method:'POST',headers:auth()});if(!response.ok)throw new Error(await errorText(response,'清除失败'));setAdminStatus('已清除 '+path+' 的标签数据');}
 async function resetTagAll(){if(!confirm('确定清除全部标签数据吗？此操作不可撤销！'))return;const response=await fetch('/api/admin/tagging/reset',{method:'POST',headers:auth()});if(!response.ok)throw new Error(await errorText(response,'清除失败'));setAdminStatus('全部标签数据已清除');}
-async function loadTrashList(){const response=await fetch('/api/admin/tagging/trash',{headers:auth(),cache:'no-store'});if(!response.ok)throw new Error(await errorText(response,'获取垃圾列表失败'));const data=await response.json();const list=document.querySelector('#trash-list');const paths=data.paths||[];if(!paths.length){list.innerHTML='<p class="note">暂无垃圾图片标记。</p>';setAdminStatus('垃圾列表：暂无数据');return;}list.replaceChildren();paths.forEach(p=>{const item=document.createElement('div');item.className='trash-item';const check=document.createElement('input');check.type='checkbox';check.value=p;const id='trash-'+Math.random().toString(36).slice(2);check.id=id;const label=document.createElement('label');label.htmlFor=id;label.className='trash-path';label.textContent=p;item.append(check,label);list.append(item);});setAdminStatus('垃圾列表已加载，共 '+paths.length+' 张图片');}
+async function loadTrashList(){const response=await fetch('/api/admin/tagging/trash',{headers:auth(),cache:'no-store'});if(!response.ok)throw new Error(await errorText(response,'获取垃圾列表失败'));const data=await response.json();const list=document.querySelector('#trash-list');const paths=data.paths||[];if(!paths.length){list.innerHTML='<p class="note">暂无垃圾图片标记。</p>';setAdminStatus('垃圾列表：暂无数据');return;}list.replaceChildren();const thumbs=new Map();for(let offset=0;offset<paths.length;offset+=50){try{const resolved=await fetch('/api/download-url',{method:'POST',headers:auth(),body:JSON.stringify({paths:paths.slice(offset,offset+50),preview:true})});if(!resolved.ok)continue;const payload=await resolved.json();(payload.images||[]).forEach(image=>{if(image&&image.path)thumbs.set(image.path,image.thumbnail||image.url||'');});}catch(error){}}paths.forEach(p=>{const item=document.createElement('div');item.className='trash-item';const check=document.createElement('input');check.type='checkbox';check.value=p;const id='trash-'+Math.random().toString(36).slice(2);check.id=id;const thumb=document.createElement('img');thumb.className='trash-thumb';thumb.alt='';thumb.loading='lazy';const src=thumbs.get(p);if(src)thumb.src=src;else thumb.style.visibility='hidden';const label=document.createElement('label');label.htmlFor=id;label.className='trash-path';label.textContent=p;item.append(check,thumb,label);list.append(item);});setAdminStatus('垃圾列表已加载，共 '+paths.length+' 张图片');}
 async function deleteTrashSelected(){const checks=document.querySelectorAll('#trash-list .trash-item input[type=checkbox]:checked');if(!checks.length){setAdminStatus('请先勾选要删除的图片');return;}const paths=Array.from(checks).map(c=>c.value);if(!confirm('确定删除选中的 '+paths.length+' 张图片吗？此操作会从 OpenList 永久删除原始图片文件，不可撤销！'))return;const response=await fetch('/api/admin/tagging/trash/delete',{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({paths:paths})});if(!response.ok)throw new Error(await errorText(response,'删除失败'));const result=await response.json();const resultEl=document.querySelector('#trash-result');resultEl.innerHTML='<p>删除完成：成功 '+result.deleted+' 张，失败 '+result.failed+' 张。</p>'+(result.errors&&result.errors.length?'<ul>'+result.errors.map(e=>'<li>'+escapeHtml(e.path)+'：'+escapeHtml(e.error)+'</li>').join('')+'</ul>':'');setAdminStatus('删除完成：成功 '+result.deleted+'，失败 '+result.failed);return loadTrashList();}
 async function deleteTrashAll(){const response=await fetch('/api/admin/tagging/trash',{headers:auth(),cache:'no-store'});if(!response.ok)throw new Error(await errorText(response,'获取垃圾列表失败'));const data=await response.json();const paths=data.paths||[];if(!paths.length){setAdminStatus('暂无垃圾图片可删除');return;}if(!confirm('确定删除全部 '+paths.length+' 张垃圾图片吗？此操作会从 OpenList 永久删除原始图片文件，不可撤销！'))return;const delResponse=await fetch('/api/admin/tagging/trash/delete',{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({})});if(!delResponse.ok)throw new Error(await errorText(delResponse,'删除失败'));const result=await delResponse.json();const resultEl=document.querySelector('#trash-result');resultEl.innerHTML='<p>删除完成：成功 '+result.deleted+' 张，失败 '+result.failed+' 张。</p>'+(result.errors&&result.errors.length?'<ul>'+result.errors.map(e=>'<li>'+escapeHtml(e.path)+'：'+escapeHtml(e.error)+'</li>').join('')+'</ul>':'');setAdminStatus('删除完成：成功 '+result.deleted+'，失败 '+result.failed);return loadTrashList();}
 </script>
@@ -3643,19 +3664,6 @@ def make_handler(application: Application):
                         return
                     directory = params.get("path", ["/"])[0]
                     return self._send_json(HTTPStatus.OK, {"directories": application.list_directories(directory)})
-                if parsed.path == "/api/admin/logs":
-                    if not self._admin_required():
-                        return
-                    lines = int(params.get("lines", ["100"])[0])
-                    lines = max(1, min(lines, 500))
-                    try:
-                        result = subprocess.run(
-                            ["journalctl", "-u", "openlist-image-api", "--no-pager", "-n", str(lines), "--output=short-iso"],
-                            capture_output=True, text=True, timeout=10,
-                        )
-                        return self._send_json(HTTPStatus.OK, {"logs": result.stdout})
-                    except Exception as error:
-                        return self._send_json(HTTPStatus.OK, {"logs": "", "error": str(error)})
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
             except (ValueError, RuntimeError) as error:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
@@ -3796,7 +3804,9 @@ def make_handler(application: Application):
                     if not category:
                         return self._send_json(HTTPStatus.BAD_REQUEST, {"error": "category is required"})
                     categories = application.config["tagging_categories"]
-                    is_trash = category == application.TRASH_TAG
+                    is_trash = category in {application.TRASH_TAG, LEGACY_TRASH_TAG}
+                    if is_trash:
+                        category = application.TRASH_TAG
                     if not is_trash and category not in categories:
                         return self._send_json(HTTPStatus.BAD_REQUEST, {"error": "category not allowed"})
                     if len(category) > 32:
