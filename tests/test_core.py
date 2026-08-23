@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from openlist_image_api import (  # noqa: E402
     Application,
     OpenListClient,
+    SharedImageChain,
     admin_token_from_headers,
     build_index,
     IndexRepository,
@@ -53,7 +54,12 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(defaults["grid_gap"], 12)
         self.assertEqual(defaults["grid_scale"], 150)
         self.assertEqual(defaults["url_cache_size"], 0)
-        self.assertEqual(defaults["url_cache_ttl_seconds"], 1800)
+        self.assertEqual(defaults["url_cache_ttl_seconds"], 7200)
+        self.assertEqual(validate_config({"url_cache_size": 8000, "url_cache_ttl_seconds": 7200})["url_cache_size"], 8000)
+        with self.assertRaises(ValueError):
+            validate_config({"url_cache_size": 8001})
+        with self.assertRaises(ValueError):
+            validate_config({"url_cache_ttl_seconds": 7201})
         self.assertEqual(validate_config({"listen_host": "0.0.0.0"})["listen_host"], "0.0.0.0")
         configured = validate_config({"caption_mode": "name", "grid_gap": 0, "grid_scale": 200})
         self.assertEqual(configured["caption_mode"], "name")
@@ -413,11 +419,14 @@ class UrlCacheConcurrencyTests(unittest.TestCase):
             application.url_executor.shutdown(wait=True)
 
     def test_resolve_download_urls_returns_ready_paths_when_some_are_slow(self) -> None:
+        finished = threading.Event()
+
         class FakeCache:
             def resolve(self, path: str, client: object, refresh: bool = False) -> tuple[str, str]:
                 del client, refresh
                 if path.endswith("/slow.jpg"):
                     time.sleep(0.2)
+                    finished.set()
                 return "https://example.invalid" + path, ""
 
         class FakeRepository:
@@ -446,6 +455,7 @@ class UrlCacheConcurrencyTests(unittest.TestCase):
             by_path = {item["path"]: item for item in resolved}
             self.assertEqual(by_path["/gallery/fast.jpg"]["url"], "https://example.invalid/gallery/fast.jpg")
             self.assertEqual(by_path["/gallery/slow.jpg"]["error"], "url resolve timed out")
+            self.assertTrue(finished.wait(0.5))
         finally:
             application.url_executor.shutdown(wait=True)
 
@@ -649,6 +659,107 @@ class IndexRepositoryTests(unittest.TestCase):
                 }
             )
             self.assertEqual(application.status()["last_build_duration_seconds"], 12.5)
+
+
+class SharedImageChainTests(unittest.TestCase):
+    def test_same_offset_is_shared(self) -> None:
+        chain = SharedImageChain(length=5, ttl_seconds=60)
+        first, info = chain.slice(8, 42, 3, offset=0)
+        second, same = chain.slice(8, 42, 3, chain_id=info["id"], offset=0)
+        self.assertEqual(first, second)
+        self.assertEqual(info["id"], same["id"])
+        self.assertEqual(same["offset"], 3)
+        self.assertEqual(same["remaining"], 2)
+        self.assertEqual(len(set(first)), 3)
+
+    def test_visitors_paginate_independently(self) -> None:
+        chain = SharedImageChain(length=6, ttl_seconds=60)
+        start, info = chain.slice(10, 7, 2, offset=0)
+        later, later_info = chain.slice(10, 7, 2, chain_id=info["id"], offset=2)
+        restart, restart_info = chain.slice(10, 7, 2, chain_id=info["id"], offset=0)
+        self.assertEqual(start, restart)
+        self.assertNotEqual(start, later)
+        self.assertEqual(later_info["offset"], 4)
+        self.assertEqual(restart_info["id"], info["id"])
+
+    def test_exhausted_chain_rotates_but_previous_stays_readable(self) -> None:
+        chain = SharedImageChain(length=4, ttl_seconds=60)
+        first, info = chain.slice(12, 3, 4, offset=0)
+        self.assertEqual(info["remaining"], 0)
+        next_chain, rotated = chain.slice(12, 3, 2, chain_id=info["id"], offset=4)
+        self.assertTrue(rotated["rotated"])
+        self.assertNotEqual(rotated["id"], info["id"])
+        continued, previous = chain.slice(12, 3, 2, chain_id=info["id"], offset=2)
+        self.assertEqual(previous["id"], info["id"])
+        self.assertEqual(continued, first[2:4])
+        new_visitor, current = chain.slice(12, 3, 2)
+        self.assertEqual(current["id"], rotated["id"])
+        self.assertEqual(new_visitor, next_chain)
+
+    def test_ttl_expiry_starts_a_new_chain(self) -> None:
+        chain = SharedImageChain(length=4, ttl_seconds=1)
+        _first, info = chain.slice(8, 1, 2, offset=0)
+        chain._current["expires_at"] = time.monotonic() - 1
+        _later, rotated = chain.slice(8, 1, 2)
+        self.assertTrue(rotated["rotated"])
+        self.assertNotEqual(rotated["id"], info["id"])
+
+    def test_wall_clock_window_rotates_together(self) -> None:
+        chain = SharedImageChain(length=4, ttl_seconds=7200)
+        with mock.patch.object(chain, "_window_id", return_value=10):
+            with mock.patch.object(chain, "_seconds_until_window_end", return_value=7200):
+                _first, info = chain.slice(8, 1, 2, offset=0)
+        with mock.patch.object(chain, "_window_id", return_value=11):
+            with mock.patch.object(chain, "_seconds_until_window_end", return_value=7200):
+                _later, rotated = chain.slice(8, 1, 2)
+        self.assertTrue(rotated["rotated"])
+        self.assertNotEqual(rotated["id"], info["id"])
+        self.assertIn("-11-", rotated["id"])
+
+    def test_unfiltered_requests_share_the_same_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            application = Application(Path(temporary) / "config.json")
+            images = [{"path": f"/gallery/{index}.jpg", "size": index} for index in range(8)]
+            application.repository.save(
+                {
+                    "images": images,
+                    "directories": ["/gallery"],
+                    "directory_count": 1,
+                    "generated_at": 99,
+                    "errors": [],
+                }
+            )
+            first, info = application.choose_images(3, None, None, None, offset=0, use_shared_chain=True)
+            second, _same = application.choose_images(3, None, None, None, offset=0, chain_id=info["id"], use_shared_chain=True)
+            next_batch, _next = application.choose_images(3, None, None, None, offset=3, chain_id=info["id"], use_shared_chain=True)
+            self.assertEqual([image["path"] for image in first], [image["path"] for image in second])
+            self.assertEqual(len({image["path"] for image in first + next_batch}), 6)
+            with mock.patch("openlist_image_api.random.sample", side_effect=lambda pool, count: pool[:count]) as sample:
+                independent, chain_info = application.choose_images(2, None, None, None)
+            self.assertIsNone(chain_info)
+            self.assertEqual([image["path"] for image in independent], ["/gallery/0.jpg", "/gallery/1.jpg"])
+            sample.assert_called_once()
+            application.url_executor.shutdown(wait=True)
+
+    def test_filtered_requests_stay_independent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            application = Application(Path(temporary) / "config.json")
+            images = [{"path": f"/gallery/{index}.jpg", "size": index} for index in range(6)]
+            application.repository.save(
+                {
+                    "images": images,
+                    "directories": ["/gallery"],
+                    "directory_count": 1,
+                    "generated_at": 7,
+                    "errors": [],
+                }
+            )
+            with mock.patch("openlist_image_api.random.sample", side_effect=lambda pool, count: pool[:count]) as sample:
+                selected, chain_info = application.choose_images(2, "/gallery", None, None, use_shared_chain=True)
+            self.assertIsNone(chain_info)
+            self.assertEqual([image["path"] for image in selected], ["/gallery/0.jpg", "/gallery/1.jpg"])
+            sample.assert_called_once()
+            application.url_executor.shutdown(wait=True)
 
 
 if __name__ == "__main__":

@@ -56,7 +56,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "grid_gap": 12,
     "grid_scale": 150,
     "url_cache_size": 0,
-    "url_cache_ttl_seconds": 1800,
+    "url_cache_ttl_seconds": 7200,
     "tagging_enabled": False,
     "tagging_scope": "anonymous",
     "tagging_categories": [],
@@ -70,11 +70,13 @@ ALLOWED_LAYOUTS = {"single", "grid", "waterfall"}
 ALLOWED_DELIVERY = {"preview", "download"}
 ALLOWED_CAPTION_MODES = {"path", "name", "hidden"}
 MAX_REQUEST_BODY = 64 * 1024
-URL_RESOLVE_WORKERS = 20
-URL_RESOLVE_WAIT_SECONDS = 8
+URL_RESOLVE_WORKERS = 12
+URL_RESOLVE_WAIT_SECONDS = 4
 INDEX_LIST_TIMEOUT_SECONDS = 10
 INDEX_LIST_WORKERS = 4
 INDEX_CHECKPOINT_INTERVAL = 32
+SHARED_CHAIN_LENGTH = 4000
+SHARED_CHAIN_TTL_SECONDS = 7200
 DEVICE_PREFERENCE_DEFAULTS: dict[str, Any] = {
     "view_layout": DEFAULT_CONFIG["view_layout"],
     "grid_gap": DEFAULT_CONFIG["grid_gap"],
@@ -188,9 +190,9 @@ def validate_config(candidate: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("grid_gap must be between 0 and 48")
     if not isinstance(config["grid_scale"], int) or not 75 <= config["grid_scale"] <= 200:
         raise ValueError("grid_scale must be between 75 and 200")
-    if not isinstance(config["url_cache_size"], int) or not 0 <= config["url_cache_size"] <= 5000:
+    if not isinstance(config["url_cache_size"], int) or not 0 <= config["url_cache_size"] <= 8000:
         raise ValueError("invalid url_cache_size")
-    if not isinstance(config["url_cache_ttl_seconds"], int) or not 0 <= config["url_cache_ttl_seconds"] <= 3600:
+    if not isinstance(config["url_cache_ttl_seconds"], int) or not 0 <= config["url_cache_ttl_seconds"] <= 7200:
         raise ValueError("invalid url_cache_ttl_seconds")
     if not isinstance(config["tagging_enabled"], bool):
         raise ValueError("tagging_enabled must be a boolean")
@@ -1035,6 +1037,118 @@ class UrlCache:
             return {"size": len(self._entries), "hits": self.hits, "misses": self.misses}
 
 
+class SharedImageChain:
+    def __init__(self, length: int = SHARED_CHAIN_LENGTH, ttl_seconds: int = SHARED_CHAIN_TTL_SECONDS) -> None:
+        self.length = max(1, int(length))
+        self.ttl_seconds = max(1, int(ttl_seconds))
+        self._lock = threading.Lock()
+        self._fingerprint: tuple[int, int] | None = None
+        self._order: list[int] = []
+        self._current: dict[str, Any] | None = None
+        self._previous: dict[str, Any] | None = None
+        self._generation = 0
+
+    def _ensure_order(self, size: int, generated_at: int) -> None:
+        generated_at = int(generated_at or 1)
+        fingerprint = (generated_at, size)
+        if self._fingerprint == fingerprint:
+            return
+        order = list(range(size))
+        random.Random(generated_at).shuffle(order)
+        self._order = order
+        self._fingerprint = fingerprint
+        self._current = None
+        self._previous = None
+        self._generation = 0
+
+    def _window_id(self, wall: float | None = None) -> int:
+        return int(wall if wall is not None else time.time()) // self.ttl_seconds
+
+    def _seconds_until_window_end(self, wall: float | None = None) -> float:
+        wall = float(wall if wall is not None else time.time())
+        window_end = (self._window_id(wall) + 1) * self.ttl_seconds
+        return max(1.0, window_end - wall)
+
+    def _new_chain(self, size: int, now: float) -> dict[str, Any]:
+        chain_length = min(self.length, size)
+        start = (self._generation * chain_length) % size
+        window_id = self._window_id()
+        self._generation += 1
+        return {
+            "id": f"{self._fingerprint[0]}-{window_id}-{self._generation}",
+            "window_id": window_id,
+            "start": start,
+            "length": chain_length,
+            "high_water": 0,
+            "expires_at": now + self._seconds_until_window_end(),
+        }
+
+    def _rotate(self, size: int, now: float) -> None:
+        self._previous = self._current if self._alive(self._current, now) else None
+        self._current = self._new_chain(size, now)
+
+    def _alive(self, chain: dict[str, Any] | None, now: float) -> bool:
+        return bool(chain) and now < float(chain["expires_at"])
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            current = self._current
+            previous = self._previous
+            payload: dict[str, Any] = {"length": self.length, "ttl_seconds": self.ttl_seconds}
+            if current:
+                payload.update(
+                    {
+                        "id": current["id"],
+                        "offset": int(current["high_water"]),
+                        "remaining": max(0, int(current["length"]) - int(current["high_water"])),
+                    }
+                )
+            if previous:
+                payload["previous_id"] = previous["id"]
+            return payload
+
+    def slice(self, size: int, generated_at: int, count: int, chain_id: str | None = None, offset: int | None = None) -> tuple[list[int], dict[str, Any]]:
+        if size <= 0 or count <= 0:
+            return [], {"id": "", "offset": 0, "remaining": 0, "length": 0, "rotated": False}
+        now = time.monotonic()
+        requested_offset = max(0, int(offset or 0))
+        with self._lock:
+            self._ensure_order(size, generated_at)
+            rotated = False
+            if self._previous is not None and not self._alive(self._previous, now):
+                self._previous = None
+            if self._current is None or not self._alive(self._current, now) or int(self._current.get("window_id", -1)) != self._window_id():
+                self._rotate(size, now)
+                rotated = True
+            previous = self._previous
+            current = self._current
+            if chain_id and previous and chain_id == previous["id"] and self._alive(previous, now) and requested_offset < int(previous["length"]):
+                target = previous
+                position = requested_offset
+            elif chain_id and current and chain_id == current["id"] and requested_offset < int(current["length"]):
+                target = current
+                position = requested_offset
+            else:
+                if int(current["high_water"]) >= int(current["length"]):
+                    self._rotate(size, now)
+                    rotated = True
+                    current = self._current
+                target = current
+                position = 0
+            take_count = min(count, int(target["length"]) - position)
+            start = int(target["start"])
+            positions = [self._order[(start + position + index) % size] for index in range(take_count)]
+            target["high_water"] = max(int(target["high_water"]), position + take_count)
+            info = {
+                "id": target["id"],
+                "offset": position + take_count,
+                "remaining": int(target["length"]) - (position + take_count),
+                "length": int(target["length"]),
+                "rotated": rotated,
+            }
+            return positions, info
+
+
 class Application:
     def __init__(self, config_path: Path):
         self.config_path = config_path
@@ -1042,6 +1156,7 @@ class Application:
         self.repository = IndexRepository(Path(self.config["state_dir"]))
         self.tags = TagRepository(Path(self.config["state_dir"]))
         self.cache = self._make_url_cache()
+        self.shared_chain = SharedImageChain()
         self.url_executor = ThreadPoolExecutor(max_workers=URL_RESOLVE_WORKERS, thread_name_prefix="openlist-url")
         self.config_lock = threading.Lock()
         self.refresh_lock = threading.Lock()
@@ -1336,6 +1451,7 @@ class Application:
             "last_refresh_error": self.last_refresh_error,
             "index_progress": progress,
             "cache": self.cache.status(),
+            "shared_chain": self.shared_chain_status(),
             **self.public_config(),
         }
 
@@ -1363,7 +1479,13 @@ class Application:
         children.sort(key=lambda item: item["name"].casefold())
         return children
 
-    def choose_images(self, count: int, folder: str | None, min_size: int | None, max_size: int | None, tags: list[str] | None = None, filter_mode: str = "union") -> list[dict[str, Any]]:
+    def shared_chain_status(self) -> dict[str, Any]:
+        chain = getattr(self, "shared_chain", None)
+        if chain is None:
+            return {}
+        return chain.status()
+
+    def choose_images(self, count: int, folder: str | None, min_size: int | None, max_size: int | None, tags: list[str] | None = None, filter_mode: str = "union", offset: int | None = None, chain_id: str | None = None, use_shared_chain: bool = False) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
         index = self.repository.load()
         images = index.get("images", [])
         if folder:
@@ -1387,11 +1509,17 @@ class Application:
                     allowed_paths |= self.tags.paths_for_tag(tag)
             images = [image for image in images if image.get("path", "") in allowed_paths]
         if not images:
-            return []
+            return [], None
         count = max(1, min(count, 50))
+        unfiltered = not folder and min_size is None and max_size is None and not tags
+        chain = getattr(self, "shared_chain", None)
+        if use_shared_chain and unfiltered and chain is not None:
+            generated_at = int(index.get("generated_at") or 0)
+            positions, info = chain.slice(len(images), generated_at, count, chain_id=chain_id, offset=offset)
+            return [images[position] for position in positions], info
         if count <= len(images):
-            return random.sample(images, count)
-        return [random.choice(images) for _ in range(count)]
+            return random.sample(images, count), None
+        return [random.choice(images) for _ in range(count)], None
 
     def indexed_image(self, path: str) -> dict[str, Any]:
         matches = self.indexed_images([path])
@@ -1471,16 +1599,7 @@ class Application:
 
         if len(images) == 1:
             return [resolve_one(images[0])]
-        futures = {self.url_executor.submit(resolve_one, image): str(image["path"]) for image in images}
-        done, not_done = wait(futures, timeout=URL_RESOLVE_WAIT_SECONDS)
-        for future in not_done:
-            future.cancel()
-        completed = {futures[future]: future.result() for future in done}
-        return [
-            completed.get(str(image["path"]))
-            or {"path": str(image["path"]), "error": "url resolve timed out"}
-            for image in images
-        ]
+        return self._collect_url_resolves(images, resolve_one)
 
     def resolve_preview_urls(self, paths: list[str], refresh: bool = False) -> list[dict[str, Any]]:
         images = self.indexed_images(paths[:50])
@@ -1501,11 +1620,19 @@ class Application:
 
         if len(images) == 1:
             return [resolve_one(images[0])]
+        return self._collect_url_resolves(images, resolve_one)
+
+    def _collect_url_resolves(self, images: list[dict[str, Any]], resolve_one) -> list[dict[str, Any]]:
         futures = {self.url_executor.submit(resolve_one, image): str(image["path"]) for image in images}
-        done, not_done = wait(futures, timeout=URL_RESOLVE_WAIT_SECONDS)
-        for future in not_done:
-            future.cancel()
-        completed = {futures[future]: future.result() for future in done}
+        done, _not_done = wait(futures, timeout=URL_RESOLVE_WAIT_SECONDS)
+        completed: dict[str, dict[str, Any]] = {}
+        for future in done:
+            path = futures[future]
+            try:
+                completed[path] = future.result()
+            except Exception:
+                logging.warning("Failed to resolve URL for %s", path)
+                completed[path] = {"path": path, "error": "unable to resolve image URL"}
         return [
             completed.get(str(image["path"]))
             or {"path": str(image["path"]), "error": "url resolve timed out"}
@@ -1687,10 +1814,25 @@ header{
 .gallery.waterfall .card img{max-height:none;min-height:0;height:auto}
 .card{position:relative;background:var(--bg-elev);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;transition:transform .18s ease,box-shadow .18s ease,border-color .18s ease}
 @media(hover:hover){.card:hover{transform:translateY(-3px);box-shadow:var(--shadow);border-color:var(--accent)}}
-.preview-button{display:block;width:100%;padding:0;border:0;border-radius:0;background:transparent;cursor:zoom-in}
+.preview-button{position:relative;display:block;width:100%;padding:0;border:0;border-radius:0;background:transparent;cursor:zoom-in}
 .card img{width:100%;display:block;max-height:82vh;object-fit:contain;background:#05060a;color:transparent;font-size:0}
-.card.is-loading img,.card img:not([src]),.card img[src=""]{min-height:180px;visibility:hidden}
+.card.is-loading img,.gallery.waterfall .card.is-loading img,.card img:not([src]),.card img[src=""]{min-height:180px;visibility:hidden}
+.card.is-loading .preview-button::after{
+  content:'';position:absolute;inset:0;border-radius:inherit;pointer-events:none;
+  background:linear-gradient(110deg,transparent 18%,color-mix(in srgb,var(--text) 16%,transparent) 46%,transparent 74%);
+  background-size:220% 100%;animation:card-shimmer 1.35s ease-in-out infinite
+}
+.card.is-loading .preview-button::before{
+  content:'';position:absolute;z-index:1;top:50%;left:50%;width:28px;height:28px;margin:-14px 0 0 -14px;
+  border:2px solid color-mix(in srgb,var(--muted) 42%,transparent);border-top-color:var(--accent);border-radius:50%;
+  animation:card-spin .8s linear infinite
+}
 .card.is-loading .card-tags{display:none}
+@keyframes card-shimmer{0%{background-position:120% 0}100%{background-position:-40% 0}}
+@keyframes card-spin{to{transform:rotate(360deg)}}
+#waterfall-sentinel{flex:1 0 100%;display:none;align-items:center;justify-content:center;gap:10px;min-height:52px;padding:8px 0 18px;color:var(--muted);font-size:13px}
+#waterfall-sentinel.is-visible{display:flex}
+#waterfall-sentinel .spinner{width:16px;height:16px;border:2px solid color-mix(in srgb,var(--muted) 42%,transparent);border-top-color:var(--accent);border-radius:50%;animation:card-spin .8s linear infinite}
 .image-error{display:grid;min-height:180px;place-items:center;gap:8px;padding:24px;text-align:center;color:var(--muted)}
 .image-error button{justify-self:center}
 #empty{padding:48px 20px;text-align:center;color:var(--muted)}
@@ -1844,7 +1986,7 @@ body:not(.theme-light)::after{content:'';position:fixed;inset:0;z-index:10000;po
         <p class="meta">扫码添加 QQ</p>
       </div>
     </span>
-    <a href="/admin" class="button ghost">管理</a>
+    <a href="/admin" class="button ghost" data-admin-link>管理</a>
   </nav>
   <button id="header-menu-toggle" type="button" aria-label="菜单" aria-expanded="false">菜单</button>
 </header>
@@ -1857,10 +1999,11 @@ body:not(.theme-light)::after{content:'';position:fixed;inset:0;z-index:10000;po
   <button id="menu-settings" type="button">设置</button>
   <button id="menu-announcement" class="hidden ghost" type="button">公告</button>
   <button id="menu-contact" class="hidden ghost" type="button">联系</button>
-  <a href="/admin" class="button ghost">管理</a>
+  <a href="/admin" class="button ghost" data-admin-link>管理</a>
 </aside>
 <div id="tag-bar" class="tag-bar hidden"></div>
 <main id="gallery" class="gallery" aria-busy="true"></main>
+<div id="waterfall-sentinel" aria-live="polite"><span class="spinner" aria-hidden="true"></span><span>正在准备下一批图片…</span></div>
 <button id="slide-nav-prev" class="slide-nav prev hidden" type="button" aria-label="上一张">‹</button>
 <button id="slide-nav-next" class="slide-nav next hidden" type="button" aria-label="下一张">›</button>
 <button id="slide-nav-pause" class="slide-nav pause hidden" type="button" aria-label="暂停播放">暂停</button>
@@ -1908,6 +2051,10 @@ body:not(.theme-light)::after{content:'';position:fixed;inset:0;z-index:10000;po
 <script>
 const PREFERENCE_KEY='openlist-image-preferences-v2';
 const ANNOUNCEMENT_KEY_PREFIX='openlist-image-announcement-v2-';
+const CHAIN_PROGRESS_KEY='openlist-image-chain-progress-v1';
+const GALLERY_RESTORE_KEY='openlist-image-gallery-restore-v1';
+const ADMIN_RETURN_KEY='openlist-image-admin-return-v1';
+const SEEN_IMAGE_LIMIT=4000;
 const gallery=document.querySelector('#gallery');
 const pageHeader=document.querySelector('header');
 const statusEl=document.querySelector('#status');
@@ -1974,11 +2121,16 @@ let taggingConfig=null;
 let activeTagFilters=[];
 let tagCategoriesCache={};
 let slideHistorySequence=0;
+let slideChainOffset=0;
+let slideChainId='';
 let waterfallLoading=false;
 let waterfallExhausted=false;
 let waterfallPrefetch=[];
 let waterfallPrefetchPromise=null;
 let waterfallPrefetchToken=0;
+let waterfallChainOffset=0;
+let waterfallChainId='';
+let seenByChain=new Map();
 let renderGeneration=0;
 let loadedCount=0;
 let cardSequence=0;
@@ -1989,7 +2141,7 @@ const activePointers=new Map();
 const urlResolveTasks=new Map();
 const urlResolveQueue=[];
 let urlResolveActive=0;
-const URL_RESOLVE_CONCURRENCY=3;
+const URL_RESOLVE_CONCURRENCY=6;
 const SLIDE_PRELOAD_COUNT=2;
 const SLIDE_INITIAL_LOAD=6;
 const WATERFALL_BATCH_SIZE=20;
@@ -1999,7 +2151,7 @@ let lightboxBaseWidth=0;
 let lightboxBaseHeight=0;
 let lastHiddenAt=0;
 let recoveryPromise=null;
-const URL_REFRESH_AGE_MS=25*60*1000;
+const URL_REFRESH_AGE_MS=100*60*1000;
 const IDLE_RECOVERY_MS=5*60*1000;
 const PREVIEW_QUALITY_OPTIONS=['176','480','800','1280','2560'];
 const LIGHTBOX_QUALITY_OPTIONS=['original','2560','1280'];
@@ -2325,12 +2477,38 @@ async function ensureFreshImage(image,preview=true,priority=2){
   return image;
 }
 
-function attachImageRecovery(element,image){
+function attachImageRecovery(element,image,onGiveUp){
   element.addEventListener('load',()=>{delete element.dataset.refreshAttempted;},{once:false});
   element.addEventListener('error',()=>{
-    if(element.dataset.refreshAttempted==='1') return;
-    element.dataset.refreshAttempted='1';
-    refreshImageUrl(image,true,true).then(()=>{element.src=cardSrc(image);}).catch(()=>{});
+    const attempts=Number(element.dataset.refreshAttempted||'0');
+    if(attempts>=2){
+      if(onGiveUp) onGiveUp();
+      return;
+    }
+    element.dataset.refreshAttempted=String(attempts+1);
+    refreshImageUrl(image,true,true,0).then(()=>{
+      const src=cardSrc(image);
+      if(!src) throw new Error('missing image source');
+      element.src=src;
+    }).catch(()=>{if(onGiveUp) onGiveUp();});
+  });
+}
+
+function retargetCard(image){
+  const src=cardSrc(image);
+  if(!src||!image.path) return;
+  document.querySelectorAll('.card').forEach(card=>{
+    if(card.dataset.path!==image.path) return;
+    const picture=card.querySelector('img');
+    if(!picture) return;
+    const error=card.querySelector('.image-error');
+    if(error) error.remove();
+    picture.classList.remove('hidden');
+    if(picture.dataset.srcApplied==='1'){
+      if(picture.getAttribute('src')!==src) picture.src=src;
+      return;
+    }
+    if(card._applySrc) card._applySrc();
   });
 }
 
@@ -2461,6 +2639,7 @@ function createCard(image,eager=false){
   card.className='card is-loading';
   card.dataset.sequence=String(cardSequence++);
   card.dataset.path=image.path||'';
+  card._image=image;
   const preview=document.createElement('button');
   preview.className='preview-button';
   preview.type='button';
@@ -2472,7 +2651,6 @@ function createCard(image,eager=false){
   picture.decoding='async';
   if(eager) picture.fetchPriority='high';
   picture.alt='';
-  attachImageRecovery(picture,image);
   const markCardReady=()=>{card.classList.remove('is-loading');picture.alt=accessibleName;};
   picture.addEventListener('load',markCardReady);
   const showCardError=()=>{
@@ -2493,6 +2671,7 @@ function createCard(image,eager=false){
       card.append(error);
     }
   };
+  attachImageRecovery(picture,image,showCardError);
   const applySrc=()=>{
     if(picture.dataset.srcApplied==='1') return card._ready||Promise.resolve();
     picture.dataset.srcApplied='1';
@@ -2554,29 +2733,283 @@ function createCard(image,eager=false){
   return card;
 }
 
-async function requestImages(count){
-  let url='/api/images/random?count='+count;
-  if(activeTagFilters.length){
-    activeTagFilters.forEach(t=>{url+='&tag='+encodeURIComponent(t);});
-    if(settings.filter_mode==='intersect')url+='&filter_mode=intersect';
-  }
-  url+='&_='+Date.now();
-  const data=await fetchJsonWithRetry(url,{headers:adminHeaders()},3);
-  const images=(data.images||[]).map(image=>({...image,_resolvedAt:image.url||image.thumbnail?Date.now():0}));
-  const pending=images.filter(image=>needsImageResolve(image,false,true));
-  if(!pending.length) return images;
+function usesSharedImageChain(){
+  return !activeTagFilters.length;
+}
+
+function persistChainProgress(){
+  if(!usesSharedImageChain()) return;
   try{
-    const resolved=await fetchJsonWithRetry('/api/download-url',{
+    const seen={};
+    for(const [chainId,paths] of seenByChain){
+      if(chainId) seen[chainId]=[...paths].slice(-SEEN_IMAGE_LIMIT);
+    }
+    sessionStorage.setItem(CHAIN_PROGRESS_KEY,JSON.stringify({
+      slide:{id:slideChainId,offset:slideChainOffset},
+      waterfall:{id:waterfallChainId,offset:waterfallChainOffset},
+      seen
+    }));
+  }catch(error){}
+}
+
+function restoreChainProgress(){
+  try{
+    const stored=JSON.parse(sessionStorage.getItem(CHAIN_PROGRESS_KEY)||'{}');
+    if(stored.slide&&stored.slide.id){
+      slideChainId=stored.slide.id;
+      slideChainOffset=Number(stored.slide.offset||0);
+    }
+    if(stored.waterfall&&stored.waterfall.id){
+      waterfallChainId=stored.waterfall.id;
+      waterfallChainOffset=Number(stored.waterfall.offset||0);
+    }
+    seenByChain=new Map();
+    if(stored.seen&&typeof stored.seen==='object'){
+      Object.entries(stored.seen).forEach(([chainId,paths])=>{
+        if(chainId&&Array.isArray(paths)) seenByChain.set(chainId,new Set(paths.filter(Boolean)));
+      });
+    }else if(Array.isArray(stored.seen)){
+      const chainId=waterfallChainId||slideChainId;
+      if(chainId) seenByChain.set(chainId,new Set(stored.seen.filter(Boolean)));
+    }
+  }catch(error){
+    try{sessionStorage.removeItem(CHAIN_PROGRESS_KEY);}catch(e){}
+  }
+}
+
+function seenSet(chainId){
+  if(!chainId) return null;
+  let seen=seenByChain.get(chainId);
+  if(!seen){
+    seen=new Set();
+    seenByChain.set(chainId,seen);
+  }
+  return seen;
+}
+
+function rememberSeenImages(images,chainId){
+  if(!usesSharedImageChain()||!chainId) return;
+  const seen=seenSet(chainId);
+  let added=false;
+  (images||[]).forEach(image=>{
+    if(image&&image.path&&!seen.has(image.path)){
+      seen.add(image.path);
+      added=true;
+    }
+  });
+  if(seen.size>SEEN_IMAGE_LIMIT){
+    seenByChain.set(chainId,new Set([...seen].slice(-SEEN_IMAGE_LIMIT)));
+    added=true;
+  }
+  if(added) persistChainProgress();
+}
+
+function unseenImages(images,chainId){
+  if(!usesSharedImageChain()||!chainId) return images;
+  const seen=seenByChain.get(chainId);
+  if(!seen||!seen.size) return images;
+  return images.filter(image=>!image.path||!seen.has(image.path));
+}
+
+function snapshotImage(image){
+  if(!image||!image.path) return null;
+  return {path:image.path,size:image.size,thumbnail:image.thumbnail||'',url:image.url||'',tags:image.tags,needs_url:image.needs_url,_resolvedAt:image._resolvedAt||0};
+}
+
+function persistGallerySnapshot(){
+  if(!settings||!usesSharedImageChain()) return;
+  try{
+    const waterfallImages=[...gallery.querySelectorAll('.card')].sort((left,right)=>Number(left.dataset.sequence)-Number(right.dataset.sequence)).map(card=>snapshotImage(card._image)).filter(Boolean);
+    sessionStorage.setItem(GALLERY_RESTORE_KEY,JSON.stringify({
+      layout:settings.view_layout,
+      scrollY:window.scrollY||0,
+      slide:{id:slideChainId,offset:slideChainOffset,index:slideIndex,images:slideImages.map(snapshotImage).filter(Boolean)},
+      waterfall:{id:waterfallChainId,offset:waterfallChainOffset,images:waterfallImages}
+    }));
+  }catch(error){}
+}
+
+function consumeGallerySnapshot(){
+  try{
+    const restore=sessionStorage.getItem(GALLERY_RESTORE_KEY);
+    sessionStorage.removeItem(GALLERY_RESTORE_KEY);
+    if(!restore) return null;
+    const snapshot=JSON.parse(restore);
+    return snapshot&&typeof snapshot==='object'?snapshot:null;
+  }catch(error){
+    try{sessionStorage.removeItem(GALLERY_RESTORE_KEY);}catch(e){}
+    return null;
+  }
+}
+
+function markAdminRestore(){
+  persistChainProgress();
+  persistGallerySnapshot();
+  try{sessionStorage.setItem(ADMIN_RETURN_KEY,'1');}catch(error){}
+}
+
+function consumeAdminReturn(){
+  try{
+    const flagged=sessionStorage.getItem(ADMIN_RETURN_KEY)==='1';
+    sessionStorage.removeItem(ADMIN_RETURN_KEY);
+    return flagged;
+  }catch(error){
+    return false;
+  }
+}
+
+function remountWaterfallCards(){
+  const images=[...gallery.querySelectorAll('.card')].sort((left,right)=>Number(left.dataset.sequence)-Number(right.dataset.sequence)).map(card=>card._image).filter(Boolean);
+  loadedCount=0;
+  cardSequence=0;
+  waterfallRevealObserver.disconnect();
+  gallery.replaceChildren();
+  setupWaterfallColumns();
+  const cards=images.map(image=>createCard(image));
+  cards.forEach(appendWaterfallCard);
+  prioritizeWaterfallImages(cards);
+  loadedCount=images.length;
+}
+
+function restoreGallerySnapshot(snapshot){
+  if(!snapshot||snapshot.layout!==settings.view_layout) return false;
+  if(snapshot.layout==='slideshow'){
+    const images=(snapshot.slide&&snapshot.slide.images||[]).filter(image=>image&&image.path);
+    if(!images.length) return false;
+    slideImages=images;
+    slideIndex=Math.max(0,Math.min(images.length-1,Number(snapshot.slide&&snapshot.slide.index||0)));
+    slideChainId=(snapshot.slide&&snapshot.slide.id)||slideChainId;
+    slideChainOffset=Number((snapshot.slide&&snapshot.slide.offset)||slideChainOffset||0);
+    slideExhausted=false;
+    slideHistory=[];
+    slideHistorySequence=0;
+    slidePreloads.clear();
+    renderSlideshow();
+    ensureSlideBuffer().catch(showError);
+    persistChainProgress();
+    return true;
+  }
+  const images=(snapshot.waterfall&&snapshot.waterfall.images||[]).filter(image=>image&&image.path);
+  if(!images.length) return false;
+  waterfallChainId=(snapshot.waterfall&&snapshot.waterfall.id)||waterfallChainId;
+  waterfallChainOffset=Number((snapshot.waterfall&&snapshot.waterfall.offset)||waterfallChainOffset||0);
+  waterfallExhausted=false;
+  loadedCount=0;
+  cardSequence=0;
+  clearWaterfallPrefetch();
+  waterfallRevealObserver.disconnect();
+  gallery.className='gallery waterfall';
+  gallery.replaceChildren();
+  setupWaterfallColumns();
+  const cards=images.map(image=>createCard(image));
+  cards.forEach(appendWaterfallCard);
+  prioritizeWaterfallImages(cards);
+  loadedCount=images.length;
+  statusEl.textContent='瀑布流 · 已加载 '+loadedCount+' 张';
+  persistChainProgress();
+  prefetchNextWaterfallBatch();
+  const scrollY=Number(snapshot.scrollY||0);
+  if(scrollY>0) requestAnimationFrame(()=>window.scrollTo(0,scrollY));
+  return true;
+}
+
+function applySharedChain(data,kind){
+  const chain=data&&data.chain;
+  if(!chain||!chain.id) return;
+  if(kind==='slide'){
+    slideChainId=chain.id;
+    slideChainOffset=Number(chain.offset||0);
+  }else{
+    waterfallChainId=chain.id;
+    waterfallChainOffset=Number(chain.offset||0);
+  }
+  persistChainProgress();
+}
+
+function retargetLoadedImages(){
+  gallery.querySelectorAll('.card').forEach(card=>{
+    const image=card._image;
+    const picture=card.querySelector('img');
+    if(!image||!picture||picture.dataset.srcApplied!=='1') return;
+    const next=cardSrc(image);
+    if(next&&picture.getAttribute('src')!==next) picture.src=next;
+  });
+  slideHistoryTrack.querySelectorAll('.slide-thumbnail').forEach(button=>{
+    const image=slideHistory.find(item=>String(item._historyId)===button.dataset.historyId);
+    const thumbnail=button.querySelector('img');
+    if(!image||!thumbnail) return;
+    const next=cardSrc(image);
+    if(next) thumbnail.src=next;
+  });
+  slidePreloads.clear();
+  if(settings&&settings.view_layout==='slideshow') preloadUpcomingSlides();
+  if(lightbox.open&&activeImage){
+    const wantOriginal=(settings.lightbox_quality||'original')==='original';
+    if(wantOriginal&&!activeImage.url){
+      refreshImageUrl(activeImage,false,false,0).then(()=>{if(lightbox.open&&activeImage)lightboxImage.src=lightboxSrc(activeImage);}).catch(()=>{});
+    }else{
+      const next=lightboxSrc(activeImage);
+      if(next) lightboxImage.src=next;
+    }
+  }
+}
+
+function setWaterfallBufferVisible(visible){
+  const sentinel=document.querySelector('#waterfall-sentinel');
+  if(!sentinel) return;
+  sentinel.classList.toggle('is-visible',!!visible);
+  sentinel.setAttribute('aria-hidden',visible?'false':'true');
+}
+
+async function requestImages(count,kind='waterfall'){
+  const wanted=Math.max(1,count);
+  const collected=[];
+  let emptyRounds=0;
+  while(collected.length<wanted&&emptyRounds<3){
+    const remaining=wanted-collected.length;
+    let url='/api/images/random?count='+remaining;
+    if(usesSharedImageChain()){
+      const chainId=kind==='slide'?slideChainId:waterfallChainId;
+      const offset=kind==='slide'?slideChainOffset:waterfallChainOffset;
+      if(chainId) url+='&chain='+encodeURIComponent(chainId)+'&offset='+offset;
+    }
+    if(activeTagFilters.length){
+      activeTagFilters.forEach(t=>{url+='&tag='+encodeURIComponent(t);});
+      if(settings.filter_mode==='intersect')url+='&filter_mode=intersect';
+    }
+    url+='&_='+Date.now();
+    const data=await fetchJsonWithRetry(url,{headers:adminHeaders()},3);
+    if(usesSharedImageChain()) applySharedChain(data,kind);
+    const batch=(data.images||[]).map(image=>({...image,_resolvedAt:image.url||image.thumbnail?Date.now():0}));
+    if(!batch.length) break;
+    const chainId=kind==='slide'?slideChainId:waterfallChainId;
+    const fresh=unseenImages(batch,chainId);
+    if(!fresh.length){
+      emptyRounds+=1;
+      continue;
+    }
+    emptyRounds=0;
+    collected.push(...fresh);
+    rememberSeenImages(fresh,chainId);
+    if(batch.length<remaining&&!usesSharedImageChain()) break;
+  }
+  const pending=collected.filter(image=>needsImageResolve(image,false,true));
+  if(pending.length){
+    fetchJsonWithRetry('/api/download-url',{
       method:'POST',
       headers:{'Content-Type':'application/json',...adminHeaders()},
       body:JSON.stringify({paths:pending.map(image=>image.path),preview:true})
-    },2);
-    const resolvedByPath=new Map((resolved.images||[]).map(image=>[image.path,image]));
-    pending.forEach(image=>applyResolvedUrl(image,resolvedByPath.get(image.path)));
-  }catch(error){
-    if(error.name!=='AbortError') console.debug('批量预览解析失败，将按图片重试',error);
+    },1).then(resolved=>{
+      const resolvedByPath=new Map((resolved.images||[]).map(image=>[image.path,image]));
+      pending.forEach(image=>{
+        applyResolvedUrl(image,resolvedByPath.get(image.path));
+        retargetCard(image);
+      });
+    }).catch(error=>{
+      if(error.name!=='AbortError') console.debug('批量预览解析失败，将按图片重试',error);
+    });
   }
-  return images;
+  return collected;
 }
 
 async function handleTagVote(path,type,button,event){
@@ -2812,10 +3245,10 @@ function preloadUpcomingSlides(){
 async function appendSlideImages(count,generation=renderGeneration){
   if(slideExhausted) return [];
   if(slideLoadPromise) return slideLoadPromise;
-  const loadPromise=requestImages(count).then(images=>{
+  const loadPromise=requestImages(count,'slide').then(images=>{
     if(generation!==renderGeneration) return [];
     slideImages.push(...images);
-    if(images.length<count) slideExhausted=true;
+    if(!images.length||(images.length<count&&!usesSharedImageChain())) slideExhausted=true;
     return images;
   }).catch(error=>{
     if(generation===renderGeneration) slideExhausted=true;
@@ -2907,12 +3340,16 @@ function renderSlideshow(){
   scheduleSlideshow();
 }
 
-async function loadSlideshow(reset,generation=renderGeneration){
+async function loadSlideshow(reset,generation=renderGeneration,keepChain=false){
   clearSlideTimer();
   if(reset){
     slideImages=[];
     slideIndex=0;
     slideExhausted=false;
+    if(!keepChain||!usesSharedImageChain()){
+      slideChainOffset=0;
+      slideChainId='';
+    }
     slideHistory=[];
     slideHistorySequence=0;
     slidePreloads.clear();
@@ -2951,7 +3388,8 @@ function clearWaterfallPrefetch(){
 function prefetchNextWaterfallBatch(){
   if(waterfallPrefetchPromise||waterfallExhausted||waterfallPrefetch.length) return waterfallPrefetchPromise;
   const token=waterfallPrefetchToken;
-  waterfallPrefetchPromise=requestImages(WATERFALL_BATCH_SIZE).then(images=>{
+  setWaterfallBufferVisible(true);
+  waterfallPrefetchPromise=requestImages(WATERFALL_BATCH_SIZE,'waterfall').then(images=>{
     if(token!==waterfallPrefetchToken) return [];
     if(!images.length){waterfallExhausted=true;return [];}
     waterfallPrefetch=images;
@@ -2960,30 +3398,43 @@ function prefetchNextWaterfallBatch(){
     if(token===waterfallPrefetchToken) waterfallPrefetch=[];
     return [];
   }).finally(()=>{
-    if(token===waterfallPrefetchToken) waterfallPrefetchPromise=null;
+    if(token===waterfallPrefetchToken){
+      waterfallPrefetchPromise=null;
+      if(!waterfallLoading) setWaterfallBufferVisible(false);
+    }
   });
   return waterfallPrefetchPromise;
 }
 
-async function loadWaterfallBatch(reset,generation=renderGeneration){
+async function loadWaterfallBatch(reset,generation=renderGeneration,keepChain=false){
   if(waterfallLoading) return;
   if(!reset&&waterfallExhausted) return;
   waterfallLoading=true;
   refreshButton.disabled=true;
   gallery.setAttribute('aria-busy','true');
+  setWaterfallBufferVisible(true);
   try{
     if(reset){
       clearWaterfallPrefetch();
       waterfallRevealObserver.disconnect();
       loadedCount=0;
       cardSequence=0;
+      if(!keepChain||!usesSharedImageChain()){
+        waterfallChainOffset=0;
+        waterfallChainId='';
+      }
       waterfallExhausted=false;
       gallery.replaceChildren();
       setupWaterfallColumns();
     }
     if(generation!==renderGeneration) return;
     if(!waterfallPrefetch.length&&waterfallPrefetchPromise) await waterfallPrefetchPromise;
-    let images=waterfallPrefetch.length?waterfallPrefetch.splice(0,waterfallPrefetch.length):await requestImages(WATERFALL_BATCH_SIZE);
+    let images;
+    if(waterfallPrefetch.length){
+      images=waterfallPrefetch.splice(0,waterfallPrefetch.length);
+    }else{
+      images=await requestImages(WATERFALL_BATCH_SIZE,'waterfall');
+    }
     if(generation!==renderGeneration) return;
     if(!images.length){
       waterfallExhausted=true;
@@ -3002,7 +3453,7 @@ async function loadWaterfallBatch(reset,generation=renderGeneration){
       cards.forEach(appendWaterfallCard);
       prioritizeWaterfallImages(cards);
       loadedCount+=images.length;
-      if(images.length<WATERFALL_BATCH_SIZE) waterfallExhausted=true;
+      if(images.length<WATERFALL_BATCH_SIZE&&!usesSharedImageChain()) waterfallExhausted=true;
       statusEl.textContent='瀑布流 · 已加载 '+loadedCount+' 张';
       prefetchNextWaterfallBatch();
     }
@@ -3024,6 +3475,7 @@ async function loadWaterfallBatch(reset,generation=renderGeneration){
       waterfallLoading=false;
       refreshButton.disabled=false;
       gallery.setAttribute('aria-busy','false');
+      if(!waterfallPrefetchPromise) setWaterfallBufferVisible(false);
       maybeLoadMoreWaterfall();
     }
   }
@@ -3031,7 +3483,7 @@ async function loadWaterfallBatch(reset,generation=renderGeneration){
 
 function maybeLoadMoreWaterfall(){
   if(!settings||settings.view_layout!=='waterfall'||waterfallExhausted||waterfallLoading) return;
-  if(window.scrollY+window.innerHeight>=document.documentElement.scrollHeight*.6){
+  if(window.scrollY+window.innerHeight>=document.documentElement.scrollHeight*.8){
     loadWaterfallBatch(false).catch(showError);
   }
 }
@@ -3073,7 +3525,9 @@ async function recoverAfterIdle(){
   return recoveryPromise;
 }
 
-async function render(){
+async function render(options={}){
+  const keepChain=!!options.keepChain;
+  const restore=!!options.restore;
   clearSlideTimer();
   cancelUrlResolveTasks();
   lightboxResolveToken+=1;
@@ -3098,15 +3552,22 @@ async function render(){
   slideHistoryPanel.classList.toggle('hidden',restricted||settings.view_layout!=='slideshow');
   document.body.classList.toggle('has-slide-history',!restricted&&settings.view_layout==='slideshow');
   updateSlideshowToggle();
-  if(restricted){statusEl.textContent='维护中';gallery.setAttribute('aria-busy','false');return;}
+  if(restricted){setWaterfallBufferVisible(false);statusEl.textContent='维护中';gallery.setAttribute('aria-busy','false');return;}
   statusEl.textContent='正在加载…';
   applyGridStyle();
   try{
+    if(restore){
+      const snapshot=consumeGallerySnapshot();
+      if(restoreGallerySnapshot(snapshot)) return;
+    }else{
+      try{sessionStorage.removeItem(GALLERY_RESTORE_KEY);}catch(error){}
+    }
     if(settings.view_layout==='slideshow'){
-      await loadSlideshow(true,generation);
+      setWaterfallBufferVisible(false);
+      await loadSlideshow(true,generation,keepChain);
     }else{
       gallery.className='gallery waterfall';
-      await loadWaterfallBatch(true,generation);
+      await loadWaterfallBatch(true,generation,keepChain);
     }
   }finally{
     if(generation===renderGeneration){gallery.setAttribute('aria-busy','false');refreshButton.disabled=false;}
@@ -3138,7 +3599,7 @@ gallery.addEventListener('pointerup',event=>{
 gallery.addEventListener('pointercancel',()=>{touchSwipeStart=null;});
 slideshowToggle.onclick=()=>setSlideshowPaused(!slideshowPaused);
 slideHistoryLatest.onclick=()=>{const latest=slideHistory[slideHistory.length-1];if(latest)showHistoryImage(latest).catch(showError);};
-refreshButton.onclick=()=>render().catch(showError);
+refreshButton.onclick=()=>render({keepChain:true}).catch(showError);
 settingsButton.onclick=openPreferences;
 announcementButton.onclick=()=>showAnnouncement(true);
 if(contactButton){
@@ -3165,14 +3626,46 @@ headerMenuBackdrop.onclick=closeHeaderMenu;
 document.querySelector('#menu-previous').onclick=()=>{closeHeaderMenu();previousSlide();};
 document.querySelector('#menu-next').onclick=()=>{closeHeaderMenu();nextSlide().catch(showError);};
 document.querySelector('#menu-slideshow-toggle').onclick=()=>{closeHeaderMenu();setSlideshowPaused(!slideshowPaused);};
-document.querySelector('#menu-refresh').onclick=()=>{closeHeaderMenu();render().catch(showError);};
+document.querySelector('#menu-refresh').onclick=()=>{closeHeaderMenu();render({keepChain:true}).catch(showError);};
 document.querySelector('#menu-settings').onclick=()=>{closeHeaderMenu();openPreferences();};
 document.querySelector('#menu-announcement').onclick=()=>{closeHeaderMenu();showAnnouncement(true);};
 if(menuContact) menuContact.onclick=()=>{closeHeaderMenu();openContact();};
 document.querySelector('#maintenance-unlock').onclick=async()=>{const token=maintenanceToken.value.trim();if(!token){maintenanceMessage.textContent='请输入管理密钥。';return;}maintenanceMessage.textContent='正在验证…';const response=await fetch('/api/admin/config',{headers:{'X-OpenList-Admin-Token':token},cache:'no-store'});if(!response.ok){maintenanceMessage.textContent='管理密钥无效。';return;}maintenanceAccessToken=token;maintenanceMessage.textContent='';render().catch(showError);};
 lightboxDownload.onclick=()=>downloadImage().catch(showError);
-document.querySelector('#preferences-save').onclick=()=>{settings.view_layout=layoutMode.value;settings.slideshow_interval=Math.max(0,Math.min(300,Number(slideshowInterval.value)||0));settings.mobile_waterfall_columns=['1','2'].includes(mobileWaterfallColumns.value)?mobileWaterfallColumns.value:'1';settings.caption_mode=captionMode.value;settings.show_tags_enabled=showTagsEnabled.checked;settings.filter_mode=filterMode.value;settings.preview_quality=previewQuality.value;settings.lightbox_quality=lightboxQuality.value;persistPreferences();location.reload();};
-document.querySelector('#preferences-reset').onclick=()=>{localStorage.removeItem(PREFERENCE_KEY);location.reload();};
+document.querySelector('#preferences-save').onclick=()=>{
+  const previous={view_layout:settings.view_layout,slideshow_interval:settings.slideshow_interval,mobile_waterfall_columns:settings.mobile_waterfall_columns,caption_mode:settings.caption_mode,show_tags_enabled:settings.show_tags_enabled,filter_mode:settings.filter_mode,preview_quality:settings.preview_quality,lightbox_quality:settings.lightbox_quality};
+  settings.view_layout=layoutMode.value;
+  settings.slideshow_interval=Math.max(0,Math.min(300,Number(slideshowInterval.value)||0));
+  settings.mobile_waterfall_columns=['1','2'].includes(mobileWaterfallColumns.value)?mobileWaterfallColumns.value:'1';
+  settings.caption_mode=captionMode.value;
+  settings.show_tags_enabled=showTagsEnabled.checked;
+  settings.filter_mode=filterMode.value;
+  settings.preview_quality=previewQuality.value;
+  settings.lightbox_quality=lightboxQuality.value;
+  persistPreferences();
+  closePreferences();
+  const layoutChanged=previous.view_layout!==settings.view_layout;
+  if(layoutChanged){
+    render({keepChain:true}).catch(showError);
+    return;
+  }
+  if(previous.mobile_waterfall_columns!==settings.mobile_waterfall_columns&&settings.view_layout==='waterfall') setupWaterfallColumns();
+  if(previous.caption_mode!==settings.caption_mode||previous.show_tags_enabled!==settings.show_tags_enabled){
+    if(settings.view_layout==='slideshow') renderSlideshow();
+    else remountWaterfallCards();
+    return;
+  }
+  if(previous.filter_mode!==settings.filter_mode&&activeTagFilters.length){
+    render().catch(showError);
+    return;
+  }
+  if(previous.preview_quality!==settings.preview_quality||previous.lightbox_quality!==settings.lightbox_quality) retargetLoadedImages();
+  if(settings.view_layout==='slideshow'){
+    updateSlideshowStatus();
+    scheduleSlideshow();
+  }
+};
+document.querySelector('#preferences-reset').onclick=()=>{try{sessionStorage.removeItem(CHAIN_PROGRESS_KEY);sessionStorage.removeItem(GALLERY_RESTORE_KEY);sessionStorage.removeItem(ADMIN_RETURN_KEY);}catch(error){}localStorage.removeItem(PREFERENCE_KEY);location.reload();};
 themeFab.onclick=()=>{if(!settings)return;settings.theme=settings.theme==='light'?'dark':'light';applyGalleryTheme(settings.theme);persistPreferences();};
 document.querySelector('#preferences-close').onclick=closePreferences;
 preferencesBackdrop.onclick=closePreferences;
@@ -3254,7 +3747,14 @@ document.addEventListener('visibilitychange',()=>{
 });
 window.addEventListener('online',()=>recoverAfterIdle().catch(showError));
 if(pageHeader)document.documentElement.style.setProperty('--header-h',Math.ceil(pageHeader.getBoundingClientRect().height)+'px');
-loadSettings().then(value=>{settings=value;taggingConfig=settings.tagging;applyGalleryTheme(settings.theme);const annVisible=settings.announcement.enabled;announcementButton.classList.toggle('hidden',!annVisible);document.querySelector('#menu-announcement').classList.toggle('hidden',!annVisible);syncContactControls();showAnnouncement();loadTagCategories();return render();}).catch(showError);
+document.querySelectorAll('[data-admin-link]').forEach(link=>{
+  link.addEventListener('click',event=>{
+    if(event.defaultPrevented||event.button!==0||event.metaKey||event.ctrlKey||event.shiftKey||event.altKey) return;
+    markAdminRestore();
+  });
+});
+window.addEventListener('pagehide',()=>{persistChainProgress();});
+loadSettings().then(value=>{settings=value;taggingConfig=settings.tagging;applyGalleryTheme(settings.theme);const annVisible=settings.announcement.enabled;announcementButton.classList.toggle('hidden',!annVisible);document.querySelector('#menu-announcement').classList.toggle('hidden',!annVisible);syncContactControls();showAnnouncement();restoreChainProgress();loadTagCategories();return render({keepChain:true,restore:consumeAdminReturn()});}).catch(showError);
 </script>
 </body>
 </html>"""
@@ -3736,19 +4236,29 @@ def make_handler(application: Application):
                         return
                     request_start = time.time()
                     count = self._query_int(params, "count", 1)
+                    offset_raw = params.get("offset", [None])[0]
+                    offset = None if offset_raw in (None, "") else self._query_int(params, "offset", 0)
+                    chain_id = (params.get("chain", [""])[0] or "").strip() or None
                     tag_filter = params.get("tag", []) or params.get("tags", [])
                     filter_mode = params.get("filter_mode", ["union"])[0]
-                    images = application.choose_images(
-                        count, params.get("folder", [None])[0], parse_size(params.get("min_size", [None])[0]), parse_size(params.get("max_size", [None])[0]), tags=tag_filter or None, filter_mode=filter_mode
+                    use_shared_chain = not tag_filter and not params.get("folder", [None])[0] and not params.get("min_size", [None])[0] and not params.get("max_size", [None])[0]
+                    images, chain_info = application.choose_images(
+                        count, params.get("folder", [None])[0], parse_size(params.get("min_size", [None])[0]), parse_size(params.get("max_size", [None])[0]), tags=tag_filter or None, filter_mode=filter_mode, offset=offset, chain_id=chain_id, use_shared_chain=use_shared_chain
                     )
                     if not images:
                         logging.debug("images/random: count=%d tags=%s mode=%s -> 0 images in %.3fs", count, tag_filter, filter_mode, time.time() - request_start)
-                        return self._send_json(HTTPStatus.OK, {"images": []})
+                        payload = {"images": []}
+                        if chain_info:
+                            payload["chain"] = chain_info
+                        return self._send_json(HTTPStatus.OK, payload)
                     include_tags = application.config["tagging_enabled"] and application.config["tagging_scope"] != "disabled"
                     result = application.resolve_images_lazy(images, include_tags=include_tags)
                     cached = sum(1 for r in result if not r.get("needs_url"))
                     logging.debug("images/random: count=%d tags=%s mode=%s -> %d images (%d cached) in %.3fs", count, tag_filter, filter_mode, len(result), cached, time.time() - request_start)
-                    return self._send_json(HTTPStatus.OK, {"images": result})
+                    payload = {"images": result}
+                    if chain_info:
+                        payload["chain"] = chain_info
+                    return self._send_json(HTTPStatus.OK, payload)
                 if parsed.path == "/api/download-url":
                     if self._maintenance_access_required():
                         return
@@ -3772,7 +4282,7 @@ def make_handler(application: Application):
                 if parsed.path == "/random":
                     if self._maintenance_access_required():
                         return
-                    images = application.choose_images(1, params.get("folder", [None])[0], None, None)
+                    images, _chain = application.choose_images(1, params.get("folder", [None])[0], None, None)
                     if not images:
                         return self._send_json(HTTPStatus.NOT_FOUND, {"error": "no matching images"})
                     url = application.resolve_images(images)[0]["url"]

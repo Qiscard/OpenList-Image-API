@@ -103,9 +103,9 @@ systemd 启动命令：
 
 ### 3.3 URL 解析模型
 
-随机图片接口先返回索引元数据和已有缓存；未缓存项带 `needs_url: true`。浏览器随后通过 `POST /api/download-url` 的 `preview:true` 一次解析当前批次的缩略图，预览响应的 `url` 为空；批量失败时退回最多 3 路并发的单图请求。灯箱和下载再按需解析原图签名 URL。
+随机图片接口先返回索引元数据和已有缓存；未缓存项带 `needs_url: true`。浏览器随后立刻把卡片入列，并通过 `POST /api/download-url` 的 `preview:true` 在后台解析当前批次的缩略图，预览响应的 `url` 为空；批量失败或超时时退回最多 6 路并发的单图请求。灯箱和下载再按需解析原图签名 URL。
 
-服务端共享 20 个 URL 解析线程，批量接口最多接收 50 个有效去重路径，并在 8 秒后为未完成项返回 `url resolve timed out`。未索引路径和上游失败按路径返回独立错误。
+服务端共享 12 个 URL 解析线程，批量接口最多接收 50 个有效去重路径，并在 4 秒后为未完成项返回 `url resolve timed out`。超时后上游解析仍继续填缓存，不取消。未索引路径和上游失败按路径返回独立错误。
 
 `UrlCache.resolve()` 维护：
 
@@ -127,7 +127,7 @@ systemd 启动命令：
 | 图片索引 | `IndexRepository`、`build_index()` | 图片索引缓存、原子持久化和 BFS 重建。 |
 | 标签数据 | `TagRepository` | 点赞/踩、分类、统计、垃圾桶和旧路径迁移。 |
 | URL 缓存 | `UrlCache`、`_InflightResolve` | LRU/TTL、并发合并和缓存统计。 |
-| 应用服务 | `Application` | 配置视图、备份恢复、索引任务、筛选、换链和鉴权。 |
+| 应用服务 | `Application`、`SharedImageChain` | 配置视图、备份恢复、索引任务、筛选、共享随机链、换链和鉴权。 |
 | HTTP | `make_handler()`、`ConcurrentHTTPServer` | 路由、状态码、压缩、下载代理和错误处理。 |
 | 前端 | `gallery_html()`、`admin_html()` | 完整浏览页与管理页。 |
 | CLI | `command_serve()`、`command_refresh()`、`command_create_admin_token()` | 三个子命令入口。 |
@@ -189,8 +189,8 @@ TUI 从核心模块复用 `atomic_write_json()`、`load_config()` 和 `write_sec
 | `directory_display_depth` | `0` | 隐藏路径前 0–64 层。 |
 | `theme` | `dark` | 新浏览器的浏览页缺省主题。 |
 | `grid_gap` | `12` | 瀑布流间距 0–48。 |
-| `url_cache_size` | `0` | 0–5000；安装器生成配置为 1000。 |
-| `url_cache_ttl_seconds` | `1800` | 0–3600 秒。 |
+| `url_cache_size` | `0` | 0–8000；安装器生成配置为 4000。 |
+| `url_cache_ttl_seconds` | `7200` | 0–7200 秒。 |
 | `announcement_*` | 关闭/空内容/0 秒 | 标题 ≤120，内容 ≤4000，强制阅读 0–3600 秒。 |
 | `contact_*` | 关闭/空 | 联系按钮、QQ 号（5–12 位）、电脑端 `http(s)` 加好友链接和二维码图片地址。 |
 | `maintenance_enabled` | `false` | 维护模式总开关。 |
@@ -259,8 +259,10 @@ TUI 从核心模块复用 `atomic_write_json()`、`load_config()` 和 `write_sec
 请求参数：
 
 ```text
-count=1..50
-folder=/virtual/path
+	count=1..50
+	chain=<id>              # 未筛选浏览时沿当前/上一热点链分页
+	offset=0..              # 与 chain 一起使用；省略则从当前热点链开头取
+	folder=/virtual/path
 min_size=500kb
 max_size=10mb
 tag=landscape           # 可重复，也接受 tags
@@ -272,8 +274,10 @@ filter_mode=union|intersect
 ```text
 GET /api/images/random
   → Application.choose_images()
-  → 路径/大小/标签过滤
-  → random.sample 或 random.choice 回填
+	  → 路径/大小/标签过滤
+	  → 未筛选：SharedImageChain 按索引 generated_at 洗牌后切出约 4000 张热点链
+	  → 同一 chain+offset 返回同一批；链看完或每 2 小时整点窗口后轮转到下一条
+  → 否则 random.sample 或 random.choice 回填
   → Application.resolve_images_lazy()
   → 返回缓存中的 URL/缩略图，未缓存项标记 needs_url
   → 浏览器 POST /api/download-url {preview:true}
@@ -290,7 +294,7 @@ POST 请求体：
 {"paths":["/gallery/a.jpg","/gallery/b.jpg"],"fresh":false,"preview":true}
 ```
 
-`preview:true` 只返回缩略图，响应中的 `url` 为空；省略时返回原图签名 URL。`Application.indexed_images()` 一次扫描索引并保留有效去重顺序，最多处理 50 个路径。未索引路径返回 `image is not in the current index`；上游解析错误返回 `unable to resolve image URL`；超过 8 秒仍未完成的项目返回 `url resolve timed out`。接口不会解析索引外的任意 OpenList 路径。
+`preview:true` 只返回缩略图，响应中的 `url` 为空；省略时返回原图签名 URL。`Application.indexed_images()` 一次扫描索引并保留有效去重顺序，最多处理 50 个路径。未索引路径返回 `image is not in the current index`；上游解析错误返回 `unable to resolve image URL`；超过 4 秒仍未完成的项目返回 `url resolve timed out`，但上游解析会继续填缓存。接口不会解析索引外的任意 OpenList 路径。
 
 ### 6.4 下载
 
@@ -322,7 +326,8 @@ POST 请求体：
 `gallery_html()` 包含：
 
 - **幻灯片**：首批 6 张、预加载 2 张、历史上限 60、自动播放、页面按钮、菜单按钮和触屏滑动；页面隐藏、灯箱、设置面板或公告打开时暂停。
-- **瀑布流**：900 px 以上 3 列、561–900 px 2 列、560 px 以下按浏览器偏好使用 1 或 2 列；按估算高度放入最矮列，`IntersectionObserver` 负责接近视口时加载，滚动到 60% 后拉取下一批。
+- **瀑布流**：每批 20 张；900 px 以上 3 列、561–900 px 2 列、560 px 以下按浏览器偏好使用 1 或 2 列；按估算高度放入最矮列，占位卡显示 shimmer/转圈，`IntersectionObserver` 负责接近视口时加载，滚动到 80% 后拉取下一批，预取时底部 `#waterfall-sentinel` 显示缓冲动画。批量换链在后台进行，不挡住卡片入列；已完成的地址会回填到对应卡片。
+- **共享随机链**：未筛选的瀑布流和幻灯片请求带 `chain`/`offset`，所有访客共用当前约 4000 张热点链并各自独立分页，便于命中 URL 缓存。链被看完或每 2 小时整点窗口后切换到下一条，上一链在过期前仍可继续翻完。当前浏览器把 `chain`/`offset` 和已看路径记在 `sessionStorage`：刷新/重载跳过已加载图片，从管理页返回则恢复当前画面。仅改画质时就地改写已加载图片的 `src`，不整页刷新。带标签/目录/大小筛选时仍独立随机。
 - **灯箱**：0.5–4 倍缩放、90° 旋转、拖拽、捏合、双击复位和失效 URL 恢复。
 - **画质**：`sizedThumb()` 只改写已包含 `width`/`height` 参数的缩略图 URL，否则原样返回。
 - **公告**：使用受限 Markdown 转换、阅读倒计时和版本化关闭状态。`![说明](https://...)` 会渲染为图片，只接受 `http://` 或 `https://` 地址。
@@ -384,9 +389,9 @@ sudo -u openlist-image /usr/bin/python3 \
 
 ### 8.3 缓存默认值与迁移
 
-- Python 源码缺省：容量 0，TTL 1800 秒；适用于直接运行且配置缺失时。
-- 安装器生成配置：容量 1000，TTL 1800 秒。
-- 老安装默认值：200/240 会迁移到 1000/1800；`grid_scale` 125 仍兼容迁移到 150，但当前前端不读取它。
+- Python 源码缺省：容量 0，TTL 7200 秒；适用于直接运行且配置缺失时。
+- 安装器生成配置：容量 4000，TTL 7200 秒。
+- 老安装默认值：200/240 或 1000/1800 会迁移到 4000/7200；`grid_scale` 125 仍兼容迁移到 150，但当前前端不读取它。
 
 ### 8.4 不提供的运维机制
 

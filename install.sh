@@ -90,8 +90,8 @@ create_default_config() {
   "caption_mode": "path",
   "grid_gap": 12,
   "grid_scale": 150,
-  "url_cache_size": 1000,
-  "url_cache_ttl_seconds": 1800,
+  "url_cache_size": 4000,
+  "url_cache_ttl_seconds": 7200,
   "admin_token_file": "${CONFIG_DIR}/admin.token"
 }
 EOF
@@ -123,15 +123,17 @@ from pathlib import Path
 path = Path(sys.argv[1])
 data = json.loads(path.read_text(encoding="utf-8"))
 legacy_defaults = {
-    "grid_scale": (125, 150),
-    "url_cache_size": (200, 1000),
-    "url_cache_ttl_seconds": (240, 1800),
+    "grid_scale": [(125, 150)],
+    "url_cache_size": [(200, 4000), (1000, 4000)],
+    "url_cache_ttl_seconds": [(240, 7200), (1800, 7200)],
 }
 changed = []
-for key, (old_value, new_value) in legacy_defaults.items():
-    if data.get(key) == old_value:
-        data[key] = new_value
-        changed.append(key)
+for key, replacements in legacy_defaults.items():
+    for old_value, new_value in replacements:
+        if data.get(key) == old_value:
+            data[key] = new_value
+            changed.append(key)
+            break
 if changed:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print("[openlist-image-api] migrated performance defaults: " + ", ".join(changed))
