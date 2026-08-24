@@ -51,6 +51,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "contact_qq_number": "",
     "contact_qq_url": "",
     "contact_qr_url": "",
+    "contact_personal_label": "个人",
+    "contact_personal_url": "",
+    "contact_personal_image": "",
+    "contact_group_label": "群组",
+    "contact_group_url": "",
+    "contact_group_image": "",
     "maintenance_enabled": False,
     "theme": "dark",
     "grid_gap": 12,
@@ -103,6 +109,29 @@ def normalize_directories(values: Any) -> list[str]:
     return normalized
 
 
+def normalize_http_url(value: Any, key: str, limit: int = 300) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be a string")
+    value = value.strip()
+    if not value:
+        return ""
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"{key} must be an http or https URL")
+    if len(value) > limit:
+        raise ValueError(f"{key} is too long")
+    return value
+
+
+def normalize_contact_text(value: Any, key: str, default: str = "", limit: int = 20) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be a string")
+    value = value.strip() or default
+    if len(value) > limit:
+        raise ValueError(f"{key} is too long")
+    return value
+
+
 def is_loopback_openlist_url(value: Any) -> bool:
     if not isinstance(value, str):
         return False
@@ -152,36 +181,28 @@ def validate_config(candidate: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("announcement_version must be a non-negative integer")
     if not isinstance(config["contact_enabled"], bool):
         raise ValueError("contact_enabled must be a boolean")
-    if not isinstance(config["contact_label"], str):
-        raise ValueError("contact_label must be a string")
-    config["contact_label"] = config["contact_label"].strip() or "联系"
-    if len(config["contact_label"]) > 20:
-        raise ValueError("contact_label is too long")
+    config["contact_label"] = normalize_contact_text(config["contact_label"], "contact_label", "联系")
     if not isinstance(config["contact_qq_number"], str):
         raise ValueError("contact_qq_number must be a string")
     config["contact_qq_number"] = config["contact_qq_number"].strip()
     if config["contact_qq_number"] and not re.fullmatch(r"\d{5,12}", config["contact_qq_number"]):
         raise ValueError("contact_qq_number must be 5-12 digits")
-    if not isinstance(config["contact_qq_url"], str):
-        raise ValueError("contact_qq_url must be a string")
-    config["contact_qq_url"] = config["contact_qq_url"].strip()
-    if config["contact_qq_url"]:
-        parsed_contact = urlparse(config["contact_qq_url"])
-        if parsed_contact.scheme not in {"http", "https"} or not parsed_contact.netloc:
-            raise ValueError("contact_qq_url must be an http or https URL")
-        if len(config["contact_qq_url"]) > 300:
-            raise ValueError("contact_qq_url is too long")
-    if not isinstance(config["contact_qr_url"], str):
-        raise ValueError("contact_qr_url must be a string")
-    config["contact_qr_url"] = config["contact_qr_url"].strip()
-    if config["contact_qr_url"]:
-        parsed_qr = urlparse(config["contact_qr_url"])
-        if parsed_qr.scheme not in {"http", "https"} or not parsed_qr.netloc:
-            raise ValueError("contact_qr_url must be an http or https URL")
-        if len(config["contact_qr_url"]) > 300:
-            raise ValueError("contact_qr_url is too long")
-    if config["contact_enabled"] and not config["contact_qq_number"] and not config["contact_qq_url"]:
-        raise ValueError("contact requires a QQ number or a desktop URL")
+    config["contact_qq_url"] = normalize_http_url(config["contact_qq_url"], "contact_qq_url")
+    config["contact_qr_url"] = normalize_http_url(config["contact_qr_url"], "contact_qr_url")
+    config["contact_personal_label"] = normalize_contact_text(config["contact_personal_label"], "contact_personal_label", "个人")
+    config["contact_personal_url"] = normalize_http_url(config["contact_personal_url"], "contact_personal_url")
+    config["contact_personal_image"] = normalize_http_url(config["contact_personal_image"], "contact_personal_image")
+    config["contact_group_label"] = normalize_contact_text(config["contact_group_label"], "contact_group_label", "群组")
+    config["contact_group_url"] = normalize_http_url(config["contact_group_url"], "contact_group_url")
+    config["contact_group_image"] = normalize_http_url(config["contact_group_image"], "contact_group_image")
+    if not config["contact_personal_url"] and (config["contact_qq_url"] or config["contact_qq_number"]):
+        config["contact_personal_url"] = config["contact_qq_url"]
+    if not config["contact_personal_image"] and config["contact_qr_url"]:
+        config["contact_personal_image"] = config["contact_qr_url"]
+    has_personal = bool(config["contact_personal_url"] or config["contact_personal_image"] or config["contact_qq_number"])
+    has_group = bool(config["contact_group_url"] or config["contact_group_image"])
+    if config["contact_enabled"] and not has_personal and not has_group:
+        raise ValueError("contact requires a personal or group link, image, or QQ number")
     if not isinstance(config["maintenance_enabled"], bool):
         raise ValueError("maintenance_enabled must be a boolean")
     if config["theme"] not in {"light", "dark"}:
@@ -1214,12 +1235,29 @@ class Application:
             "required_seconds": self.config["announcement_required_seconds"] if self.config["announcement_enabled"] else 0,
             "version": self.config["announcement_version"],
         }
-        config["contact"] = {
-            "enabled": self.config["contact_enabled"] and bool(self.config["contact_qq_number"] or self.config["contact_qq_url"]),
-            "label": self.config["contact_label"],
+        personal_url = self.config["contact_personal_url"] or self.config["contact_qq_url"]
+        personal_image = self.config["contact_personal_image"] or self.config["contact_qr_url"]
+        personal = {
+            "label": self.config["contact_personal_label"] or "个人",
+            "url": personal_url if self.config["contact_enabled"] else "",
+            "image": personal_image if self.config["contact_enabled"] else "",
             "qq_number": self.config["contact_qq_number"] if self.config["contact_enabled"] else "",
-            "qq_url": self.config["contact_qq_url"] if self.config["contact_enabled"] else "",
-            "qr_url": self.config["contact_qr_url"] if self.config["contact_enabled"] else "",
+        }
+        group = {
+            "label": self.config["contact_group_label"] or "群组",
+            "url": self.config["contact_group_url"] if self.config["contact_enabled"] else "",
+            "image": self.config["contact_group_image"] if self.config["contact_enabled"] else "",
+        }
+        has_personal = bool(personal["url"] or personal["image"] or personal["qq_number"])
+        has_group = bool(group["url"] or group["image"])
+        config["contact"] = {
+            "enabled": self.config["contact_enabled"] and (has_personal or has_group),
+            "label": self.config["contact_label"],
+            "personal": personal if has_personal else None,
+            "group": group if has_group else None,
+            "qq_number": personal["qq_number"],
+            "qq_url": personal["url"],
+            "qr_url": personal["image"],
         }
         config["maintenance_enabled"] = self.config["maintenance_enabled"]
         config["filter_enabled"] = self.config["filter_enabled"]
@@ -1253,6 +1291,12 @@ class Application:
             "contact_qq_number": self.config["contact_qq_number"],
             "contact_qq_url": self.config["contact_qq_url"],
             "contact_qr_url": self.config["contact_qr_url"],
+            "contact_personal_label": self.config["contact_personal_label"],
+            "contact_personal_url": self.config["contact_personal_url"],
+            "contact_personal_image": self.config["contact_personal_image"],
+            "contact_group_label": self.config["contact_group_label"],
+            "contact_group_url": self.config["contact_group_url"],
+            "contact_group_image": self.config["contact_group_image"],
             "maintenance_enabled": self.config["maintenance_enabled"],
             "tagging_enabled": self.config["tagging_enabled"],
             "tagging_scope": self.config["tagging_scope"],
@@ -1279,6 +1323,12 @@ class Application:
             "contact_qq_number",
             "contact_qq_url",
             "contact_qr_url",
+            "contact_personal_label",
+            "contact_personal_url",
+            "contact_personal_image",
+            "contact_group_label",
+            "contact_group_url",
+            "contact_group_image",
             "maintenance_enabled",
             "tagging_enabled",
             "tagging_scope",
@@ -1323,6 +1373,12 @@ class Application:
                 "contact_qq_number": self.config["contact_qq_number"],
                 "contact_qq_url": self.config["contact_qq_url"],
                 "contact_qr_url": self.config["contact_qr_url"],
+                "contact_personal_label": self.config["contact_personal_label"],
+                "contact_personal_url": self.config["contact_personal_url"],
+                "contact_personal_image": self.config["contact_personal_image"],
+                "contact_group_label": self.config["contact_group_label"],
+                "contact_group_url": self.config["contact_group_url"],
+                "contact_group_image": self.config["contact_group_image"],
                 "maintenance_enabled": self.config["maintenance_enabled"],
                 "tagging_enabled": self.config["tagging_enabled"],
                 "tagging_scope": self.config["tagging_scope"],
@@ -1369,6 +1425,12 @@ class Application:
             "contact_qq_number",
             "contact_qq_url",
             "contact_qr_url",
+            "contact_personal_label",
+            "contact_personal_url",
+            "contact_personal_image",
+            "contact_group_label",
+            "contact_group_url",
+            "contact_group_image",
             "maintenance_enabled",
             "tagging_enabled",
             "tagging_scope",
@@ -1928,9 +1990,12 @@ body.theme-light{color-scheme:light;--bg:#f3f5f8;--bg-elev:#fff;--bg-soft:#eef1f
 body.theme-light .card img,body.theme-light .lightbox-stage,body.theme-light .slide-thumbnail{background:#e8edf5}
 body:not(.theme-light)::after{content:'';position:fixed;inset:0;z-index:10000;pointer-events:none;background:rgba(0,0,0,.32)}
 .contact-wrap{position:relative;display:inline-flex}
-#contact-popover{position:absolute;z-index:12;top:calc(100% + 8px);right:0;width:196px;padding:10px;border:1px solid var(--line);border-radius:14px;background:var(--bg-elev);box-shadow:var(--shadow);text-align:center}
-#contact-popover img{display:block;width:176px;height:176px;object-fit:contain;border-radius:10px;background:#fff}
-#contact-popover .meta{margin:8px 0 0}
+#contact-popover{position:absolute;z-index:12;top:calc(100% + 8px);right:0;width:260px;padding:12px;border:1px solid var(--line);border-radius:14px;background:var(--bg-elev);box-shadow:var(--shadow)}
+#contact-popover .contact-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+#contact-popover .contact-card{display:flex;flex-direction:column;align-items:center;gap:6px;padding:8px 6px;border-radius:10px;background:var(--bg-soft);cursor:pointer;text-decoration:none;color:var(--text);transition:background .15s}
+#contact-popover .contact-card:hover{background:var(--accent);color:#fff}
+#contact-popover .contact-card img{display:block;width:96px;height:96px;object-fit:contain;border-radius:8px;background:#fff}
+#contact-popover .contact-card .contact-text{font-size:13px;font-weight:600;text-align:center;line-height:1.3}
 .header-menu #contact-popover{right:auto;left:12px;top:auto;bottom:calc(100% + 8px)}
 @media(max-width:760px){
   header{padding:8px 12px}
@@ -1982,8 +2047,7 @@ body:not(.theme-light)::after{content:'';position:fixed;inset:0;z-index:10000;po
     <span class="contact-wrap hidden" id="contact-wrap">
       <button id="contact-button" class="ghost" type="button">联系</button>
       <div id="contact-popover" class="hidden" role="tooltip">
-        <img id="contact-qr" alt="QQ 二维码">
-        <p class="meta">扫码添加 QQ</p>
+        <div class="contact-grid" id="contact-grid"></div>
       </div>
     </span>
     <a href="/admin" class="button ghost" data-admin-link>管理</a>
@@ -2067,7 +2131,7 @@ const announcementButton=document.querySelector('#announcement-button');
 const contactWrap=document.querySelector('#contact-wrap');
 const contactButton=document.querySelector('#contact-button');
 const contactPopover=document.querySelector('#contact-popover');
-const contactQr=document.querySelector('#contact-qr');
+const contactGrid=document.querySelector('#contact-grid');
 const menuContact=document.querySelector('#menu-contact');
 const announcementContact=document.querySelector('#announcement-contact');
 const maintenance=document.querySelector('#maintenance');
@@ -2262,16 +2326,25 @@ function setAnnouncementCountdown(seconds,key){
 let announcementReturnFocus=null;
 function isMobileContact(){return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);}
 function contactConfig(){return settings&&settings.contact&&settings.contact.enabled?settings.contact:null;}
-function contactHref(){
+function contactEntries(){
   const contact=contactConfig();
-  if(!contact) return '';
-  if(isMobileContact()){
-    if(contact.qq_number) return 'mqqwpa://im/chat?chat_type=wpa&uin='+encodeURIComponent(contact.qq_number)+'&version=1&src_type=web&web_src=oicqzone.com';
-    return contact.qq_url||'';
+  if(!contact) return [];
+  const entries=[];
+  const personal=contact.personal;
+  if(personal){
+    let url=personal.url||'';
+    if(!url&&personal.qq_number){
+      url=isMobileContact()
+        ?'mqqwpa://im/chat?chat_type=wpa&uin='+encodeURIComponent(personal.qq_number)+'&version=1&src_type=web&web_src=oicqzone.com'
+        :'tencent://message/?uin='+encodeURIComponent(personal.qq_number)+'&Site=OpenList&Menu=yes';
+    }
+    entries.push({label:personal.label||'个人',image:personal.image||'',url});
   }
-  if(contact.qq_url) return contact.qq_url;
-  if(contact.qq_number) return 'tencent://message/?uin='+encodeURIComponent(contact.qq_number)+'&Site=OpenList&Menu=yes';
-  return '';
+  const group=contact.group;
+  if(group){
+    entries.push({label:group.label||'群组',image:group.image||'',url:group.url||''});
+  }
+  return entries;
 }
 function syncContactControls(){
   const contact=contactConfig();
@@ -2281,18 +2354,44 @@ function syncContactControls(){
   if(contactButton) contactButton.textContent=label;
   if(menuContact){menuContact.classList.toggle('hidden',!enabled);menuContact.textContent=label;}
   if(announcementContact){announcementContact.classList.toggle('hidden',!enabled);announcementContact.textContent=label;}
-  if(contactQr){
-    if(contact&&contact.qr_url){contactQr.src=contact.qr_url;contactQr.alt=label+' 二维码';}
-    else {contactQr.removeAttribute('src');contactQr.alt='';}
-  }
+  if(contactGrid) contactGrid.replaceChildren();
 }
 function hideContactPopover(){if(contactPopover) contactPopover.classList.add('hidden');}
-function showContactPopover(){if(!contactConfig()||!contactConfig().qr_url||!contactPopover) return;contactPopover.classList.remove('hidden');}
+function showContactPopover(){
+  if(!contactConfig()||!contactPopover||!contactGrid) return;
+  const entries=contactEntries();
+  if(!entries.length) return;
+  contactGrid.replaceChildren(...entries.map(entry=>{
+    const card=document.createElement(entry.url?'a':'div');
+    card.className='contact-card';
+    if(entry.url){card.href=entry.url;card.target='_blank';card.rel='noopener noreferrer';}
+    if(entry.image){
+      const img=document.createElement('img');
+      img.src=entry.image;
+      img.alt=entry.label;
+      img.loading='lazy';
+      img.referrerPolicy='no-referrer';
+      card.append(img);
+    }
+    const text=document.createElement('span');
+    text.className='contact-text';
+    text.textContent=entry.label;
+    card.append(text);
+    return card;
+  }));
+  contactPopover.classList.remove('hidden');
+}
 function openContact(){
-  const href=contactHref();
-  if(!href) return;
-  hideContactPopover();
-  window.open(href,'_blank');
+  const entries=contactEntries();
+  if(!entries.length) return;
+  const primary=entries.find(entry=>entry.url)||entries[0];
+  if(primary&&primary.url){
+    hideContactPopover();
+    window.open(primary.url,'_blank');
+    return;
+  }
+  if(!contactPopover.classList.contains('hidden')){hideContactPopover();return;}
+  showContactPopover();
 }
 
 function showAnnouncement(force=false){
@@ -3894,10 +3993,20 @@ body:not(.theme-light)::after{content:'';position:fixed;inset:0;z-index:10000;po
     <h3>联系方式</h3>
     <label class="check"><input id="contact-enabled" type="checkbox">显示联系按钮</label>
     <label>按钮文字<input id="contact-label" maxlength="20" placeholder="联系"></label>
-    <label>QQ 号码<input id="contact-qq-number" inputmode="numeric" maxlength="12" placeholder="3473905540"></label>
-    <label>电脑端加好友链接<input id="contact-qq-url" maxlength="300" placeholder="https://qm.qq.com/q/..."></label>
-    <label>二维码图片地址<input id="contact-qr-url" maxlength="300" placeholder="https://example.com/qq-qr.png"></label>
-    <p class="note">电脑悬停显示二维码，点击打开 QQ；手机长按显示二维码，点击跳转加好友。二维码需使用公网图片地址。</p>
+    <p class="note">下方配置个人和群组联系方式。每项可填图片（二维码等）和跳转链接；无图片时只显示文字。图片需使用公网 http/https 地址。</p>
+    <h4>个人联系</h4>
+    <label>文字<input id="contact-personal-label" maxlength="20" placeholder="个人"></label>
+    <label>跳转链接<input id="contact-personal-url" maxlength="300" placeholder="https://qm.qq.com/q/..."></label>
+    <label>图片地址<input id="contact-personal-image" maxlength="300" placeholder="https://example.com/qq-qr.png"></label>
+    <p class="note">留空链接时可填 QQ 号（下方旧字段），电脑端自动走 tencent://，手机端走 mqqwpa://。</p>
+    <label>QQ 号码（兼容旧字段）<input id="contact-qq-number" inputmode="numeric" maxlength="12" placeholder="3473905540"></label>
+    <label>旧电脑端链接（兼容）<input id="contact-qq-url" maxlength="300" placeholder="https://qm.qq.com/q/..."></label>
+    <label>旧二维码图片（兼容）<input id="contact-qr-url" maxlength="300" placeholder="https://example.com/qq-qr.png"></label>
+    <h4>群组联系</h4>
+    <label>文字<input id="contact-group-label" maxlength="20" placeholder="群组"></label>
+    <label>跳转链接<input id="contact-group-url" maxlength="300" placeholder="https://qm.qq.com/q/..."></label>
+    <label>图片地址<input id="contact-group-image" maxlength="300" placeholder="https://example.com/group-qr.png"></label>
+    <p class="note">浏览页联系弹层一行最多两格，图片在上、文字在下，点击图片或文字跳转对应链接。</p>
   </div>
 
   <div id="tab-tags" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-tags">
@@ -3953,7 +4062,7 @@ function showSelected(){const root=document.querySelector('#selected');root.repl
 function escapeHtml(value){return value.replace(/[&<>"']/g,character=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));}
 function renderMarkdown(value){return escapeHtml(value).replace(/&lt;font\s+color=(?:&quot;|&#39;)?(#[0-9a-f]{3,8}|[a-z]+)(?:&quot;|&#39;)?\s*&gt;/gi,'<span style="color:$1">').replace(/&lt;\/font&gt;/gi,'</span>').replace(/```([\s\S]*?)```/g,'<pre><code>$1</code></pre>').replace(/^### (.*)$/gm,'<h3>$1</h3>').replace(/^## (.*)$/gm,'<h2>$1</h2>').replace(/^# (.*)$/gm,'<h1>$1</h1>').replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>').replace(/\*([^*]+)\*/g,'<em>$1</em>').replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g,'<img src="$2" alt="$1" loading="lazy" referrerpolicy="no-referrer">').replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>').replace(/\n\n/g,'</p><p>').replace(/\n/g,'<br>');}
 function previewAnnouncement(){document.querySelector('#announcement-preview').innerHTML='<p>'+renderMarkdown(document.querySelector('#announcement-content').value)+'</p>';}
-function showAdmin(){document.querySelector('#default-caption').value=config.caption_mode;document.querySelector('#directory-display-enabled').checked=config.directory_display_enabled;document.querySelector('#directory-display-depth').value=config.directory_display_depth;document.querySelector('#theme').value=config.theme||'dark';document.querySelector('#announcement-enabled').checked=config.announcement_enabled;document.querySelector('#announcement-title').value=config.announcement_title;document.querySelector('#announcement-content').value=config.announcement_content;document.querySelector('#announcement-required-seconds').value=config.announcement_required_seconds;document.querySelector('#contact-enabled').checked=config.contact_enabled||false;document.querySelector('#contact-label').value=config.contact_label||'联系';document.querySelector('#contact-qq-number').value=config.contact_qq_number||'';document.querySelector('#contact-qq-url').value=config.contact_qq_url||'';document.querySelector('#contact-qr-url').value=config.contact_qr_url||'';document.querySelector('#maintenance-enabled').checked=config.maintenance_enabled;document.querySelector('#tagging-enabled').checked=config.tagging_enabled||false;document.querySelector('#tagging-scope').value=config.tagging_scope||'disabled';document.querySelector('#tagging-categories').value=(config.tagging_categories||[]).join('\n');document.querySelector('#filter-enabled').checked=config.filter_enabled!==false;document.querySelector('#log-level').value=config.log_level||'INFO';document.querySelector('#protected').classList.remove('hidden');showSelected();previewAnnouncement();refreshRebuildStatus().catch(report);}
+function showAdmin(){document.querySelector('#default-caption').value=config.caption_mode;document.querySelector('#directory-display-enabled').checked=config.directory_display_enabled;document.querySelector('#directory-display-depth').value=config.directory_display_depth;document.querySelector('#theme').value=config.theme||'dark';document.querySelector('#announcement-enabled').checked=config.announcement_enabled;document.querySelector('#announcement-title').value=config.announcement_title;document.querySelector('#announcement-content').value=config.announcement_content;document.querySelector('#announcement-required-seconds').value=config.announcement_required_seconds;document.querySelector('#contact-enabled').checked=config.contact_enabled||false;document.querySelector('#contact-label').value=config.contact_label||'联系';document.querySelector('#contact-qq-number').value=config.contact_qq_number||'';document.querySelector('#contact-qq-url').value=config.contact_qq_url||'';document.querySelector('#contact-qr-url').value=config.contact_qr_url||'';document.querySelector('#contact-personal-label').value=config.contact_personal_label||'个人';document.querySelector('#contact-personal-url').value=config.contact_personal_url||'';document.querySelector('#contact-personal-image').value=config.contact_personal_image||'';document.querySelector('#contact-group-label').value=config.contact_group_label||'群组';document.querySelector('#contact-group-url').value=config.contact_group_url||'';document.querySelector('#contact-group-image').value=config.contact_group_image||'';document.querySelector('#maintenance-enabled').checked=config.maintenance_enabled;document.querySelector('#tagging-enabled').checked=config.tagging_enabled||false;document.querySelector('#tagging-scope').value=config.tagging_scope||'disabled';document.querySelector('#tagging-categories').value=(config.tagging_categories||[]).join('\n');document.querySelector('#filter-enabled').checked=config.filter_enabled!==false;document.querySelector('#log-level').value=config.log_level||'INFO';document.querySelector('#protected').classList.remove('hidden');showSelected();previewAnnouncement();refreshRebuildStatus().catch(report);}
 async function errorText(response,fallback){try{const data=await response.json();return data.error||fallback;}catch(error){return fallback;}}
 async function load(){const response=await fetch('/api/admin/config',{headers:auth(),cache:'no-store'});if(!response.ok)throw new Error(await errorText(response,'令牌无效或服务不可用'));config=await response.json();showAdmin();setAdminStatus('服务器配置已加载');}
 function addDirectory(path){if(!config.directories.includes(path)){config.directories.push(path);showSelected();setAdminStatus('已添加目录：'+path+'，请保存服务器配置');}}
@@ -4038,7 +4147,7 @@ async function browse(){
   if(!data.directories.length){container.innerHTML='<p class="note">当前目录没有子目录。</p>';}
   else{data.directories.forEach(item=>{const child=buildTreeNode(item.name,item.path,true,item.has_children);container.append(child);});}
 }
-async function saveServer(){if(!config)throw new Error('请先加载服务器配置');const payload={directories:config.directories,caption_mode:document.querySelector('#default-caption').value,directory_display_enabled:document.querySelector('#directory-display-enabled').checked,directory_display_depth:Number(document.querySelector('#directory-display-depth').value),theme:document.querySelector('#theme').value,announcement_enabled:document.querySelector('#announcement-enabled').checked,announcement_title:document.querySelector('#announcement-title').value,announcement_content:document.querySelector('#announcement-content').value,announcement_required_seconds:Number(document.querySelector('#announcement-required-seconds').value),contact_enabled:document.querySelector('#contact-enabled').checked,contact_label:document.querySelector('#contact-label').value,contact_qq_number:document.querySelector('#contact-qq-number').value,contact_qq_url:document.querySelector('#contact-qq-url').value,contact_qr_url:document.querySelector('#contact-qr-url').value,maintenance_enabled:document.querySelector('#maintenance-enabled').checked,tagging_enabled:document.querySelector('#tagging-enabled').checked,tagging_scope:document.querySelector('#tagging-scope').value,tagging_categories:document.querySelector('#tagging-categories').value.split('\n').map(s=>s.trim()).filter(Boolean),filter_enabled:document.querySelector('#filter-enabled').checked,log_level:document.querySelector('#log-level').value};const response=await fetch('/api/admin/config',{method:'PUT',headers:auth(),body:JSON.stringify(payload)});if(!response.ok)throw new Error(await errorText(response,'保存失败'));config=await response.json();showAdmin();setAdminStatus('全局服务器配置已保存；公告修改后将向访客显示新版本。');}
+async function saveServer(){if(!config)throw new Error('请先加载服务器配置');const payload={directories:config.directories,caption_mode:document.querySelector('#default-caption').value,directory_display_enabled:document.querySelector('#directory-display-enabled').checked,directory_display_depth:Number(document.querySelector('#directory-display-depth').value),theme:document.querySelector('#theme').value,announcement_enabled:document.querySelector('#announcement-enabled').checked,announcement_title:document.querySelector('#announcement-title').value,announcement_content:document.querySelector('#announcement-content').value,announcement_required_seconds:Number(document.querySelector('#announcement-required-seconds').value),contact_enabled:document.querySelector('#contact-enabled').checked,contact_label:document.querySelector('#contact-label').value,contact_qq_number:document.querySelector('#contact-qq-number').value,contact_qq_url:document.querySelector('#contact-qq-url').value,contact_qr_url:document.querySelector('#contact-qr-url').value,contact_personal_label:document.querySelector('#contact-personal-label').value,contact_personal_url:document.querySelector('#contact-personal-url').value,contact_personal_image:document.querySelector('#contact-personal-image').value,contact_group_label:document.querySelector('#contact-group-label').value,contact_group_url:document.querySelector('#contact-group-url').value,contact_group_image:document.querySelector('#contact-group-image').value,maintenance_enabled:document.querySelector('#maintenance-enabled').checked,tagging_enabled:document.querySelector('#tagging-enabled').checked,tagging_scope:document.querySelector('#tagging-scope').value,tagging_categories:document.querySelector('#tagging-categories').value.split('\n').map(s=>s.trim()).filter(Boolean),filter_enabled:document.querySelector('#filter-enabled').checked,log_level:document.querySelector('#log-level').value};const response=await fetch('/api/admin/config',{method:'PUT',headers:auth(),body:JSON.stringify(payload)});if(!response.ok)throw new Error(await errorText(response,'保存失败'));config=await response.json();showAdmin();setAdminStatus('全局服务器配置已保存；公告修改后将向访客显示新版本。');}
 function formatClock(value){const seconds=Math.max(0,Math.round(Number(value)||0));const minutes=String(Math.floor(seconds/60)).padStart(2,'0');const rest=String(seconds%60).padStart(2,'0');return minutes+':'+rest;}
 function formatIndexDate(unix){const date=new Date(Number(unix)*1000);if(!unix||Number.isNaN(date.getTime()))return '';const month=String(date.getMonth()+1).padStart(2,'0');const day=String(date.getDate()).padStart(2,'0');return month+'.'+day+' 数据';}
 function applyRebuildStatus(status){

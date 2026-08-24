@@ -61,6 +61,12 @@ class AdminConfigurationTests(unittest.TestCase):
                     "contact_qq_number",
                     "contact_qq_url",
                     "contact_qr_url",
+                    "contact_personal_label",
+                    "contact_personal_url",
+                    "contact_personal_image",
+                    "contact_group_label",
+                    "contact_group_url",
+                    "contact_group_image",
                     "maintenance_enabled",
                     "tagging_enabled",
                     "tagging_scope",
@@ -185,6 +191,10 @@ class WebUiMarkupTests(unittest.TestCase):
         self.assertIn("tencent://message/?uin=", page)
         self.assertIn("mqqwpa://im/chat?chat_type=wpa&uin=", page)
         self.assertIn("function openContact()", page)
+        self.assertIn("contactEntries()", page)
+        self.assertIn("contact-grid", page)
+        self.assertIn("contact-card", page)
+        self.assertIn("contact-text", page)
         self.assertIn("!\\[([^\\]]*)\\]\\((https?:\\/\\/[^\\s)]+)\\)", page)
         self.assertIn('<img src="$2" alt="$1" loading="lazy" referrerpolicy="no-referrer">', page)
         self.assertIn(".announcement-content img{display:block;max-width:100%", page)
@@ -238,6 +248,14 @@ class WebUiMarkupTests(unittest.TestCase):
         self.assertIn("#contact-qq-url", page)
         self.assertIn("#contact-qr-url", page)
         self.assertIn("contact_qr_url", page)
+        self.assertIn("#contact-personal-label", page)
+        self.assertIn("#contact-personal-url", page)
+        self.assertIn("#contact-personal-image", page)
+        self.assertIn("#contact-group-label", page)
+        self.assertIn("#contact-group-url", page)
+        self.assertIn("#contact-group-image", page)
+        self.assertIn("contact_personal_label", page)
+        self.assertIn("contact_group_image", page)
         self.assertIn("#maintenance-enabled", page)
         self.assertGreater(page.find('id="maintenance-enabled"'), page.find('id="tab-tools"'))
         self.assertIn("id=\"rebuild-status\"", page)
