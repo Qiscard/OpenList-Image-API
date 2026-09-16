@@ -73,8 +73,10 @@ ALLOWED_LAYOUTS = {"single", "grid", "waterfall"}
 ALLOWED_DELIVERY = {"preview", "download"}
 ALLOWED_CAPTION_MODES = {"path", "name", "hidden"}
 MAX_REQUEST_BODY = 64 * 1024
-URL_RESOLVE_WORKERS = 12
-URL_RESOLVE_WAIT_SECONDS = 4
+URL_RESOLVE_WORKERS = 6
+URL_RESOLVE_WAIT_SECONDS = 25
+# BaiduPhoto fs/get often needs 15-40s; short timeouts cancel OpenList upstream work.
+URL_RESOLVE_OPENLIST_TIMEOUT_SECONDS = 45
 INDEX_LIST_TIMEOUT_SECONDS = 60
 INDEX_LIST_PAGE_SIZE = 100
 INDEX_LIST_WORKERS = 4
@@ -457,7 +459,7 @@ class OpenListClient:
         data = self._post(
             "/api/fs/get",
             {"path": path, "password": "", "refresh": False},
-            timeout=8,
+            timeout=URL_RESOLVE_OPENLIST_TIMEOUT_SECONDS,
             retries=1,
             retry_throttled_only=True,
         )
@@ -473,7 +475,7 @@ class OpenListClient:
         data = self._post(
             "/api/fs/get",
             {"path": path, "password": "", "refresh": False},
-            timeout=8,
+            timeout=URL_RESOLVE_OPENLIST_TIMEOUT_SECONDS,
             retries=1,
             retry_throttled_only=True,
         )
