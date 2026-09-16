@@ -28,7 +28,7 @@ OpenList Image API 为本机 OpenList 中选定目录的图片建立轻量索引
 - 公告、维护模式、配置备份和全局迁移打包；
 - systemd 部署与交互式终端管理。
 
-生产端没有 Python 第三方依赖，前端 HTML/CSS/JavaScript 由 [`src/openlist_image_api.py`](src/openlist_image_api.py) 直接内嵌返回。
+生产端没有 Python 第三方依赖。浏览页与管理页 HTML/CSS/JavaScript 放在 [`src/webui/`](src/webui/)，由 [`src/openlist_image_api.py`](src/openlist_image_api.py) 的 `load_webui()` 读取并缓存后返回；安装器把 `webui/` 一并装到 `/opt/openlist-image-api/webui/`。
 
 ## 2. 仓库结构
 
@@ -36,12 +36,16 @@ OpenList Image API 为本机 OpenList 中选定目录的图片建立轻量索引
 OpenList-Image-API/
 ├── .github/workflows/ci.yml       # GitHub Actions 检查
 ├── src/
-│   ├── openlist_image_api.py      # HTTP 服务、索引、缓存、标签和内嵌 WebUI
-│   └── openlist_tui.py            # 终端管理界面
+│   ├── openlist_image_api.py      # HTTP 服务、索引、缓存、标签和 WebUI 加载
+│   ├── openlist_tui.py            # 终端管理界面
+│   └── webui/
+│       ├── gallery.html           # 浏览页
+│       └── admin.html             # 管理页
 ├── tests/
 │   ├── mock_openlist.py           # 手动测试用 OpenList 模拟服务
 │   ├── test_core.py               # 配置、索引、缓存、换链测试
-│   └── test_management_features.py# WebUI、管理 API、TUI、安装器测试
+│   ├── test_management_features.py# WebUI、管理 API、TUI、安装器测试
+│   └── test_browser_smoke.py      # 可选 Playwright 无头冒烟
 ├── install.sh                     # 安装、更新、卸载和 OpenList 部署
 ├── README.md                      # 用户与部署文档
 ├── CODE_WIKI.md                   # 本文档
@@ -95,11 +99,14 @@ systemd 启动命令：
 
 1. `OpenListClient.list_directory()` 分页读取目录，每页 1000 条；单目录分页保持串行，索引列表请求使用 10 秒超时；
 2. 正常轮次最多使用 4 个目录扫描 worker，子目录加入 `deque`，图片按扩展名过滤；
-3. 首轮失败目录记录后，在扫描末尾以单 worker 串行重试一次；仍失败的目录写入最终 `errors`，不阻塞其他目录；
-4. `state_dir/index.checkpoint.json` 以原子方式记录队列、已访问目录、图片、失败目录和配置指纹；进程中断后仅在目录与扩展名指纹匹配时恢复，损坏或过期 checkpoint 自动忽略；
-5. 成功后 `IndexRepository.save()` 原子写入 `index.json`，再删除 checkpoint；重建期间旧 `index.json` 始终可读。
+3. 对 `BaiduPhoto` 挂载根：只把名称匹配 `^\d+$` 的子目录入队，相册内部不再向下展开；普通存储仍完整 BFS；
+4. 首轮失败目录记录后，在扫描末尾以单 worker 串行重试一次；仍失败的目录写入最终 `errors`，不阻塞其他目录；
+5. `state_dir/index.checkpoint.json` 以原子方式记录队列、已访问目录、图片、失败目录和配置指纹；进程中断后仅在目录与扩展名指纹匹配时恢复，损坏或过期 checkpoint 自动忽略；
+6. 成功后 `IndexRepository.save()` 原子写入 `index.json`，再删除 checkpoint；重建期间旧 `index.json` 始终可读。
 
-目录选择器不使用持久目录索引。`Application.list_directories()` 每次直接请求 OpenList，根目录请求失败时才回退到当前已配置目录。
+目录选择器不使用持久目录索引。`Application.list_directories()` 每次直接请求 OpenList，根目录请求失败时才回退到当前已配置目录。对 OpenList 中 `driver=BaiduPhoto`（一刻相册）的挂载点：管理页只展示为可勾选的存储器叶节点（`has_children=false` / `leaf=true`），不展开其子目录，避免一次加载数百个作者相册导致管理页卡顿。
+
+挂载识别优先使用 `GET /api/admin/storage/list` 的 `driver` 字段，失败时再对候选路径 `POST /api/fs/get` 读取 `provider`。随机浏览不重扫存储：访客请求只读本地索引路径，再经 URL 缓存换链；约 300 个作者相册的重建在本机 OpenList 上通常约 1.5–5 分钟（抽样约 3.4 册/秒量级，大册分页与上游限流会使上限变长）。
 
 ### 3.3 URL 解析模型
 
@@ -129,7 +136,8 @@ systemd 启动命令：
 | URL 缓存 | `UrlCache`、`_InflightResolve` | LRU/TTL、并发合并和缓存统计。 |
 | 应用服务 | `Application`、`SharedImageChain` | 配置视图、备份恢复、索引任务、筛选、共享随机链、换链和鉴权。 |
 | HTTP | `make_handler()`、`ConcurrentHTTPServer` | 路由、状态码、压缩、下载代理和错误处理。 |
-| 前端 | `gallery_html()`、`admin_html()` | 完整浏览页与管理页。 |
+| 前端 | `webui_dir()`、`load_webui()`、`gallery_html()`、`admin_html()` | 从同目录 `webui/*.html` 加载完整浏览页与管理页并进程内缓存。 |
+| 一刻策略 | `BAIDU_PHOTO_DRIVER`、`DIGIT_FOLDER_RE`、`baidu_photo_scan_mode()`、`discover_baidu_photo_mounts()` | 识别 BaiduPhoto 挂载；管理树不展开；索引只扫纯数字作者夹。 |
 | CLI | `command_serve()`、`command_refresh()`、`command_create_admin_token()` | 三个子命令入口。 |
 
 ### 4.2 `src/openlist_tui.py`
@@ -192,7 +200,7 @@ TUI 从核心模块复用 `atomic_write_json()`、`load_config()` 和 `write_sec
 | `url_cache_size` | `0` | 0–8000；安装器生成配置为 4000。 |
 | `url_cache_ttl_seconds` | `7200` | 0–7200 秒。 |
 | `announcement_*` | 关闭/空内容/0 秒 | 标题 ≤120，内容 ≤4000，强制阅读 0–3600 秒。 |
-| `contact_*` | 关闭/空 | 联系按钮、QQ 号（5–12 位）、旧电脑端链接和旧二维码（兼容个人联系）、个人/群组各自的文字、跳转链接和图片地址。弹层一行最多两格，图片在上文字在下，无图片时只显示文字。 |
+| `contact_*` | 关闭/空 | 联系按钮、个人/群组各自的文字、跳转链接和图片地址。点击按钮展开/关闭弹层；一行最多两格，宽度按条目数自适应；图片在上文字在下，无图片时只显示文字。 |
 | `maintenance_enabled` | `false` | 维护模式总开关。 |
 | `tagging_enabled` | `false` | 标签总开关。 |
 | `tagging_scope` | `anonymous` | `disabled`/`anonymous`/`token`。 |
@@ -323,7 +331,7 @@ POST 请求体：
 
 ### 7.1 浏览页
 
-`gallery_html()` 包含：
+`src/webui/gallery.html`（经 `gallery_html()` 加载）包含：
 
 - **幻灯片**：首批 6 张、预加载 2 张、历史上限 60、自动播放、页面按钮、菜单按钮和触屏滑动；页面隐藏、灯箱、设置面板或公告打开时暂停。
 - **瀑布流**：每批 20 张；900 px 以上 3 列、561–900 px 2 列、560 px 以下按浏览器偏好使用 1 或 2 列；按估算高度放入最矮列，占位卡显示 shimmer/转圈，`IntersectionObserver` 负责接近视口时加载，滚动到 80% 后拉取下一批，预取时底部 `#waterfall-sentinel` 显示缓冲动画。批量换链在后台进行，不挡住卡片入列；已完成的地址会回填到对应卡片。
@@ -331,14 +339,14 @@ POST 请求体：
 - **灯箱**：0.5–4 倍缩放、90° 旋转、拖拽、捏合、双击复位和失效 URL 恢复。
 - **画质**：`sizedThumb()` 只改写已包含 `width`/`height` 参数的缩略图 URL，否则原样返回。
 - **公告**：使用受限 Markdown 转换、阅读倒计时和版本化关闭状态。`![说明](https://...)` 会渲染为图片，只接受 `http://` 或 `https://` 地址。
-- **联系**：顶栏/菜单/公告底部共用一个联系按钮。点击或悬停弹出弹层，内含个人和群组两条联系方式，一行最多两格，图片在上、文字在下，无图片时只显示文字，点击图片或文字跳转对应链接。旧 QQ 号/链接/二维码字段自动兼容为个人联系：QQ 号在无链接时自动走 `tencent://`（电脑）或 `mqqwpa://`（手机），旧二维码图片自动作为个人图片。
+- **联系**：顶栏/菜单/公告底部共用一个联系按钮。点击展开或关闭弹层，内含个人和群组两条联系方式；一行最多两格，宽度按条目数自适应；图片在上、文字在下，无图片时只显示文字，点击图片或文字跳转对应链接。
 - **维护**：验证管理令牌后将其暂存在页面内存，并附加到受门控请求。
 
 旧本地偏好中的 `single`/`grid` 会迁移为 `slideshow`。当前实际渲染类只有 `gallery slideshow` 和 `gallery waterfall`。
 
 ### 7.2 管理页
 
-`admin_html()` 使用五个页签：
+`src/webui/admin.html`（经 `admin_html()` 加载）使用五个页签：
 
 1. 目录配置；
 2. 显示与主题；
@@ -355,7 +363,7 @@ POST 请求体：
 ### 8.1 安装产物
 
 ```text
-/opt/openlist-image-api/{install.sh,openlist_image_api.py,openlist_tui.py,VERSION}
+/opt/openlist-image-api/{install.sh,openlist_image_api.py,openlist_tui.py,VERSION,webui/gallery.html,webui/admin.html}
 /etc/openlist-image-api/{config.json,admin.token,openlist.token}
 /var/lib/openlist-image-api/{index.json,index.checkpoint.json,tags.json,url_cache.json,rebuild.log}
 /etc/systemd/system/openlist-image-api.service
@@ -460,16 +468,17 @@ GitHub Actions 在 push 和 pull request 时使用 Ubuntu 与 Python 3.11 执行
 - 管理字段白名单、公告版本和备份秘密排除；
 - token 标签范围的管理令牌验证；
 - 浏览/管理页关键结构；
+- 可选 Playwright 无头冒烟（`tests/test_browser_smoke.py`，本机有 Chromium 时启用）；
 - TUI 状态、服务、按来源更新、卸载、全局迁移和安装器约束。
 
-前端测试主要是生成 HTML/JavaScript 的字符串断言，不等于完整浏览器端到端覆盖。涉及布局、触控、主题、公告或灯箱的改动还需实际浏览器冒烟验证。
+前端默认仍以 HTML/JavaScript 字符串断言为主；有 Playwright 时补跑浏览页加载、公共配置与随机图请求。布局、触控、主题、公告或灯箱的细交互仍建议人工冒烟。
 
 ### 10.3 发布一致性
 
 修改任一发布文件后执行：
 
 ```bash
-sha256sum install.sh src/openlist_image_api.py src/openlist_tui.py VERSION > SHA256SUMS
+sha256sum install.sh src/openlist_image_api.py src/openlist_tui.py src/webui/gallery.html src/webui/admin.html VERSION > SHA256SUMS
 sha256sum --check SHA256SUMS
 ```
 

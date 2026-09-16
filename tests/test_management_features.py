@@ -58,9 +58,6 @@ class AdminConfigurationTests(unittest.TestCase):
                     "announcement_version",
                     "contact_enabled",
                     "contact_label",
-                    "contact_qq_number",
-                    "contact_qq_url",
-                    "contact_qr_url",
                     "contact_personal_label",
                     "contact_personal_url",
                     "contact_personal_image",
@@ -188,13 +185,15 @@ class WebUiMarkupTests(unittest.TestCase):
         self.assertIn("openlist-image-announcement-v2-", page)
         self.assertIn("id=\"contact-button\"", page)
         self.assertIn("id=\"contact-popover\"", page)
-        self.assertIn("tencent://message/?uin=", page)
-        self.assertIn("mqqwpa://im/chat?chat_type=wpa&uin=", page)
         self.assertIn("function openContact()", page)
         self.assertIn("contactEntries()", page)
         self.assertIn("contact-grid", page)
         self.assertIn("contact-card", page)
         self.assertIn("contact-text", page)
+        self.assertIn("--contact-cols", page)
+        self.assertNotIn("tencent://message/?uin=", page)
+        self.assertNotIn("mqqwpa://im/chat?chat_type=wpa&uin=", page)
+        self.assertNotIn("mouseenter", page.split("if(contactButton)")[1].split("if(announcementContact)")[0] if "if(contactButton)" in page else "")
         self.assertIn("!\\[([^\\]]*)\\]\\((https?:\\/\\/[^\\s)]+)\\)", page)
         self.assertIn('<img src="$2" alt="$1" loading="lazy" referrerpolicy="no-referrer">', page)
         self.assertIn(".announcement-content img{display:block;max-width:100%", page)
@@ -235,6 +234,8 @@ class WebUiMarkupTests(unittest.TestCase):
         self.assertIn("#default-caption", page)
         self.assertIn("#directory-display-enabled", page)
         self.assertIn("#directory-display-depth", page)
+        self.assertIn("一刻相册（BaiduPhoto）只显示为可勾选的存储器根", page)
+        self.assertIn("纯数字作者目录", page)
         self.assertIn("#announcement-enabled", page)
         self.assertIn("#announcement-title", page)
         self.assertIn("#announcement-content", page)
@@ -244,10 +245,10 @@ class WebUiMarkupTests(unittest.TestCase):
         self.assertIn("图片请使用公网 http/https 地址", page)
         self.assertIn("#announcement-required-seconds", page)
         self.assertIn("#contact-enabled", page)
-        self.assertIn("#contact-qq-number", page)
-        self.assertIn("#contact-qq-url", page)
-        self.assertIn("#contact-qr-url", page)
-        self.assertIn("contact_qr_url", page)
+        self.assertNotIn("#contact-qq-number", page)
+        self.assertNotIn("#contact-qq-url", page)
+        self.assertNotIn("#contact-qr-url", page)
+        self.assertNotIn("contact_qr_url", page)
         self.assertIn("#contact-personal-label", page)
         self.assertIn("#contact-personal-url", page)
         self.assertIn("#contact-personal-image", page)
@@ -620,6 +621,10 @@ class InstallerTests(unittest.TestCase):
         self.assertIn('(1000, 4000)', installer)
         self.assertIn('(1800, 7200)', installer)
         self.assertIn("migrate_performance_defaults", installer)
+        self.assertIn('download "src/webui/gallery.html"', installer)
+        self.assertIn('download "src/webui/admin.html"', installer)
+        self.assertIn('"${APP_DIR}/webui/gallery.html"', installer)
+        self.assertIn('"${APP_DIR}/webui/admin.html"', installer)
         self.assertNotIn("res.oplist.org", installer)
         self.assertNotRegex(installer, r"\bdocker(?:-compose)?\s+(?:run|start|stop|rm|ps|pull|compose)\b")
 

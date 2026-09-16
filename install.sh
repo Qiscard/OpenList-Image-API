@@ -306,11 +306,13 @@ install_image_api() {
   local install_mode="$1"
   local temporary was_enabled=0 was_active=0
   temporary="$(mktemp -d)"
-  mkdir -p "${temporary}/src"
+  mkdir -p "${temporary}/src/webui"
   download "SHA256SUMS" "${temporary}/SHA256SUMS"
   download "install.sh" "${temporary}/install.sh"
   download "src/openlist_image_api.py" "${temporary}/src/openlist_image_api.py"
   download "src/openlist_tui.py" "${temporary}/src/openlist_tui.py"
+  download "src/webui/gallery.html" "${temporary}/src/webui/gallery.html"
+  download "src/webui/admin.html" "${temporary}/src/webui/admin.html"
   download "VERSION" "${temporary}/VERSION"
   (
     cd "${temporary}"
@@ -326,10 +328,12 @@ install_image_api() {
   fi
 
   create_service_user
-  install -d -m 0755 "${APP_DIR}" "${CONFIG_DIR}" "${STATE_DIR}"
+  install -d -m 0755 "${APP_DIR}" "${APP_DIR}/webui" "${CONFIG_DIR}" "${STATE_DIR}"
   install -m 0755 "${temporary}/install.sh" "${APP_DIR}/install.sh"
   install -m 0755 "${temporary}/src/openlist_image_api.py" "${APP_DIR}/openlist_image_api.py"
   install -m 0755 "${temporary}/src/openlist_tui.py" "${APP_DIR}/openlist_tui.py"
+  install -m 0644 "${temporary}/src/webui/gallery.html" "${APP_DIR}/webui/gallery.html"
+  install -m 0644 "${temporary}/src/webui/admin.html" "${APP_DIR}/webui/admin.html"
   install -m 0644 "${temporary}/VERSION" "${APP_DIR}/VERSION"
   create_default_config
   migrate_listen_host

@@ -511,23 +511,143 @@ class IndexRepositoryTests(unittest.TestCase):
                 {"name": "image.jpg", "is_dir": False, "size": 10},
                 {"name": "nested", "is_dir": True},
             ]
-            with mock.patch.object(OpenListClient, "list_directory", return_value=entries):
-                result = application.list_directories("/gallery")
+            with mock.patch.object(OpenListClient, "baidu_photo_mounts", return_value=set()):
+                with mock.patch.object(OpenListClient, "list_directory", return_value=entries):
+                    result = application.list_directories("/gallery")
             self.assertEqual(
                 result,
                 [
-                    {"name": "a-folder", "path": "/gallery/a-folder"},
-                    {"name": "b-folder", "path": "/gallery/b-folder"},
-                    {"name": "nested", "path": "/gallery/nested"},
+                    {
+                        "name": "a-folder",
+                        "path": "/gallery/a-folder",
+                        "has_children": True,
+                        "storage_driver": "",
+                        "leaf": False,
+                    },
+                    {
+                        "name": "b-folder",
+                        "path": "/gallery/b-folder",
+                        "has_children": True,
+                        "storage_driver": "",
+                        "leaf": False,
+                    },
+                    {
+                        "name": "nested",
+                        "path": "/gallery/nested",
+                        "has_children": True,
+                        "storage_driver": "",
+                        "leaf": False,
+                    },
                 ],
             )
 
     def test_root_listing_falls_back_to_configured_directories_when_openlist_fails(self) -> None:
         application = Application.__new__(Application)
-        application.config = validate_config({"directories": ["/gallery/sub"]})
-        with mock.patch.object(OpenListClient, "list_directory", side_effect=RuntimeError("down")):
-            result = application.list_directories("/")
-        self.assertEqual(result, [{"name": "sub", "path": "/gallery/sub"}])
+        application.config = validate_config({"directories": ["/gallery/sub", "/一刻相册"]})
+        with mock.patch.object(OpenListClient, "baidu_photo_mounts", return_value={"/一刻相册"}):
+            with mock.patch.object(OpenListClient, "list_directory", side_effect=RuntimeError("down")):
+                result = application.list_directories("/")
+        self.assertEqual(
+            result,
+            [
+                {
+                    "name": "sub",
+                    "path": "/gallery/sub",
+                    "has_children": True,
+                    "storage_driver": "",
+                    "leaf": False,
+                },
+                {
+                    "name": "一刻相册",
+                    "path": "/一刻相册",
+                    "has_children": False,
+                    "storage_driver": "BaiduPhoto",
+                    "leaf": True,
+                },
+            ],
+        )
+
+    def test_baidu_photo_mount_is_not_expanded_in_directory_picker(self) -> None:
+        application = Application.__new__(Application)
+        application.config = validate_config({"directories": ["/一刻相册"]})
+        with mock.patch.object(OpenListClient, "baidu_photo_mounts", return_value={"/一刻相册"}):
+            with mock.patch.object(OpenListClient, "list_directory") as list_directory:
+                result = application.list_directories("/一刻相册")
+        self.assertEqual(result, [])
+        list_directory.assert_not_called()
+
+    def test_root_marks_baidu_photo_storage_as_leaf(self) -> None:
+        application = Application.__new__(Application)
+        application.config = validate_config({"directories": []})
+        entries = [
+            {"name": "本机", "is_dir": True},
+            {"name": "一刻相册", "is_dir": True},
+        ]
+
+        def path_provider(self: OpenListClient, path: str) -> str:
+            del self
+            return "BaiduPhoto" if path == "/一刻相册" else "Local"
+
+        with mock.patch.object(OpenListClient, "baidu_photo_mounts", return_value=set()):
+            with mock.patch.object(OpenListClient, "list_directory", return_value=entries):
+                with mock.patch.object(OpenListClient, "path_provider", path_provider):
+                    result = application.list_directories("/")
+        self.assertEqual(
+            result,
+            [
+                {
+                    "name": "一刻相册",
+                    "path": "/一刻相册",
+                    "has_children": False,
+                    "storage_driver": "BaiduPhoto",
+                    "leaf": True,
+                },
+                {
+                    "name": "本机",
+                    "path": "/本机",
+                    "has_children": True,
+                    "storage_driver": "",
+                    "leaf": False,
+                },
+            ],
+        )
+
+    def test_build_index_baidu_photo_mount_only_scans_digit_author_folders(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = validate_config({"directories": ["/一刻相册"]})
+            config["state_dir"] = temporary
+            repository = IndexRepository(Path(temporary))
+
+            def list_directory(self: OpenListClient, path: str, index_scan: bool = False) -> list[dict[str, object]]:
+                del self, index_scan
+                if path == "/一刻相册":
+                    return [
+                        {"name": "10030990", "is_dir": True},
+                        {"name": "教程", "is_dir": True},
+                        {"name": "readme.txt", "is_dir": False, "size": 1},
+                        {"name": "cover.jpg", "is_dir": False, "size": 9},
+                    ]
+                if path == "/一刻相册/10030990":
+                    return [
+                        {"name": "a.jpg", "is_dir": False, "size": 3},
+                        {"name": "nested", "is_dir": True},
+                        {"name": "b.png", "is_dir": False, "size": 4},
+                    ]
+                if path == "/一刻相册/教程":
+                    return [{"name": "lesson.jpg", "is_dir": False, "size": 5}]
+                if path == "/一刻相册/10030990/nested":
+                    return [{"name": "deep.jpg", "is_dir": False, "size": 6}]
+                return []
+
+            with mock.patch.object(OpenListClient, "baidu_photo_mounts", return_value={"/一刻相册"}):
+                with mock.patch.object(OpenListClient, "list_directory", list_directory):
+                    index = build_index(config, repository)
+            self.assertEqual(
+                {image["path"] for image in index["images"]},
+                {"/一刻相册/cover.jpg", "/一刻相册/10030990/a.jpg", "/一刻相册/10030990/b.png"},
+            )
+            self.assertNotIn("/一刻相册/教程/lesson.jpg", {image["path"] for image in index["images"]})
+            self.assertNotIn("/一刻相册/10030990/nested/deep.jpg", {image["path"] for image in index["images"]})
 
     def test_index_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

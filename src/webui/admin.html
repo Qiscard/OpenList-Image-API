@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>图库管理</title>
+<style>
+:root{
+  color-scheme:dark;
+  --bg:#07080c;--bg-elev:#0e1218;--bg-soft:#141922;--line:#1f2633;--text:#d7deea;--muted:#7b879b;--accent:#3d8bfd;--accent-hover:#5aa0ff;--danger:#ff5d6c;--radius:14px;--shadow:0 16px 40px rgba(0,0,0,.5);
+  --font:"Segoe UI",system-ui,-apple-system,"PingFang SC","Noto Sans SC",sans-serif;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 var(--font)}
+.wrap{max-width:980px;margin:0 auto;padding:22px 18px 80px}
+.admin-head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-bottom:18px}
+.admin-head h1{margin:0;font-size:24px}
+.admin-head a{color:var(--accent);text-decoration:none}
+section{margin-bottom:16px;padding:18px;background:var(--bg-elev);border:1px solid var(--line);border-radius:var(--radius)}
+h2,h3{margin:0 0 10px}
+h2{font-size:18px}h3{font-size:14px;color:var(--muted)}
+label{display:grid;gap:6px;margin:10px 0}
+.row{display:flex;gap:12px;flex-wrap:wrap}
+.row>label{flex:1;min-width:180px}
+input,select,textarea,button{font:inherit}
+input,select,textarea{width:100%;padding:9px 10px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--text)}
+input:focus-visible,select:focus-visible,textarea:focus-visible,button:focus-visible,a:focus-visible{outline:3px solid color-mix(in srgb,var(--accent) 55%,transparent);outline-offset:2px;border-color:var(--accent)}
+textarea{min-height:80px;resize:vertical}
+button{padding:9px 16px;border:0;border-radius:10px;background:var(--accent);color:#fff;cursor:pointer}
+button:hover{background:var(--accent-hover)}
+button:disabled{opacity:.5;cursor:not-allowed}
+button.secondary,button.ghost{background:transparent;color:var(--text);border:1px solid var(--line)}
+button.danger{background:transparent;color:var(--danger);border:1px solid color-mix(in srgb,var(--danger) 45%,var(--line))}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+.note{color:var(--muted);font-size:13px}
+.selected{display:grid;gap:6px;margin-top:10px}
+.selected-item{display:flex;gap:8px;align-items:center;justify-content:space-between;padding:8px 10px;border:1px solid var(--line);border-radius:10px;background:var(--bg)}
+.check{display:flex;align-items:center;gap:8px}
+.check input{width:auto}
+.markdown-preview{min-height:80px;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);line-height:1.65}
+.markdown-preview img{display:block;max-width:100%;height:auto;margin:12px auto;border-radius:10px}
+.hidden{display:none}
+.trash-list{display:flex;flex-direction:column;gap:8px;margin-top:10px;max-height:520px;overflow-y:auto}
+.trash-item{display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg)}
+.trash-item input[type=checkbox]{width:auto;flex:0 0 auto}
+.trash-thumb{width:72px;height:72px;flex:0 0 auto;object-fit:cover;border-radius:8px;background:#05060a;display:block}
+.trash-item .trash-path{flex:1;min-width:0;word-break:break-all;font-size:13px}
+a{color:#b7d1ff}
+.tabs-nav{display:flex;gap:6px;overflow-x:auto;padding-bottom:2px;margin:-4px 0 16px;border-bottom:1px solid var(--line);scrollbar-width:thin}
+.tab-button{padding:10px 14px;background:transparent;color:var(--muted);border:0;border-radius:10px 10px 0 0;white-space:nowrap}
+.tab-button.active{color:var(--text);background:color-mix(in srgb,var(--accent) 16%,transparent);box-shadow:inset 0 -2px 0 var(--accent)}
+.tab-panel{display:none}
+.tab-panel.active{display:block}
+.tree{max-height:440px;overflow:auto;border:1px solid var(--line);border-radius:10px;padding:8px;background:var(--bg)}
+.tree-node{margin:2px 0}
+.tree-row{display:flex;align-items:center;gap:6px;padding:6px;border-radius:8px}
+.tree-row:hover{background:color-mix(in srgb,var(--accent) 10%,transparent)}
+.tree-toggle{width:24px;height:24px;padding:0;text-align:center;font-size:12px;color:var(--accent);background:transparent;border:0}
+.tree-check{width:auto}
+.tree-label{flex:1;word-break:break-all}
+.tree-children{margin-left:22px;display:none}
+.tree-node.open>.tree-children{display:block}
+.theme-toggle{position:fixed;bottom:max(18px,env(safe-area-inset-bottom));right:max(18px,env(safe-area-inset-right));z-index:60;width:48px;height:48px;padding:0;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:22px;box-shadow:var(--shadow)}
+.sticky-save{position:sticky;bottom:0;padding-top:14px;margin-top:18px;background:linear-gradient(transparent,var(--bg) 28%)}
+body.theme-light{color-scheme:light;--bg:#f3f5f8;--bg-elev:#fff;--bg-soft:#eef1f6;--line:#d5dbe6;--text:#1a2230;--muted:#667085;--accent:#2d6cf0;--accent-hover:#1f5ee0;--shadow:0 14px 32px rgba(30,40,60,.12)}
+body.theme-light a{color:#2d6cf0}
+body:not(.theme-light)::after{content:'';position:fixed;inset:0;z-index:10000;pointer-events:none;background:rgba(0,0,0,.32)}
+@media(max-width:640px){
+  .wrap{padding:14px 12px 88px}
+  .admin-head{align-items:flex-start;flex-direction:column}
+  .row.actions button,.actions button{flex:1 1 calc(50% - 8px)}
+  .tabs-nav{margin-left:-4px;margin-right:-4px}
+}
+</style>
+</head>
+<body>
+<button id="theme-toggle" class="theme-toggle secondary" type="button" title="切换明暗主题" aria-label="切换明暗主题" aria-pressed="false">🌙</button>
+<div class="wrap">
+<header class="admin-head">
+  <div><h1>图库管理</h1><p class="note" style="margin:6px 0 0">改这里会影响所有访客。</p></div>
+  <a href="/gallery">返回浏览</a>
+</header>
+<section>
+  <h2>登录</h2>
+  <label>管理令牌<input id="token" type="password" autocomplete="current-password"></label>
+  <div class="actions"><button id="load" type="button">加载配置</button></div>
+  <p class="note hidden" id="admin-status" aria-live="polite"></p>
+</section>
+<section id="protected" class="hidden">
+  <div class="tabs-nav" role="tablist" aria-label="管理设置">
+    <button id="tab-button-directories" class="tab-button active" data-tab="directories" type="button" role="tab" aria-selected="true" aria-controls="tab-directories" tabindex="0">目录</button>
+    <button id="tab-button-display" class="tab-button" data-tab="display" type="button" role="tab" aria-selected="false" aria-controls="tab-display" tabindex="-1">显示</button>
+    <button id="tab-button-announcement" class="tab-button" data-tab="announcement" type="button" role="tab" aria-selected="false" aria-controls="tab-announcement" tabindex="-1">公告</button>
+    <button id="tab-button-tags" class="tab-button" data-tab="tags" type="button" role="tab" aria-selected="false" aria-controls="tab-tags" tabindex="-1">标签</button>
+    <button id="tab-button-tools" class="tab-button" data-tab="tools" type="button" role="tab" aria-selected="false" aria-controls="tab-tools" tabindex="-1">维护</button>
+  </div>
+  <p class="note">多名管理员同时保存时，以最后一次为准。</p>
+
+  <div id="tab-directories" class="tab-panel active" role="tabpanel" aria-labelledby="tab-button-directories">
+    <h2>浏览 OpenList 目录</h2>
+    <div class="row">
+      <label style="flex:2">当前路径<input id="path" value="/"></label>
+    </div>
+    <div class="actions"><button id="browse" type="button">加载目录树</button></div>
+    <p class="note">目录树实时读取自 OpenList。勾选目录后保存，再在维护页重建索引。一刻相册（BaiduPhoto）只显示为可勾选的存储器根，不展开其下数百个作者相册；重建索引时会自动只收录纯数字作者目录中的图片。</p>
+    <div id="directories" class="tree"><p class="note">点击“加载目录树”开始浏览。</p></div>
+    <h3>已选目录</h3>
+    <div id="selected" class="selected"></div>
+  </div>
+
+  <div id="tab-display" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-display">
+    <h2>显示与主题</h2>
+    <label>新访客的图片文字<select id="default-caption"><option value="path">完整路径</option><option value="name">仅图片名称</option><option value="hidden">不展示</option></select></label>
+    <label class="check"><input id="directory-display-enabled" type="checkbox">完整路径模式下显示目录</label>
+    <label>隐藏前 N 层目录<input id="directory-display-depth" type="number" min="0" max="64" step="1"></label>
+    <p class="note">路径 1/2/3/4，隐藏 1 层后显示 2/3/4。</p>
+    <label>默认主题<select id="theme"><option value="dark">暗色</option><option value="light">浅色</option></select></label>
+    <p class="note">访客仍可用右下角按钮临时切换。</p>
+  </div>
+
+  <div id="tab-announcement" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-announcement">
+    <h2>网站公告</h2>
+    <label class="check"><input id="announcement-enabled" type="checkbox">启用公告弹窗</label>
+    <label>公告标题<input id="announcement-title" maxlength="120"></label>
+    <label>公告内容（Markdown）<textarea id="announcement-content" maxlength="4000" placeholder="# 标题&#10;支持 **加粗**、*斜体*、`代码`、链接、图片和代码块&#10;![说明](https://example.com/notice.png)"></textarea></label>
+    <p class="note">图片请使用公网 http/https 地址，例如 ![说明](https://example.com/notice.png)。不支持 OpenList 签名链接。</p>
+    <div class="actions"><button id="announcement-preview-button" class="secondary" type="button">预览</button></div>
+    <div id="announcement-preview" class="markdown-preview"></div>
+    <label>强制阅读秒数<input id="announcement-required-seconds" type="number" min="0" max="3600" step="1"></label>
+    <p class="note">修改标题、内容、开关或秒数都会生成新公告版本。</p>
+    <h3>联系方式</h3>
+    <label class="check"><input id="contact-enabled" type="checkbox">显示联系按钮</label>
+    <label>按钮文字<input id="contact-label" maxlength="20" placeholder="联系"></label>
+    <p class="note">下方配置个人和群组联系方式。每项可填图片（二维码等）和跳转链接；无图片时只显示文字。图片需使用公网 http/https 地址。</p>
+    <h4>个人联系</h4>
+    <label>文字<input id="contact-personal-label" maxlength="20" placeholder="个人"></label>
+    <label>跳转链接<input id="contact-personal-url" maxlength="300" placeholder="https://qm.qq.com/q/..."></label>
+    <label>图片地址<input id="contact-personal-image" maxlength="300" placeholder="https://example.com/qq-qr.png"></label>
+    <h4>群组联系</h4>
+    <label>文字<input id="contact-group-label" maxlength="20" placeholder="群组"></label>
+    <label>跳转链接<input id="contact-group-url" maxlength="300" placeholder="https://qm.qq.com/q/..."></label>
+    <label>图片地址<input id="contact-group-image" maxlength="300" placeholder="https://example.com/group-qr.png"></label>
+    <p class="note">浏览页联系弹层一行最多两格，图片在上、文字在下，点击图片或文字跳转对应链接。</p>
+  </div>
+
+  <div id="tab-tags" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-tags">
+    <h2>标签</h2>
+    <label class="check"><input id="tagging-enabled" type="checkbox">启用标签</label>
+    <label>谁可以投票<select id="tagging-scope"><option value="disabled">禁用</option><option value="anonymous">匿名访客</option><option value="token">仅管理员</option></select></label>
+    <label>分类名称（每行一个）<textarea id="tagging-categories" rows="5" placeholder="男生&#10;女生&#10;AI&#10;风景&#10;动漫"></textarea></label>
+    <label class="check"><input id="filter-enabled" type="checkbox">允许访客按标签筛选</label>
+    <div class="actions">
+      <button id="tagging-stats" class="secondary" type="button">查看统计</button>
+      <button id="tagging-reset-path" class="secondary" type="button">清除指定图片</button>
+      <button id="tagging-reset-all" class="danger" type="button">清除全部标签</button>
+    </div>
+    <div id="tagging-stats-result" class="markdown-preview"></div>
+    <h3>垃圾桶</h3>
+    <p class="note">删除会从 OpenList 永久去掉原图，不可撤销。列表会加载缩略图预览。</p>
+    <div class="actions">
+      <button id="trash-load" class="secondary" type="button">刷新列表</button>
+      <button id="trash-delete-selected" class="danger" type="button">删除选中</button>
+      <button id="trash-delete-all" class="danger" type="button">删除全部</button>
+    </div>
+    <div id="trash-list" class="trash-list"><p class="note">点击“刷新列表”加载。</p></div>
+    <div id="trash-result" class="markdown-preview"></div>
+  </div>
+
+  <div id="tab-tools" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-tools">
+    <h2>维护模式 / 索引 / 备份</h2>
+    <h3>维护模式</h3>
+    <label class="check"><input id="maintenance-enabled" type="checkbox">启用维护模式</label>
+    <p class="note">开启后主界面只显示“维护中”，管理员可用令牌临时解锁。</p>
+    <label>日志级别<select id="log-level"><option value="DEBUG">DEBUG</option><option value="INFO">INFO</option><option value="WARNING">WARNING</option><option value="ERROR">ERROR</option></select></label>
+    <h3>图片索引</h3>
+    <p id="rebuild-status" class="note" aria-live="polite">无数据</p>
+    <div class="actions"><button id="rebuild" type="button">后台重建图片索引</button></div>
+    <h3>配置备份</h3>
+    <div class="actions"><button id="backup" class="secondary" type="button">下载配置备份</button></div>
+    <label>上传备份（ZIP）<input id="backup-file" type="file" accept=".zip,application/zip"></label>
+    <div class="actions"><button id="restore-backup" class="secondary" type="button">恢复备份</button></div>
+    <p class="note">恢复只覆盖本页可编辑项，不含管理密钥和 OpenList 令牌。</p>
+  </div>
+  <div class="sticky-save actions"><button id="save-server" type="button">保存服务器配置</button></div>
+</section>
+</div>
+<script>
+let config=null;
+let rebuildTimer=null;
+let rebuildJustFinished=false;
+const adminStatus=document.querySelector('#admin-status');
+const rebuildStatus=document.querySelector('#rebuild-status');
+function setAdminStatus(text){adminStatus.textContent=text;adminStatus.classList.toggle('hidden',!text);}
+function auth(){return {'Content-Type':'application/json','X-OpenList-Admin-Token':document.querySelector('#token').value};}
+function showSelected(){const root=document.querySelector('#selected');root.replaceChildren(...config.directories.map(path=>{const item=document.createElement('div');item.className='selected-item';const text=document.createElement('span');text.textContent=path;const remove=document.createElement('button');remove.className='secondary';remove.type='button';remove.textContent='移除';remove.onclick=()=>{config.directories=config.directories.filter(value=>value!==path);showSelected();};item.append(text,remove);return item;}));}
+function escapeHtml(value){return value.replace(/[&<>"']/g,character=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));}
+function renderMarkdown(value){return escapeHtml(value).replace(/&lt;font\s+color=(?:&quot;|&#39;)?(#[0-9a-f]{3,8}|[a-z]+)(?:&quot;|&#39;)?\s*&gt;/gi,'<span style="color:$1">').replace(/&lt;\/font&gt;/gi,'</span>').replace(/```([\s\S]*?)```/g,'<pre><code>$1</code></pre>').replace(/^### (.*)$/gm,'<h3>$1</h3>').replace(/^## (.*)$/gm,'<h2>$1</h2>').replace(/^# (.*)$/gm,'<h1>$1</h1>').replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>').replace(/\*([^*]+)\*/g,'<em>$1</em>').replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g,'<img src="$2" alt="$1" loading="lazy" referrerpolicy="no-referrer">').replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>').replace(/\n\n/g,'</p><p>').replace(/\n/g,'<br>');}
+function previewAnnouncement(){document.querySelector('#announcement-preview').innerHTML='<p>'+renderMarkdown(document.querySelector('#announcement-content').value)+'</p>';}
+function showAdmin(){document.querySelector('#default-caption').value=config.caption_mode;document.querySelector('#directory-display-enabled').checked=config.directory_display_enabled;document.querySelector('#directory-display-depth').value=config.directory_display_depth;document.querySelector('#theme').value=config.theme||'dark';document.querySelector('#announcement-enabled').checked=config.announcement_enabled;document.querySelector('#announcement-title').value=config.announcement_title;document.querySelector('#announcement-content').value=config.announcement_content;document.querySelector('#announcement-required-seconds').value=config.announcement_required_seconds;document.querySelector('#contact-enabled').checked=config.contact_enabled||false;document.querySelector('#contact-label').value=config.contact_label||'联系';document.querySelector('#contact-personal-label').value=config.contact_personal_label||'个人';document.querySelector('#contact-personal-url').value=config.contact_personal_url||'';document.querySelector('#contact-personal-image').value=config.contact_personal_image||'';document.querySelector('#contact-group-label').value=config.contact_group_label||'群组';document.querySelector('#contact-group-url').value=config.contact_group_url||'';document.querySelector('#contact-group-image').value=config.contact_group_image||'';document.querySelector('#maintenance-enabled').checked=config.maintenance_enabled;document.querySelector('#tagging-enabled').checked=config.tagging_enabled||false;document.querySelector('#tagging-scope').value=config.tagging_scope||'disabled';document.querySelector('#tagging-categories').value=(config.tagging_categories||[]).join('\n');document.querySelector('#filter-enabled').checked=config.filter_enabled!==false;document.querySelector('#log-level').value=config.log_level||'INFO';document.querySelector('#protected').classList.remove('hidden');showSelected();previewAnnouncement();refreshRebuildStatus().catch(report);}
+async function errorText(response,fallback){try{const data=await response.json();return data.error||fallback;}catch(error){return fallback;}}
+async function load(){const response=await fetch('/api/admin/config',{headers:auth(),cache:'no-store'});if(!response.ok)throw new Error(await errorText(response,'令牌无效或服务不可用'));config=await response.json();showAdmin();setAdminStatus('服务器配置已加载');}
+function addDirectory(path){if(!config.directories.includes(path)){config.directories.push(path);showSelected();setAdminStatus('已添加目录：'+path+'，请保存服务器配置');}}
+function removeDirectory(path){config.directories=config.directories.filter(value=>value!==path);showSelected();}
+function buildTreeNode(name,path,isDir,hasChildren){
+  const node=document.createElement('div');
+  node.className='tree-node';
+  const row=document.createElement('div');
+  row.className='tree-row';
+  if(isDir){
+    const toggle=document.createElement('button');
+    toggle.type='button';
+    toggle.className='tree-toggle';
+    toggle.setAttribute('aria-label','展开 '+name);
+    toggle.setAttribute('aria-expanded','false');
+    if(hasChildren===false){toggle.textContent='';toggle.classList.add('tree-leaf');toggle.disabled=true;}
+    else{toggle.textContent='+';}
+    const check=document.createElement('input');
+    check.type='checkbox';
+    check.className='tree-check';
+    const checkId='directory-'+Math.random().toString(36).slice(2);
+    check.id=checkId;
+    check.checked=config.directories.includes(path);
+    check.onchange=()=>{if(check.checked)addDirectory(path);else removeDirectory(path);};
+    const label=document.createElement('label');
+    label.className='tree-label';
+    label.htmlFor=checkId;
+    label.textContent=name;
+    toggle.onclick=()=>{
+      if(hasChildren===false)return;
+      node.classList.toggle('open');
+      const expanded=node.classList.contains('open');
+      toggle.textContent=expanded?'-':'+';
+      toggle.setAttribute('aria-expanded',String(expanded));
+      if(expanded&&!node.querySelector('.tree-children').children.length){
+        loadTreeChildren(path,node).catch(error=>{node.querySelector('.tree-children').innerHTML='<p class="note">加载失败，请折叠后重试。</p>';report(error);});
+      }
+    };
+    row.append(toggle,check,label);
+  }else{
+    const spacer=document.createElement('span');
+    spacer.className='tree-toggle';
+    spacer.textContent='•';
+    const label=document.createElement('span');
+    label.className='tree-label';
+    label.textContent=name;
+    row.append(spacer,label);
+  }
+  node.append(row);
+  const children=document.createElement('div');
+  children.className='tree-children';
+  node.append(children);
+  return node;
+}
+async function loadTreeChildren(path,parent){
+  const container=parent.querySelector('.tree-children');
+  container.innerHTML='<p class="note" style="margin-left:24px">正在读取目录…</p>';
+  const response=await fetch('/api/admin/directories?path='+encodeURIComponent(path),{headers:auth(),cache:'no-store'});
+  if(!response.ok)throw new Error(await errorText(response,'无法读取目录'));
+  const data=await response.json();
+  container.replaceChildren();
+  if(!data.directories.length){container.innerHTML='<p class="note" style="margin-left:24px">无子目录</p>';const toggle=parent.querySelector('.tree-toggle');if(toggle){toggle.textContent='';toggle.classList.add('tree-leaf');}return;}
+  data.directories.forEach(item=>{
+    const child=buildTreeNode(item.name,item.path,true,item.has_children);
+    container.append(child);
+  });
+}
+async function browse(){
+  if(!config)throw new Error('请先加载服务器配置');
+  const path=document.querySelector('#path').value||'/';
+  const response=await fetch('/api/admin/directories?path='+encodeURIComponent(path),{headers:auth(),cache:'no-store'});
+  if(!response.ok)throw new Error(await errorText(response,'无法读取目录缓存'));
+  const data=await response.json();
+  const root=document.querySelector('#directories');
+  root.replaceChildren();
+  const node=buildTreeNode(path||'/',path||'/',true,data.directories.length>0);
+  node.classList.add('open');
+  const toggle=node.querySelector('.tree-toggle');
+  if(toggle&&!toggle.classList.contains('tree-leaf'))toggle.textContent='-';
+  root.append(node);
+  const container=node.querySelector('.tree-children');
+  if(!data.directories.length){container.innerHTML='<p class="note">当前目录没有子目录。</p>';}
+  else{data.directories.forEach(item=>{const child=buildTreeNode(item.name,item.path,true,item.has_children);container.append(child);});}
+}
+async function saveServer(){if(!config)throw new Error('请先加载服务器配置');const payload={directories:config.directories,caption_mode:document.querySelector('#default-caption').value,directory_display_enabled:document.querySelector('#directory-display-enabled').checked,directory_display_depth:Number(document.querySelector('#directory-display-depth').value),theme:document.querySelector('#theme').value,announcement_enabled:document.querySelector('#announcement-enabled').checked,announcement_title:document.querySelector('#announcement-title').value,announcement_content:document.querySelector('#announcement-content').value,announcement_required_seconds:Number(document.querySelector('#announcement-required-seconds').value),contact_enabled:document.querySelector('#contact-enabled').checked,contact_label:document.querySelector('#contact-label').value,contact_personal_label:document.querySelector('#contact-personal-label').value,contact_personal_url:document.querySelector('#contact-personal-url').value,contact_personal_image:document.querySelector('#contact-personal-image').value,contact_group_label:document.querySelector('#contact-group-label').value,contact_group_url:document.querySelector('#contact-group-url').value,contact_group_image:document.querySelector('#contact-group-image').value,maintenance_enabled:document.querySelector('#maintenance-enabled').checked,tagging_enabled:document.querySelector('#tagging-enabled').checked,tagging_scope:document.querySelector('#tagging-scope').value,tagging_categories:document.querySelector('#tagging-categories').value.split('\n').map(s=>s.trim()).filter(Boolean),filter_enabled:document.querySelector('#filter-enabled').checked,log_level:document.querySelector('#log-level').value};const response=await fetch('/api/admin/config',{method:'PUT',headers:auth(),body:JSON.stringify(payload)});if(!response.ok)throw new Error(await errorText(response,'保存失败'));config=await response.json();showAdmin();setAdminStatus('全局服务器配置已保存；公告修改后将向访客显示新版本。');}
+function formatClock(value){const seconds=Math.max(0,Math.round(Number(value)||0));const minutes=String(Math.floor(seconds/60)).padStart(2,'0');const rest=String(seconds%60).padStart(2,'0');return minutes+':'+rest;}
+function formatIndexDate(unix){const date=new Date(Number(unix)*1000);if(!unix||Number.isNaN(date.getTime()))return '';const month=String(date.getMonth()+1).padStart(2,'0');const day=String(date.getDate()).padStart(2,'0');return month+'.'+day+' 数据';}
+function applyRebuildStatus(status){
+  if(!rebuildStatus)return;
+  if(status.refreshing){
+    rebuildJustFinished=false;
+    const elapsed=formatClock((status.index_progress&&status.index_progress.elapsed_seconds)||0);
+    const estimate=Number(status.last_build_duration_seconds)||0;
+    rebuildStatus.textContent=estimate?'重建中（预计需要 '+formatClock(estimate)+'，已重建 '+elapsed+'）':'重建中（已重建 '+elapsed+'）';
+    return;
+  }
+  if(rebuildJustFinished){
+    rebuildStatus.textContent='重建完毕';
+    return;
+  }
+  if(Number(status.image_count||0)<=0){
+    rebuildStatus.textContent='无数据';
+    return;
+  }
+  rebuildStatus.textContent=formatIndexDate(status.generated_at)||'无数据';
+}
+async function refreshRebuildStatus(){
+  const response=await fetch('/api/status',{cache:'no-store'});
+  if(!response.ok)return null;
+  const status=await response.json();
+  applyRebuildStatus(status);
+  if(status.refreshing&&!rebuildTimer){
+    rebuildTimer=setTimeout(()=>pollRebuild().catch(report),2000);
+  }
+  return status;
+}
+async function pollRebuild(doneMessage='索引后台重建完成'){
+  const status=await refreshRebuildStatus();
+  if(!status)return;
+  if(status.refreshing){
+    rebuildTimer=setTimeout(()=>pollRebuild(doneMessage).catch(report),2000);
+    return;
+  }
+  rebuildJustFinished=true;
+  applyRebuildStatus(status);
+  setAdminStatus(doneMessage);
+  rebuildTimer=null;
+  setTimeout(()=>{
+    if(rebuildJustFinished){
+      rebuildJustFinished=false;
+      refreshRebuildStatus().catch(report);
+    }
+  },2000);
+}
+async function rebuild(){const previous=await refreshRebuildStatus()||{};const response=await fetch('/api/admin/rebuild',{method:'POST',headers:auth()});if(!response.ok)throw new Error(await errorText(response,'重建未启动'));rebuildJustFinished=false;const estimate=Number(previous.last_build_duration_seconds)||0;setAdminStatus('索引正在后台重建'+(estimate?'，预计约 '+formatClock(estimate):'，首次重建暂无预估时间'));applyRebuildStatus({refreshing:true,last_build_duration_seconds:estimate,index_progress:{elapsed_seconds:0}});clearTimeout(rebuildTimer);rebuildTimer=setTimeout(()=>pollRebuild().catch(report),2000);}
+async function backup(){const response=await fetch('/api/admin/backup',{headers:auth()});if(!response.ok)throw new Error(await errorText(response,'备份下载失败'));const blob=await response.blob();const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download='openlist-image-api-backup.zip';link.click();setTimeout(()=>URL.revokeObjectURL(link.href),1000);setAdminStatus('配置备份已下载（不含 token）');}
+async function restoreBackup(){const file=document.querySelector('#backup-file').files[0];if(!file)throw new Error('请先选择 ZIP 备份文件');if(!window.confirm('确定恢复该备份中的可编辑配置吗？'))return;const response=await fetch('/api/admin/backup',{method:'POST',headers:{'X-OpenList-Admin-Token':document.querySelector('#token').value},body:file});if(!response.ok)throw new Error(await errorText(response,'备份恢复失败'));config=await response.json();showAdmin();setAdminStatus('备份配置已恢复，请按需保存或重建图片索引。');}
+function report(error){setAdminStatus('操作失败：'+error.message);}
+function activateTab(btn){document.querySelectorAll('.tab-button').forEach(b=>{const active=b===btn;b.classList.toggle('active',active);b.setAttribute('aria-selected',String(active));b.tabIndex=active?0:-1;});document.querySelectorAll('.tab-panel').forEach(p=>p.classList.toggle('active',p.id==='tab-'+btn.dataset.tab));}
+document.querySelectorAll('.tab-button').forEach(btn=>{btn.onclick=()=>activateTab(btn);btn.onkeydown=event=>{if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;event.preventDefault();const tabs=[...document.querySelectorAll('.tab-button')];let index=tabs.indexOf(btn);if(event.key==='Home')index=0;else if(event.key==='End')index=tabs.length-1;else index=(index+(event.key==='ArrowRight'?1:-1)+tabs.length)%tabs.length;activateTab(tabs[index]);tabs[index].focus();};});
+function applyTheme(theme){document.body.classList.toggle('theme-light',theme==='light');document.body.classList.toggle('theme-dark',theme!=='light');const button=document.querySelector('#theme-toggle');button.textContent=theme==='light'?'☀':'🌙';button.setAttribute('aria-pressed',String(theme==='light'));try{localStorage.setItem('openlist-admin-theme',theme);}catch(e){}}
+function toggleTheme(){applyTheme(document.body.classList.contains('theme-light')?'dark':'light');}
+document.querySelector('#theme-toggle').onclick=toggleTheme;
+(function(){let saved='dark';try{saved=localStorage.getItem('openlist-admin-theme')||'dark';}catch(e){}applyTheme(saved);})();
+async function runButtonAction(button,action){if(button.disabled)return;button.disabled=true;button.setAttribute('aria-busy','true');try{await action();}catch(error){report(error);}finally{button.disabled=false;button.removeAttribute('aria-busy');}}
+document.querySelector('#load').onclick=event=>runButtonAction(event.currentTarget,load);
+document.querySelector('#announcement-preview-button').onclick=previewAnnouncement;
+document.querySelector('#browse').onclick=event=>runButtonAction(event.currentTarget,browse);
+document.querySelector('#save-server').onclick=event=>runButtonAction(event.currentTarget,saveServer);
+document.querySelector('#rebuild').onclick=event=>runButtonAction(event.currentTarget,rebuild);
+document.querySelector('#backup').onclick=event=>runButtonAction(event.currentTarget,backup);
+document.querySelector('#restore-backup').onclick=event=>runButtonAction(event.currentTarget,restoreBackup);
+document.querySelector('#tagging-stats').onclick=event=>runButtonAction(event.currentTarget,loadTagStats);
+document.querySelector('#tagging-reset-path').onclick=event=>runButtonAction(event.currentTarget,resetTagPath);
+document.querySelector('#tagging-reset-all').onclick=event=>runButtonAction(event.currentTarget,resetTagAll);
+document.querySelector('#trash-load').onclick=event=>runButtonAction(event.currentTarget,loadTrashList);
+document.querySelector('#trash-delete-selected').onclick=event=>runButtonAction(event.currentTarget,deleteTrashSelected);
+document.querySelector('#trash-delete-all').onclick=event=>runButtonAction(event.currentTarget,deleteTrashAll);
+async function loadTagStats(){const response=await fetch('/api/tagging/categories',{headers:auth(),cache:'no-store'});if(!response.ok)throw new Error(await errorText(response,'获取统计失败'));const data=await response.json();const result=document.querySelector('#tagging-stats-result');const cats=data.categories||{};const keys=Object.keys(cats);if(!keys.length){result.innerHTML='<p class="note">暂无标签数据。访客投票或打分类后，这里会显示统计。</p>';setAdminStatus('标签统计：暂无数据');return;}const items=keys.map(k=>'<li>'+escapeHtml(k)+'：'+cats[k]+' 张图片</li>').join('');result.innerHTML='<p>当前标签使用情况：</p><ul>'+items+'</ul>';setAdminStatus('标签统计已加载');}
+async function resetTagPath(){const path=prompt('请输入要清除标签的图片路径：');if(!path)return;const response=await fetch('/api/admin/tagging/reset?path='+encodeURIComponent(path),{method:'POST',headers:auth()});if(!response.ok)throw new Error(await errorText(response,'清除失败'));setAdminStatus('已清除 '+path+' 的标签数据');}
+async function resetTagAll(){if(!confirm('确定清除全部标签数据吗？此操作不可撤销！'))return;const response=await fetch('/api/admin/tagging/reset',{method:'POST',headers:auth()});if(!response.ok)throw new Error(await errorText(response,'清除失败'));setAdminStatus('全部标签数据已清除');}
+async function loadTrashList(){const response=await fetch('/api/admin/tagging/trash',{headers:auth(),cache:'no-store'});if(!response.ok)throw new Error(await errorText(response,'获取垃圾列表失败'));const data=await response.json();const list=document.querySelector('#trash-list');const paths=data.paths||[];if(!paths.length){list.innerHTML='<p class="note">暂无垃圾图片标记。</p>';setAdminStatus('垃圾列表：暂无数据');return;}list.replaceChildren();const thumbs=new Map();for(let offset=0;offset<paths.length;offset+=50){try{const resolved=await fetch('/api/download-url',{method:'POST',headers:auth(),body:JSON.stringify({paths:paths.slice(offset,offset+50),preview:true})});if(!resolved.ok)continue;const payload=await resolved.json();(payload.images||[]).forEach(image=>{if(image&&image.path)thumbs.set(image.path,image.thumbnail||image.url||'');});}catch(error){}}paths.forEach(p=>{const item=document.createElement('div');item.className='trash-item';const check=document.createElement('input');check.type='checkbox';check.value=p;const id='trash-'+Math.random().toString(36).slice(2);check.id=id;const thumb=document.createElement('img');thumb.className='trash-thumb';thumb.alt='';thumb.loading='lazy';const src=thumbs.get(p);if(src)thumb.src=src;else thumb.style.visibility='hidden';const label=document.createElement('label');label.htmlFor=id;label.className='trash-path';label.textContent=p;item.append(check,thumb,label);list.append(item);});setAdminStatus('垃圾列表已加载，共 '+paths.length+' 张图片');}
+async function deleteTrashSelected(){const checks=document.querySelectorAll('#trash-list .trash-item input[type=checkbox]:checked');if(!checks.length){setAdminStatus('请先勾选要删除的图片');return;}const paths=Array.from(checks).map(c=>c.value);if(!confirm('确定删除选中的 '+paths.length+' 张图片吗？此操作会从 OpenList 永久删除原始图片文件，不可撤销！'))return;const response=await fetch('/api/admin/tagging/trash/delete',{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({paths:paths})});if(!response.ok)throw new Error(await errorText(response,'删除失败'));const result=await response.json();const resultEl=document.querySelector('#trash-result');resultEl.innerHTML='<p>删除完成：成功 '+result.deleted+' 张，失败 '+result.failed+' 张。</p>'+(result.errors&&result.errors.length?'<ul>'+result.errors.map(e=>'<li>'+escapeHtml(e.path)+'：'+escapeHtml(e.error)+'</li>').join('')+'</ul>':'');setAdminStatus('删除完成：成功 '+result.deleted+'，失败 '+result.failed);return loadTrashList();}
+async function deleteTrashAll(){const response=await fetch('/api/admin/tagging/trash',{headers:auth(),cache:'no-store'});if(!response.ok)throw new Error(await errorText(response,'获取垃圾列表失败'));const data=await response.json();const paths=data.paths||[];if(!paths.length){setAdminStatus('暂无垃圾图片可删除');return;}if(!confirm('确定删除全部 '+paths.length+' 张垃圾图片吗？此操作会从 OpenList 永久删除原始图片文件，不可撤销！'))return;const delResponse=await fetch('/api/admin/tagging/trash/delete',{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({})});if(!delResponse.ok)throw new Error(await errorText(delResponse,'删除失败'));const result=await delResponse.json();const resultEl=document.querySelector('#trash-result');resultEl.innerHTML='<p>删除完成：成功 '+result.deleted+' 张，失败 '+result.failed+' 张。</p>'+(result.errors&&result.errors.length?'<ul>'+result.errors.map(e=>'<li>'+escapeHtml(e.path)+'：'+escapeHtml(e.error)+'</li>').join('')+'</ul>':'');setAdminStatus('删除完成：成功 '+result.deleted+'，失败 '+result.failed);return loadTrashList();}
+</script>
+</body>
+</html>
