@@ -112,13 +112,47 @@ def install_openlist() -> None:
     print("OpenList 内置安装流程已完成。请在 OpenList 初始化完成后回到本菜单设置 token。")
 
 
+def update_installer_url(source: str) -> str:
+    if source == "github":
+        return f"https://raw.githubusercontent.com/Qiscard/OpenList-Image-API/main/install.sh"
+    if source == "gitee":
+        return f"https://gitee.com/qiscard/OpenList-Image-API/raw/main/install.sh"
+    raise ValueError("无效的更新来源")
+
+
+def refresh_embedded_installer(source: str) -> None:
+    """Download the newest install.sh before update so old installers can learn new files."""
+    require_root()
+    url = update_installer_url(source)
+    APP_INSTALLER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = APP_INSTALLER_PATH.with_name(f".install.sh.{os.getpid()}.new")
+    try:
+        with urllib.request.urlopen(url, timeout=30) as response:
+            payload = response.read()
+        if not payload.startswith(b"#!/"):
+            raise RuntimeError("下载的安装器内容无效")
+        temporary.write_bytes(payload)
+        temporary.chmod(0o755)
+        os.replace(temporary, APP_INSTALLER_PATH)
+        APP_INSTALLER_PATH.chmod(0o755)
+    finally:
+        if temporary.exists():
+            temporary.unlink(missing_ok=True)
+
+
 def update_application(source: str) -> None:
     require_root()
     if source not in {"github", "gitee"}:
         raise ValueError("无效的更新来源")
+    print(f"正在从 {source} 拉取最新脚本并更新图片 API；服务会恢复到更新前的启用和运行状态。")
+    try:
+        refresh_embedded_installer(source)
+    except Exception as error:
+        if not APP_INSTALLER_PATH.is_file():
+            raise RuntimeError(f"内置安装器缺失且无法下载: {error}") from error
+        print(f"预更新安装器失败，将继续使用本地安装器: {error}")
     if not APP_INSTALLER_PATH.is_file():
         raise RuntimeError("内置安装器缺失，请重新运行本项目安装命令")
-    print(f"正在从 {source} 拉取最新脚本并更新图片 API；服务会恢复到更新前的启用和运行状态。")
     run(["bash", str(APP_INSTALLER_PATH), "--source", source, "--update"])
     print("更新完成。当前 TUI 会话仍使用旧代码；退出后重新运行即可使用新菜单。")
 

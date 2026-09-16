@@ -302,6 +302,29 @@ set_download_ref() {
   GITEE_RAW_BASE="https://gitee.com/${GITEE_REPOSITORY}/raw/${reference}"
 }
 
+bootstrap_update_installer() {
+  # Old on-disk installers may not know about newly added release files (e.g. webui/).
+  # Re-exec the latest install.sh from the selected source before applying an update.
+  local temporary latest self_path self_hash latest_hash
+  [[ "${OPENLIST_IMAGE_API_BOOTSTRAPPED:-0}" == "1" ]] && return 0
+  temporary="$(mktemp -d)"
+  latest="/tmp/openlist-image-api-bootstrap-install.sh"
+  download "install.sh" "${temporary}/install.sh"
+  chmod +x "${temporary}/install.sh"
+  self_path="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || printf '%s' "$0")"
+  self_hash="$(sha256sum "${self_path}" 2>/dev/null | awk '{print $1}')"
+  latest_hash="$(sha256sum "${temporary}/install.sh" | awk '{print $1}')"
+  if [[ -n "${self_hash}" && "${self_hash}" == "${latest_hash}" ]]; then
+    rm -rf "${temporary}"
+    return 0
+  fi
+  log "bootstrapping newer install.sh before update"
+  mv -f "${temporary}/install.sh" "${latest}"
+  rm -rf "${temporary}"
+  chmod +x "${latest}"
+  OPENLIST_IMAGE_API_BOOTSTRAPPED=1 exec bash "${latest}" --source "${SOURCE}" --update
+}
+
 install_image_api() {
   local install_mode="$1"
   local temporary was_enabled=0 was_active=0
@@ -468,6 +491,7 @@ main() {
       require_command python3
       require_command sha256sum
       set_download_ref "${UPDATE_REF}"
+      bootstrap_update_installer
       install_image_api "update"
       ;;
     install)

@@ -493,10 +493,15 @@ class TuiManagementTests(unittest.TestCase):
             with (
                 patch.object(openlist_tui, "APP_INSTALLER_PATH", installer),
                 patch.object(openlist_tui, "require_root"),
+                patch.object(openlist_tui, "refresh_embedded_installer") as refresh_installer,
                 patch.object(openlist_tui, "run") as run_command,
             ):
                 openlist_tui.update_application("github")
                 openlist_tui.update_application("gitee")
+        self.assertEqual(
+            refresh_installer.call_args_list,
+            [call("github"), call("gitee")],
+        )
         self.assertEqual(
             run_command.call_args_list,
             [
@@ -625,6 +630,8 @@ class InstallerTests(unittest.TestCase):
         self.assertIn('download "src/webui/admin.html"', installer)
         self.assertIn('"${APP_DIR}/webui/gallery.html"', installer)
         self.assertIn('"${APP_DIR}/webui/admin.html"', installer)
+        self.assertIn("bootstrap_update_installer", installer)
+        self.assertIn("OPENLIST_IMAGE_API_BOOTSTRAPPED", installer)
         self.assertNotIn("res.oplist.org", installer)
         self.assertNotRegex(installer, r"\bdocker(?:-compose)?\s+(?:run|start|stop|rm|ps|pull|compose)\b")
 
