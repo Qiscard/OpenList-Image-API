@@ -612,7 +612,53 @@ class IndexRepositoryTests(unittest.TestCase):
             ],
         )
 
+    def test_list_directory_index_scan_uses_patient_timeout_and_smaller_pages(self) -> None:
+        client = OpenListClient(
+            {
+                "openlist_api_url": "http://127.0.0.1:5244",
+                "openlist_token_file": "/tmp/openlist.token",
+            }
+        )
+        calls: list[tuple[dict[str, object], float]] = []
+
+        def fake_post(
+            self: OpenListClient,
+            endpoint: str,
+            payload: dict[str, object],
+            timeout: float = 15,
+            retries: int = 1,
+            retry_throttled_only: bool = False,
+        ) -> dict[str, object]:
+            del self, endpoint, retries, retry_throttled_only
+            calls.append((payload, timeout))
+            page = int(payload["page"])
+            if page == 1:
+                return {
+                    "content": [{"name": "10030990", "is_dir": True}],
+                    "total": 2,
+                }
+            return {
+                "content": [{"name": "cover.jpg", "is_dir": False, "size": 1}],
+                "total": 2,
+            }
+
+        with mock.patch.object(OpenListClient, "_post", fake_post):
+            entries = client.list_directory("/一刻相册", index_scan=True)
+        self.assertEqual([item["name"] for item in entries], ["10030990", "cover.jpg"])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][0]["per_page"], 100)
+        self.assertEqual(calls[0][1], 60)
+        self.assertEqual(calls[1][0]["page"], 2)
+        self.assertTrue(calls[0][0]["path"] == "/一刻相册")
+
+        calls.clear()
+        with mock.patch.object(OpenListClient, "_post", fake_post):
+            client.list_directory("/gallery", index_scan=False)
+        self.assertEqual(calls[0][0]["per_page"], 200)
+        self.assertEqual(calls[0][1], 30)
+
     def test_build_index_baidu_photo_mount_only_scans_digit_author_folders(self) -> None:
+
         with tempfile.TemporaryDirectory() as temporary:
             config = validate_config({"directories": ["/一刻相册"]})
             config["state_dir"] = temporary

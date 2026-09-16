@@ -75,7 +75,8 @@ ALLOWED_CAPTION_MODES = {"path", "name", "hidden"}
 MAX_REQUEST_BODY = 64 * 1024
 URL_RESOLVE_WORKERS = 12
 URL_RESOLVE_WAIT_SECONDS = 4
-INDEX_LIST_TIMEOUT_SECONDS = 10
+INDEX_LIST_TIMEOUT_SECONDS = 60
+INDEX_LIST_PAGE_SIZE = 100
 INDEX_LIST_WORKERS = 4
 INDEX_CHECKPOINT_INTERVAL = 32
 SHARED_CHAIN_LENGTH = 4000
@@ -391,11 +392,13 @@ class OpenListClient:
     def list_directory(self, path: str, index_scan: bool = False) -> list[dict[str, Any]]:
         page = 1
         entries: list[dict[str, Any]] = []
-        timeout = INDEX_LIST_TIMEOUT_SECONDS if index_scan else 15
+        # BaiduPhoto album roots often need >10s; keep browse snappy, index patient.
+        timeout = INDEX_LIST_TIMEOUT_SECONDS if index_scan else 30
+        page_size = INDEX_LIST_PAGE_SIZE if index_scan else 200
         while True:
             data = self._post(
                 "/api/fs/list",
-                {"path": path, "password": "", "page": page, "per_page": 1000, "refresh": False},
+                {"path": path, "password": "", "page": page, "per_page": page_size, "refresh": False},
                 timeout=timeout,
                 retries=1,
                 retry_throttled_only=index_scan,

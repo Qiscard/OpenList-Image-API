@@ -97,7 +97,7 @@ systemd 启动命令：
 
 `build_index()` 对配置的虚拟目录执行有界并发的广度优先遍历：
 
-1. `OpenListClient.list_directory()` 分页读取目录，每页 1000 条；单目录分页保持串行，索引列表请求使用 10 秒超时；
+1. `OpenListClient.list_directory()` 分页读取目录；索引扫描每页 100 条、超时 60 秒（一刻相册根目录单页常见 12–15 秒），浏览目录每页 200 条、超时 30 秒；单目录分页保持串行；
 2. 正常轮次最多使用 4 个目录扫描 worker，子目录加入 `deque`，图片按扩展名过滤；
 3. 对 `BaiduPhoto` 挂载根：只把名称匹配 `^\d+$` 的子目录入队，相册内部不再向下展开；普通存储仍完整 BFS；
 4. 首轮失败目录记录后，在扫描末尾以单 worker 串行重试一次；仍失败的目录写入最终 `errors`，不阻塞其他目录；
@@ -106,7 +106,7 @@ systemd 启动命令：
 
 目录选择器不使用持久目录索引。`Application.list_directories()` 每次直接请求 OpenList，根目录请求失败时才回退到当前已配置目录。对 OpenList 中 `driver=BaiduPhoto`（一刻相册）的挂载点：管理页只展示为可勾选的存储器叶节点（`has_children=false` / `leaf=true`），不展开其子目录，避免一次加载数百个作者相册导致管理页卡顿。
 
-挂载识别优先使用 `GET /api/admin/storage/list` 的 `driver` 字段，失败时再对候选路径 `POST /api/fs/get` 读取 `provider`。随机浏览不重扫存储：访客请求只读本地索引路径，再经 URL 缓存换链；约 300 个作者相册的重建在本机 OpenList 上通常约 1.5–5 分钟（抽样约 3.4 册/秒量级，大册分页与上游限流会使上限变长）。
+挂载识别优先使用 `GET /api/admin/storage/list` 的 `driver` 字段，失败时再对候选路径 `POST /api/fs/get` 读取 `provider`。随机浏览不重扫存储：访客请求只读本地索引路径，再经 URL 缓存换链；约 300 个作者相册的重建在本机 OpenList 上通常约 1.5–5 分钟；生产机经百度一刻上游时，根目录列举就可能 10 秒以上，整库重建常需数十分钟（大册分页与上游限流会使上限变长）。
 
 ### 3.3 URL 解析模型
 
