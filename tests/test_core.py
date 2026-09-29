@@ -884,7 +884,11 @@ class SharedImageChainTests(unittest.TestCase):
 
     def test_unfiltered_requests_share_the_same_chain(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            application = Application(Path(temporary) / "config.json")
+            config_path = Path(temporary) / "config.json"
+            config = validate_config({})
+            config["state_dir"] = temporary
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            application = Application(config_path)
             images = [{"path": f"/gallery/{index}.jpg", "size": index} for index in range(8)]
             application.repository.save(
                 {
@@ -909,7 +913,11 @@ class SharedImageChainTests(unittest.TestCase):
 
     def test_filtered_requests_stay_independent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            application = Application(Path(temporary) / "config.json")
+            config_path = Path(temporary) / "config.json"
+            config = validate_config({})
+            config["state_dir"] = temporary
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            application = Application(config_path)
             images = [{"path": f"/gallery/{index}.jpg", "size": index} for index in range(6)]
             application.repository.save(
                 {

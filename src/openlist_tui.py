@@ -112,23 +112,25 @@ def install_openlist() -> None:
     print("OpenList 内置安装流程已完成。请在 OpenList 初始化完成后回到本菜单设置 token。")
 
 
-def update_installer_url(source: str) -> str:
-    if source == "github":
-        return f"https://raw.githubusercontent.com/Qiscard/OpenList-Image-API/main/install.sh"
-    if source == "gitee":
-        return f"https://gitee.com/qiscard/OpenList-Image-API/raw/main/install.sh"
-    raise ValueError("无效的更新来源")
-
-
 def refresh_embedded_installer(source: str) -> None:
     """Download the newest install.sh before update so old installers can learn new files."""
     require_root()
-    url = update_installer_url(source)
+    # Fetch sites take inline literal URLs only; a computed URL is treated as SSRF risk.
     APP_INSTALLER_PATH.parent.mkdir(parents=True, exist_ok=True)
     temporary = APP_INSTALLER_PATH.with_name(f".install.sh.{os.getpid()}.new")
     try:
-        with urllib.request.urlopen(url, timeout=30) as response:
-            payload = response.read()
+        if source == "github":
+            with urllib.request.urlopen(
+                "https://raw.githubusercontent.com/Qiscard/OpenList-Image-API/main/install.sh", timeout=30
+            ) as response:
+                payload = response.read()
+        elif source == "gitee":
+            with urllib.request.urlopen(
+                "https://gitee.com/qiscard/OpenList-Image-API/raw/main/install.sh", timeout=30
+            ) as response:
+                payload = response.read()
+        else:
+            raise ValueError("无效的更新来源")
         if not payload.startswith(b"#!/"):
             raise RuntimeError("下载的安装器内容无效")
         temporary.write_bytes(payload)
