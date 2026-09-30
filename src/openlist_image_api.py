@@ -77,6 +77,9 @@ URL_RESOLVE_WORKERS = 6
 URL_RESOLVE_WAIT_SECONDS = 25
 # BaiduPhoto fs/get often needs 15-40s; short timeouts cancel OpenList upstream work.
 URL_RESOLVE_OPENLIST_TIMEOUT_SECONDS = 45
+# A failed fs/get usually means the upstream driver is throttling; retrying in
+# that window only queues another 45s timeout on the same path.
+URL_NEGATIVE_CACHE_SECONDS = 60
 INDEX_LIST_TIMEOUT_SECONDS = 60
 INDEX_LIST_PAGE_SIZE = 100
 INDEX_LIST_WORKERS = 4
@@ -962,6 +965,7 @@ class UrlCache:
         self._entries: OrderedDict[str, tuple[float, str, str]] = OrderedDict()
         self._lock = threading.Lock()
         self._inflight: dict[tuple[str, str], _InflightResolve] = {}
+        self._failures: dict[tuple[str, str], float] = {}
         self._save_timer: threading.Timer | None = None
         self.hits = 0
         self.misses = 0
@@ -1066,6 +1070,19 @@ class UrlCache:
                 self._entries.popitem(last=False)
         self._mark_dirty()
 
+    def _failed_recently_unlocked(self, path: str, kind: str) -> bool:
+        if len(self._failures) > 4096:
+            now = time.monotonic()
+            for expired in [name for name, failed_at in self._failures.items() if now - failed_at >= URL_NEGATIVE_CACHE_SECONDS]:
+                del self._failures[expired]
+        failed_at = self._failures.get((path, kind))
+        if failed_at is None:
+            return False
+        if time.monotonic() - failed_at >= URL_NEGATIVE_CACHE_SECONDS:
+            self._failures.pop((path, kind), None)
+            return False
+        return True
+
     def resolve(self, path: str, client: OpenListClient, refresh: bool = False) -> tuple[str, str]:
         if not refresh:
             cached = self._cached(path)
@@ -1079,6 +1096,8 @@ class UrlCache:
                     cached = self._cached_unlocked(path)
                     if cached is not None and cached[0]:
                         return cached
+                    if self._failed_recently_unlocked(path, "download"):
+                        raise RuntimeError("recent resolve failed; backing off briefly")
                 inflight = _InflightResolve()
                 self._inflight[key] = inflight
                 self.misses += 1
@@ -1094,6 +1113,8 @@ class UrlCache:
             return inflight.result
         try:
             url, thumb = client.resolve_file(path)
+            with self._lock:
+                self._failures.pop(key, None)
             if self.max_size:
                 with self._lock:
                     previous = self._entries.get(path)
@@ -1107,6 +1128,8 @@ class UrlCache:
             inflight.result = (url, thumb)
             return url, thumb
         except Exception as error:
+            with self._lock:
+                self._failures[key] = time.monotonic()
             inflight.error = error
             raise
         finally:
@@ -1128,6 +1151,8 @@ class UrlCache:
                     cached = self._cached_unlocked(path)
                     if cached is not None and cached[1]:
                         return "", cached[1]
+                    if self._failed_recently_unlocked(path, "preview"):
+                        raise RuntimeError("recent preview resolve failed; backing off briefly")
                 inflight = _InflightResolve()
                 self._inflight[key] = inflight
                 self.misses += 1
@@ -1143,6 +1168,8 @@ class UrlCache:
             return inflight.result
         try:
             _url, thumb = client.resolve_preview(path)
+            with self._lock:
+                self._failures.pop(key, None)
             if self.max_size:
                 with self._lock:
                     previous = self._entries.get(path)
@@ -1155,6 +1182,8 @@ class UrlCache:
             inflight.result = ("", thumb)
             return "", thumb
         except Exception as error:
+            with self._lock:
+                self._failures[key] = time.monotonic()
             inflight.error = error
             raise
         finally:
@@ -1289,6 +1318,8 @@ class Application:
         self.cache = self._make_url_cache()
         self.shared_chain = SharedImageChain()
         self.url_executor = ThreadPoolExecutor(max_workers=URL_RESOLVE_WORKERS, thread_name_prefix="openlist-url")
+        self._prefetch_lock = threading.Lock()
+        self._prefetch_busy = False
         self.config_lock = threading.Lock()
         self.refresh_lock = threading.Lock()
         self.refreshing = False
@@ -1850,13 +1881,16 @@ class Application:
             results.append(result)
         return results
 
-    def prefetch_urls(self, images: list[dict[str, Any]]) -> None:
+    def prefetch_urls(self, images: list[dict[str, Any]], preview: bool = False) -> None:
         client = OpenListClient(self.config)
         paths = [str(image["path"]) for image in images]
 
         def prefetch(path: str) -> None:
             try:
-                self.cache.resolve(path, client)
+                if preview:
+                    self.cache.resolve_preview(path, client)
+                else:
+                    self.cache.resolve(path, client)
             except Exception:
                 pass
 
@@ -1865,6 +1899,40 @@ class Application:
             name="openlist-url-prefetch",
             daemon=True,
         ).start()
+
+    def prefetch_chain_next(self, chain_info: dict[str, Any], count: int) -> None:
+        """Warm the URL cache for the next shared-chain segment before visitors ask for it."""
+        if not self.config.get("url_cache_size") or not isinstance(chain_info, dict):
+            return
+        remaining = int(chain_info.get("remaining") or 0)
+        if remaining <= 0:
+            return
+        with self._prefetch_lock:
+            if self._prefetch_busy:
+                return
+            self._prefetch_busy = True
+
+        def worker() -> None:
+            try:
+                index = self.repository.load()
+                images = index.get("images", [])
+                total = len(images)
+                if total <= 0:
+                    return
+                generated_at = int(index.get("generated_at") or 0)
+                prefetch_count = min(max(int(count) * 2, 10), 30, remaining)
+                positions, _info = self.shared_chain.slice(
+                    total, generated_at, prefetch_count, chain_id=str(chain_info.get("id") or ""), offset=int(chain_info.get("offset") or 0)
+                )
+                segment = [images[position] for position in positions if isinstance(position, int) and 0 <= position < total]
+                if segment:
+                    self.prefetch_urls(segment, preview=True)
+            except Exception:
+                logging.debug("chain segment prefetch skipped", exc_info=True)
+            finally:
+                self._prefetch_busy = False
+
+        threading.Thread(target=worker, name="openlist-chain-prefetch", daemon=True).start()
 
     def voter_id(self, ip: str, user_agent: str, admin_token: str | None) -> str:
         if self.config["tagging_scope"] == "token":
@@ -2095,6 +2163,7 @@ def make_handler(application: Application):
                     payload = {"images": result}
                     if chain_info:
                         payload["chain"] = chain_info
+                        application.prefetch_chain_next(chain_info, count)
                     return self._send_json(HTTPStatus.OK, payload)
                 if parsed.path == "/api/download-url":
                     if self._maintenance_access_required():
