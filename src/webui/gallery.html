@@ -21,14 +21,15 @@
   --radius:14px;
   --radius-sm:9px;
   --shadow:0 16px 40px rgba(0,0,0,.5);
-  --header-h:56px;
+  --header-h:48px;
   --font:"Segoe UI",system-ui,-apple-system,"PingFang SC","Noto Sans SC",sans-serif;
 }
+body,header,dialog,.preferences,.announcement,.header-menu,.tag-bar,.tag-chip,.tag-clear,.maintenance,.slide-history,.slide-nav,#theme-fab{transition:background-color .35s ease,color .35s ease,border-color .35s ease}
 *{box-sizing:border-box}
-html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text);font:15px/1.45 var(--font)}
+html,body{margin:0;min-height:100%;background-color:var(--bg);background-image:radial-gradient(1100px 700px at 85% -10%,color-mix(in srgb,var(--accent) 9%,var(--bg)),transparent);background-attachment:fixed;color:var(--text);font:15px/1.45 var(--font)}
 button,.button,input,select,textarea{font:inherit}
-button,.button{border:0;border-radius:var(--radius-sm);background:var(--accent);color:#fff;padding:8px 13px;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;gap:6px}
-button:hover,.button:hover{background:var(--accent-hover)}
+button,.button{border:0;border-radius:var(--radius-sm);background:linear-gradient(135deg,var(--accent),var(--accent-hover));color:#fff;padding:8px 13px;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;gap:6px}
+button:hover,.button:hover{background-image:linear-gradient(135deg,var(--accent-hover),var(--accent))}
 button:disabled{opacity:.45;cursor:not-allowed}
 button.ghost,.button.ghost{background:transparent;color:var(--text);border:1px solid var(--line)}
 button.ghost:hover,.button.ghost:hover{background:var(--bg-soft);border-color:var(--accent)}
@@ -37,25 +38,26 @@ button:focus-visible,.button:focus-visible,input:focus-visible,select:focus-visi
 .hidden{display:none!important}
 a{color:inherit}
 header{
-  position:sticky;z-index:8;top:0;display:flex;align-items:center;gap:12px;
-  min-height:var(--header-h);padding:8px 16px;
-  background:color-mix(in srgb,var(--bg) 86%,transparent);
+  position:sticky;z-index:8;top:0;display:flex;align-items:center;gap:10px;
+  min-height:var(--header-h);padding:6px 14px;
+  background:linear-gradient(180deg,color-mix(in srgb,var(--bg-elev) 92%,transparent),color-mix(in srgb,var(--bg) 72%,transparent));
   backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
   border-bottom:1px solid var(--line);
 }
 .brand{display:flex;align-items:baseline;gap:10px;min-width:0;flex:1}
 .brand strong{font-size:16px;letter-spacing:.02em}
 .brand .meta{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.header-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.header-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.header-actions button,.header-actions .button{padding:5px 11px;font-size:13px}
 .header-actions #previous,.header-actions #next,.header-actions #slideshow-toggle{display:none!important}
 #header-menu-toggle{
-  display:none;width:40px;height:40px;padding:0;border-radius:11px;
-  background:var(--bg-soft);border:1px solid var(--line);color:var(--text);font-size:13px
+  display:none;width:34px;height:34px;padding:0;border-radius:9px;
+  background:var(--bg-soft);border:1px solid var(--line);color:var(--text);font-size:12px
 }
 .header-menu{
-  position:fixed;z-index:6;top:var(--menu-top,56px);right:10px;width:188px;
-  display:flex;flex-direction:column;gap:8px;padding:12px;
-  background:var(--bg-elev);border:1px solid var(--line);border-radius:16px;
+  position:fixed;z-index:6;top:var(--menu-top,48px);right:10px;width:172px;
+  display:flex;flex-direction:column;gap:6px;padding:10px;
+  background:var(--bg-elev);border:1px solid var(--line);border-radius:14px;
   box-shadow:var(--shadow);
   opacity:0;visibility:hidden;transform:translateY(-8px);
   transition:opacity .22s ease,transform .22s ease,visibility .22s
@@ -64,7 +66,7 @@ header{
 #header-menu-backdrop{position:fixed;z-index:5;inset:0;opacity:0;visibility:hidden;background:#0007;transition:opacity .22s ease,visibility .22s}
 #header-menu-backdrop.open{opacity:1;visibility:visible}
 #header-menu .button,#header-menu button,#header-menu a{
-  width:100%;text-align:center;padding:11px 12px;border-radius:10px
+  width:100%;text-align:center;padding:8px 12px;border-radius:9px
 }
 #menu-previous,#menu-next,#menu-slideshow-toggle{display:none!important}
 .gallery{padding:16px}
@@ -119,7 +121,7 @@ body.announcement-open>header,body.announcement-open>main,body.announcement-open
 body.announcement-open>#announcement-backdrop,body.announcement-open>#announcement{display:block!important;visibility:visible!important}
 .preferences{
   position:fixed;z-index:5;top:50%;left:50%;width:min(92vw,460px);max-height:86vh;overflow:auto;
-  padding:22px;border:1px solid var(--line);border-radius:18px;background:var(--bg-elev);color:var(--text);
+  padding:22px;border:1px solid var(--line);border-radius:18px;background:linear-gradient(180deg,var(--bg-elev),var(--bg));color:var(--text);
   transform:translate(-50%,-50%);box-shadow:var(--shadow)
 }
 .preferences h2{margin:0 0 8px;font-size:18px}
@@ -206,7 +208,7 @@ body:not(.theme-light)::after{content:'';position:fixed;inset:0;z-index:10000;po
 .card .card-image{position:relative;z-index:1;opacity:0;transition:opacity .28s ease}
 .card .card-image.is-loaded{opacity:1}
 @media(max-width:760px){
-  header{padding:8px 12px}
+  header{padding:5px 10px}
   .header-actions{display:none}
   #header-menu-toggle{display:inline-flex}
   .header-menu{left:0;right:0;width:auto;border-radius:0 0 16px 16px;border-left:0;border-right:0}
