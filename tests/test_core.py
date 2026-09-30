@@ -56,8 +56,9 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(defaults["url_cache_size"], 0)
         self.assertEqual(defaults["url_cache_ttl_seconds"], 7200)
         self.assertEqual(validate_config({"url_cache_size": 8000, "url_cache_ttl_seconds": 7200})["url_cache_size"], 8000)
+        self.assertEqual(validate_config({"url_cache_size": 100000})["url_cache_size"], 100000)
         with self.assertRaises(ValueError):
-            validate_config({"url_cache_size": 8001})
+            validate_config({"url_cache_size": 100001})
         with self.assertRaises(ValueError):
             validate_config({"url_cache_ttl_seconds": 7201})
         self.assertEqual(validate_config({"listen_host": "0.0.0.0"})["listen_host"], "0.0.0.0")

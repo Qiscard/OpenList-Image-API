@@ -210,7 +210,7 @@ def validate_config(candidate: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("grid_gap must be between 0 and 48")
     if not isinstance(config["grid_scale"], int) or not 75 <= config["grid_scale"] <= 200:
         raise ValueError("grid_scale must be between 75 and 200")
-    if not isinstance(config["url_cache_size"], int) or not 0 <= config["url_cache_size"] <= 8000:
+    if not isinstance(config["url_cache_size"], int) or not 0 <= config["url_cache_size"] <= 100000:
         raise ValueError("invalid url_cache_size")
     if not isinstance(config["url_cache_ttl_seconds"], int) or not 0 <= config["url_cache_ttl_seconds"] <= 7200:
         raise ValueError("invalid url_cache_ttl_seconds")
