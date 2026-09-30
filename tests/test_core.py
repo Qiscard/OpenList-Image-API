@@ -116,6 +116,37 @@ class OpenListClientRetryTests(unittest.TestCase):
             self.assertEqual(resolved[0], "https://example.invalid/gallery/a.jpg")
 
 
+class OpenListClientResolveConcurrencyTests(unittest.TestCase):
+    def test_fs_get_resolves_are_globally_capped(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            token_path = Path(temporary) / "openlist.token"
+            token_path.write_text("test-token", encoding="utf-8")
+            client = OpenListClient({"openlist_api_url": "http://127.0.0.1:5244", "openlist_token_file": str(token_path)})
+            state = {"active": 0, "peak": 0}
+            state_lock = threading.Lock()
+
+            def slow_urlopen(*args, **kwargs):
+                with state_lock:
+                    state["active"] += 1
+                    state["peak"] = max(state["peak"], state["active"])
+                time.sleep(0.1)
+                with state_lock:
+                    state["active"] -= 1
+                response = mock.MagicMock()
+                response.__enter__.return_value = io.StringIO(
+                    json.dumps({"code": 200, "data": {"raw_url": "https://example.invalid/a.jpg", "thumb": ""}})
+                )
+                return response
+
+            with mock.patch("openlist_image_api.urlopen", side_effect=slow_urlopen):
+                workers = [threading.Thread(target=client.resolve_file, args=(f"/gallery/{index}.jpg",)) for index in range(6)]
+                for worker in workers:
+                    worker.start()
+                for worker in workers:
+                    worker.join()
+            self.assertLessEqual(state["peak"], 2)
+
+
 class UrlCacheConcurrencyTests(unittest.TestCase):
     def test_same_path_concurrent_misses_are_coalesced(self) -> None:
         class Client:

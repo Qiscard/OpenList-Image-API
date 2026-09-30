@@ -80,6 +80,11 @@ URL_RESOLVE_OPENLIST_TIMEOUT_SECONDS = 45
 # A failed fs/get usually means the upstream driver is throttling; retrying in
 # that window only queues another 45s timeout on the same path.
 URL_NEGATIVE_CACHE_SECONDS = 60
+# fs/get is the only call that hits slow storage drivers (BaiduPhoto needs
+# 15-40s when hammered in parallel but ~1s serially); a small global cap keeps
+# concurrent gallery waves from collapsing the upstream into mass timeouts.
+URL_RESOLVE_GLOBAL_CONCURRENCY = 2
+_fs_get_semaphore = threading.BoundedSemaphore(URL_RESOLVE_GLOBAL_CONCURRENCY)
 INDEX_LIST_TIMEOUT_SECONDS = 60
 INDEX_LIST_PAGE_SIZE = 100
 INDEX_LIST_WORKERS = 4
@@ -459,13 +464,14 @@ class OpenListClient:
         return {path for path, driver in self.storage_drivers().items() if driver == BAIDU_PHOTO_DRIVER}
 
     def resolve_file(self, path: str) -> tuple[str, str]:
-        data = self._post(
-            "/api/fs/get",
-            {"path": path, "password": "", "refresh": False},
-            timeout=URL_RESOLVE_OPENLIST_TIMEOUT_SECONDS,
-            retries=1,
-            retry_throttled_only=True,
-        )
+        with _fs_get_semaphore:
+            data = self._post(
+                "/api/fs/get",
+                {"path": path, "password": "", "refresh": False},
+                timeout=URL_RESOLVE_OPENLIST_TIMEOUT_SECONDS,
+                retries=1,
+                retry_throttled_only=True,
+            )
         url = str(data.get("raw_url") or data.get("url") or "").strip()
         if not url:
             raise RuntimeError("OpenList did not return a file URL")
@@ -475,13 +481,14 @@ class OpenListClient:
         return url, self._safe_thumb(data.get("thumb"))
 
     def resolve_preview(self, path: str) -> tuple[str, str]:
-        data = self._post(
-            "/api/fs/get",
-            {"path": path, "password": "", "refresh": False},
-            timeout=URL_RESOLVE_OPENLIST_TIMEOUT_SECONDS,
-            retries=1,
-            retry_throttled_only=True,
-        )
+        with _fs_get_semaphore:
+            data = self._post(
+                "/api/fs/get",
+                {"path": path, "password": "", "refresh": False},
+                timeout=URL_RESOLVE_OPENLIST_TIMEOUT_SECONDS,
+                retries=1,
+                retry_throttled_only=True,
+            )
         thumb = self._safe_thumb(data.get("thumb"))
         if not thumb:
             raise RuntimeError("OpenList did not return a thumbnail")
