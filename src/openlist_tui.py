@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import itertools
 import io
 import json
 import os
@@ -12,6 +13,8 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import threading
+import time
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -53,6 +56,30 @@ def pause() -> None:
 
 def clear() -> None:
     print("\033[2J\033[H", end="")
+
+
+def run_with_spinner(description: str, task):
+    """Run task in a worker thread; show a spinner only when it takes a while."""
+    done = threading.Event()
+    outcome: dict[str, Any] = {}
+
+    def worker() -> None:
+        try:
+            outcome["result"] = task()
+        except BaseException as error:
+            outcome["error"] = error
+        finally:
+            done.set()
+
+    threading.Thread(target=worker, daemon=True).start()
+    if not done.wait(0.4):
+        frames = itertools.cycle("-\\|/")
+        while not done.wait(0.12):
+            print(f"\r{description} {next(frames)} ", end="", flush=True)
+        print("\r\033[K", end="", flush=True)
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("result")
 
 
 def run(
@@ -192,17 +219,19 @@ def maintenance_menu() -> None:
         if choice == "0":
             return
         if choice == "1":
-            update_application("github")
+            run_with_spinner("更新中（github）", lambda: update_application("github"))
         elif choice == "2":
-            update_application("gitee")
+            run_with_spinner("更新中（gitee）", lambda: update_application("gitee"))
         elif choice == "3":
-            uninstall_application()
+            run_with_spinner("卸载中", lambda: uninstall_application())
         elif choice == "4":
-            cleanup_residuals_and_runtime_cache()
+            run_with_spinner("清理中", lambda: cleanup_residuals_and_runtime_cache())
         elif choice == "5":
-            export_global_migration()
+            run_with_spinner("生成迁移包", lambda: export_global_migration())
         else:
-            raise ValueError("无效的维护操作")
+            print("无效的维护操作。")
+            time.sleep(0.6)
+            continue
         pause()
 
 
@@ -257,11 +286,11 @@ def service_management() -> None:
         if choice == "1":
             configure_listen_host()
         elif choice == "2":
-            service_action("start")
+            run_with_spinner("启动服务", lambda: service_action("start"))
         elif choice == "3":
-            service_action("stop")
+            run_with_spinner("停止服务", lambda: service_action("stop"))
         elif choice == "4":
-            service_action("restart")
+            run_with_spinner("重启服务", lambda: service_action("restart"))
         else:
             raise ValueError("无效的服务管理操作")
         pause()
@@ -472,7 +501,7 @@ def main_menu() -> None:
         if not action:
             continue
         try:
-            action()
+            run_with_spinner("处理中", action)
         except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as error:
             print(f"操作失败: {error}")
         pause()
@@ -484,8 +513,11 @@ def main() -> None:
     if args.print_admin_token:
         print_admin_token()
         return
-    ensure_admin_token()
-    main_menu()
+    try:
+        ensure_admin_token()
+        main_menu()
+    except KeyboardInterrupt:
+        print("\n已退出。")
 
 
 if __name__ == "__main__":
