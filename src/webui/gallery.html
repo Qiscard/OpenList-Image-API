@@ -111,7 +111,7 @@ dialog::backdrop{background:#000c}
 .modal-backdrop{position:fixed;z-index:4;inset:0;background:#0008}
 #announcement-backdrop{position:fixed!important;z-index:1000!important;inset:0!important;background:#10131a!important;opacity:1!important;pointer-events:auto!important;animation:backdrop-in .25s ease both}
 .announcement{z-index:1001!important;pointer-events:auto!important}
-body.announcement-open{overflow:hidden}
+body.announcement-open,body.preferences-open{overflow:hidden}
 body.announcement-open>header,body.announcement-open>main,body.announcement-open>#maintenance{pointer-events:none!important;user-select:none}
 body.announcement-open>#announcement-backdrop,body.announcement-open>#announcement{display:block!important;visibility:visible!important}
 .preferences{
@@ -189,12 +189,14 @@ body.theme-light .card img,body.theme-light .lightbox-stage,body.theme-light .sl
 body:not(.theme-light)::after{content:'';position:fixed;inset:0;z-index:10000;pointer-events:none;background:rgba(0,0,0,.32)}
 .contact-wrap{position:relative;display:inline-flex}
 #contact-popover{position:absolute;z-index:12;top:calc(100% + 8px);right:0;width:max-content;max-width:min(92vw,280px);padding:12px;border:1px solid var(--line);border-radius:14px;background:var(--bg-elev);box-shadow:var(--shadow)}
-#contact-popover .contact-grid{display:grid;grid-template-columns:repeat(var(--contact-cols,1),minmax(96px,1fr));gap:10px}
-#contact-popover .contact-card{display:flex;flex-direction:column;align-items:center;gap:6px;padding:8px 6px;border-radius:10px;background:var(--bg-soft);cursor:pointer;text-decoration:none;color:var(--text);transition:background .15s;min-width:96px}
-#contact-popover .contact-card:hover{background:var(--accent);color:#fff}
-#contact-popover .contact-card img{display:block;width:96px;height:96px;object-fit:contain;border-radius:8px;background:#fff}
-#contact-popover .contact-card .contact-text{font-size:13px;font-weight:600;text-align:center;line-height:1.3}
-.header-menu #contact-popover{right:auto;left:12px;top:auto;bottom:calc(100% + 8px)}
+.contact-grid{display:grid;grid-template-columns:repeat(var(--contact-cols,1),minmax(96px,1fr));gap:10px}
+.contact-card{display:flex;flex-direction:column;align-items:center;gap:6px;padding:8px 6px;border-radius:10px;background:var(--bg-soft);cursor:pointer;text-decoration:none;color:var(--text);transition:background .15s;min-width:96px}
+.contact-card:hover{background:var(--accent);color:#fff}
+.contact-card img{display:block;width:96px;height:96px;object-fit:contain;border-radius:8px;background:#fff}
+.contact-card .contact-text{font-size:13px;font-weight:600;text-align:center;line-height:1.3}
+#contact-dialog{width:min(92vw,360px);padding:16px;border-radius:16px}
+#contact-dialog .contact-dialog-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}
+#contact-dialog .contact-dialog-head h2{margin:0;font-size:16px}
 @media(max-width:760px){
   header{padding:8px 12px}
   .header-actions{display:none}
@@ -215,8 +217,10 @@ body:not(.theme-light)::after{content:'';position:fixed;inset:0;z-index:10000;po
   .tag-clear{padding:3px 8px;font-size:11px}
   .card-tags{max-height:48px;padding:5px 7px;gap:3px}
   .tag-vote,.tag-category{padding:3px 6px;font-size:10px}
-  .preferences{width:calc(100vw - 24px)}
-  .preferences-grid{grid-template-columns:1fr 1fr}
+  .preferences{top:auto;bottom:0;left:0;right:0;transform:none;width:100vw;max-height:82dvh;border-radius:18px 18px 0 0;border-left:0;border-right:0;border-bottom:0;padding:14px 16px 0;overscroll-behavior:contain}
+  .preferences::before{content:'';display:block;width:36px;height:4px;margin:0 auto 10px;border-radius:2px;background:var(--line)}
+  .preferences-grid{grid-template-columns:1fr}
+  .preferences-actions{position:sticky;bottom:0;margin:16px -16px 0;padding:10px 16px calc(12px + env(safe-area-inset-bottom));background:var(--bg-elev);border-top:1px solid var(--line)}
   dialog{width:100vw;height:100dvh;max-width:none;max-height:none;border:0;border-radius:0}
   .lightbox-stage{height:calc(100dvh - 126px)}
   .lightbox-foot{flex-wrap:wrap}
@@ -228,7 +232,6 @@ body:not(.theme-light)::after{content:'';position:fixed;inset:0;z-index:10000;po
   .announcement-title{font-size:18px}
   .announcement-footer{padding:8px 18px 14px}
 }
-@media(max-width:400px){.preferences-grid{grid-template-columns:1fr}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
 </style>
 </head>
@@ -309,6 +312,7 @@ body:not(.theme-light)::after{content:'';position:fixed;inset:0;z-index:10000;po
   <div class="announcement-main"><h2 id="announcement-title" class="announcement-title"></h2><div id="announcement-content" class="announcement-content"></div></div>
   <div class="announcement-footer"><p id="announcement-reading" class="meta"></p><div class="announcement-actions"><button id="announcement-contact" class="hidden ghost" type="button">联系</button><button id="announcement-close-once" type="button">本次关闭</button><button id="announcement-close-forever" type="button">不再显示</button></div></div>
 </section>
+<dialog id="contact-dialog" aria-label="联系方式"><div class="contact-dialog-head"><h2>联系方式</h2><button id="contact-dialog-close" class="ghost" type="button" aria-label="关闭联系方式">关闭</button></div><div class="contact-grid" id="contact-dialog-grid"></div></dialog>
 <button id="theme-fab" type="button" title="切换明暗主题" aria-label="切换明暗主题">🌙</button>
 <script>
 const PREFERENCE_KEY='openlist-image-preferences-v2';
@@ -332,6 +336,8 @@ const contactPopover=document.querySelector('#contact-popover');
 const contactGrid=document.querySelector('#contact-grid');
 const menuContact=document.querySelector('#menu-contact');
 const announcementContact=document.querySelector('#announcement-contact');
+const contactDialog=document.querySelector('#contact-dialog');
+const contactDialogGrid=document.querySelector('#contact-dialog-grid');
 const maintenance=document.querySelector('#maintenance');
 const maintenanceToken=document.querySelector('#maintenance-token');
 const maintenanceMessage=document.querySelector('#maintenance-message');
@@ -548,12 +554,11 @@ function syncContactControls(){
   if(contactGrid) contactGrid.replaceChildren();
 }
 function hideContactPopover(){if(contactPopover) contactPopover.classList.add('hidden');}
-function showContactPopover(){
-  if(!contactConfig()||!contactPopover||!contactGrid) return;
+function fillContactCards(grid){
   const entries=contactEntries();
-  if(!entries.length) return;
-  contactGrid.style.setProperty('--contact-cols',String(Math.min(2,entries.length)));
-  contactGrid.replaceChildren(...entries.map(entry=>{
+  if(!entries.length) return false;
+  grid.style.setProperty('--contact-cols',String(Math.min(2,entries.length)));
+  grid.replaceChildren(...entries.map(entry=>{
     const card=document.createElement(entry.url?'a':'div');
     card.className='contact-card';
     if(entry.url){card.href=entry.url;card.target='_blank';card.rel='noopener noreferrer';}
@@ -571,9 +576,20 @@ function showContactPopover(){
     card.append(text);
     return card;
   }));
+  return true;
+}
+function showContactPopover(){
+  if(!contactConfig()||!contactPopover||!contactGrid) return;
+  if(!fillContactCards(contactGrid)) return;
   contactPopover.classList.remove('hidden');
 }
+function openContactDialog(){
+  if(!contactConfig()||!contactDialog||!contactDialogGrid) return;
+  if(!fillContactCards(contactDialogGrid)) return;
+  contactDialog.showModal();
+}
 function openContact(){
+  if(contactDialog&&window.matchMedia('(max-width: 760px)').matches){openContactDialog();return;}
   if(!contactPopover.classList.contains('hidden')){hideContactPopover();return;}
   showContactPopover();
 }
@@ -623,10 +639,11 @@ function openPreferences(){
   syncWaterfallOption();
   preferencesPanel.classList.remove('hidden');
   preferencesBackdrop.classList.remove('hidden');
+  document.body.classList.add('preferences-open');
   preferencesPanel.focus();
 }
 
-function closePreferences(){preferencesPanel.classList.add('hidden');preferencesBackdrop.classList.add('hidden');if(preferencesReturnFocus&&preferencesReturnFocus.focus)preferencesReturnFocus.focus();preferencesReturnFocus=null;scheduleSlideshow();}
+function closePreferences(){preferencesPanel.classList.add('hidden');preferencesBackdrop.classList.add('hidden');document.body.classList.remove('preferences-open');if(preferencesReturnFocus&&preferencesReturnFocus.focus)preferencesReturnFocus.focus();preferencesReturnFocus=null;scheduleSlideshow();}
 
 function syncSlideshowOption(){document.querySelector('.slideshow-only').classList.toggle('hidden',layoutMode.value!=='slideshow');}
 function syncWaterfallOption(){document.querySelector('.waterfall-only').classList.toggle('hidden',layoutMode.value!=='waterfall');}
@@ -1892,6 +1909,11 @@ if(contactPopover){
   contactPopover.addEventListener('click',event=>{if(event.target===contactPopover) hideContactPopover();});
 }
 if(announcementContact) announcementContact.onclick=event=>{event.preventDefault();openContact();};
+if(contactDialog){
+  contactDialog.addEventListener('click',event=>{if(event.target===contactDialog) contactDialog.close();});
+  const contactDialogClose=document.querySelector('#contact-dialog-close');
+  if(contactDialogClose) contactDialogClose.onclick=()=>contactDialog.close();
+}
 const headerMenuToggle=document.querySelector('#header-menu-toggle');
 const headerMenu=document.querySelector('#header-menu');
 const headerMenuBackdrop=document.querySelector('#header-menu-backdrop');
