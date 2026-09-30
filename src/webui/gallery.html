@@ -104,6 +104,7 @@ dialog::backdrop{background:#000c}
 .lightbox-head{justify-content:space-between}
 .lightbox-controls{display:flex;gap:8px}
 .lightbox-stage{position:relative;height:calc(94vh - 126px);overflow:hidden;background:#080a0f;display:grid;place-items:center;cursor:default;touch-action:none;overscroll-behavior:contain}
+.lightbox-stage.is-pending::after{content:'';width:24px;height:24px;border:2px solid rgba(255,255,255,.35);border-top-color:var(--accent);border-radius:50%;animation:card-spin .8s linear infinite}
 .lightbox-stage.can-pan{cursor:grab}
 .lightbox-stage.can-pan.is-dragging{cursor:grabbing}
 .lightbox-image{display:block;width:auto;height:auto;max-width:none;max-height:none;object-fit:fill;transform-origin:center;transition:transform .15s ease;pointer-events:none;user-select:none;will-change:transform}
@@ -922,14 +923,27 @@ function openLightbox(image){
   lightboxBaseHeight=0;
   lightbox.showModal();
   delete lightboxImage.dataset.refreshAttempted;
-  lightboxImage.onload=()=>{delete lightboxImage.dataset.refreshAttempted;fitLightboxImage(false);};
+  delete lightboxImage.dataset.fallbackApplied;
+  lightboxImage.onload=()=>{delete lightboxImage.dataset.refreshAttempted;lightboxStage.classList.remove('is-pending');fitLightboxImage(false);};
   lightboxImage.onerror=()=>{
-    if(lightboxImage.dataset.refreshAttempted==='1') return;
-    lightboxImage.dataset.refreshAttempted='1';
-    refreshImageUrl(image,true,false,0).then(()=>{if(token===lightboxResolveToken)lightboxImage.src=lightboxSrc(image);}).catch(()=>{});
+    const attempts=Number(lightboxImage.dataset.refreshAttempted||'0');
+    if(attempts>=2){lightboxStage.classList.remove('is-pending');return;}
+    lightboxImage.dataset.refreshAttempted=String(attempts+1);
+    const degrade=attempts>=1;
+    refreshImageUrl(image,true,false,0).then(()=>{
+      if(token!==lightboxResolveToken) return;
+      let next=lightboxSrc(image);
+      if(degrade){next=sizedThumb(image.thumbnail,2560)||next;lightboxImage.dataset.fallbackApplied='1';}
+      if(next&&lightboxImage.src!==next) lightboxImage.src=next;
+    }).catch(()=>{
+      if(token!==lightboxResolveToken) return;
+      const next=sizedThumb(image.thumbnail,2560);
+      if(next&&lightboxImage.dataset.fallbackApplied!=='1'){lightboxImage.dataset.fallbackApplied='1';lightboxImage.src=next;}
+    });
   };
   lightboxImage.alt=imageName(image.path)||'图片';
   const previewSrc=lightboxSrc(image);
+  lightboxStage.classList.toggle('is-pending',!previewSrc);
   if(previewSrc) lightboxImage.src=previewSrc;
   const wantOriginal=(settings.lightbox_quality||'original')==='original';
   if(wantOriginal||!previewSrc){
@@ -937,7 +951,13 @@ function openLightbox(image){
       if(token!==lightboxResolveToken||!lightbox.open)return;
       const next=lightboxSrc(image);
       if(next&&lightboxImage.src!==next) lightboxImage.src=next;
-    }).catch(()=>{});
+      lightboxStage.classList.remove('is-pending');
+    }).catch(()=>{
+      if(token!==lightboxResolveToken||!lightbox.open)return;
+      lightboxStage.classList.remove('is-pending');
+      const next=sizedThumb(image.thumbnail,2560);
+      if(next&&!lightboxImage.getAttribute('src')) lightboxImage.src=next;
+    });
   }
   if(lightboxImage.complete&&lightboxImage.naturalWidth) fitLightboxImage(false);
 }

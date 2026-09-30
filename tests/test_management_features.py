@@ -374,6 +374,15 @@ class DownloadTests(unittest.TestCase):
             with urlopen(f"http://127.0.0.1:{server.server_port}/icon.svg") as response:
                 self.assertEqual(response.status, 200)
                 self.assertIn("image/svg+xml", response.headers["Content-Type"])
+            with urlopen(f"http://127.0.0.1:{server.server_port}/gallery") as response:
+                etag = response.headers["ETag"]
+                self.assertTrue(etag)
+            conditional = Request(f"http://127.0.0.1:{server.server_port}/gallery", headers={"If-None-Match": etag})
+            try:
+                with urlopen(conditional) as response:
+                    self.assertEqual(response.status, 200)
+            except HTTPError as error:
+                self.assertEqual(error.code, 304)
         finally:
             server.shutdown()
             server.server_close()

@@ -80,6 +80,10 @@ URL_RESOLVE_OPENLIST_TIMEOUT_SECONDS = 45
 # A failed fs/get usually means the upstream driver is throttling; retrying in
 # that window only queues another 45s timeout on the same path.
 URL_NEGATIVE_CACHE_SECONDS = 60
+# Cached URLs older than this are served immediately but revalidated in the
+# background: storage-driver signed links (BaiduPhoto) can expire well before
+# the cache TTL, and visitors must never receive a dead link twice.
+URL_STALE_SECONDS = 2700
 # fs/get is the only call that hits slow storage drivers (BaiduPhoto needs
 # 15-40s when hammered in parallel but ~1s serially); a small global cap keeps
 # concurrent gallery waves from collapsing the upstream into mass timeouts.
@@ -463,11 +467,11 @@ class OpenListClient:
     def baidu_photo_mounts(self) -> set[str]:
         return {path for path, driver in self.storage_drivers().items() if driver == BAIDU_PHOTO_DRIVER}
 
-    def resolve_file(self, path: str) -> tuple[str, str]:
+    def resolve_file(self, path: str, refresh: bool = False) -> tuple[str, str]:
         with _fs_get_semaphore:
             data = self._post(
                 "/api/fs/get",
-                {"path": path, "password": "", "refresh": False},
+                {"path": path, "password": "", "refresh": bool(refresh)},
                 timeout=URL_RESOLVE_OPENLIST_TIMEOUT_SECONDS,
                 retries=1,
                 retry_throttled_only=True,
@@ -480,11 +484,11 @@ class OpenListClient:
             raise RuntimeError("OpenList returned an invalid file URL")
         return url, self._safe_thumb(data.get("thumb"))
 
-    def resolve_preview(self, path: str) -> tuple[str, str]:
+    def resolve_preview(self, path: str, refresh: bool = False) -> tuple[str, str]:
         with _fs_get_semaphore:
             data = self._post(
                 "/api/fs/get",
-                {"path": path, "password": "", "refresh": False},
+                {"path": path, "password": "", "refresh": bool(refresh)},
                 timeout=URL_RESOLVE_OPENLIST_TIMEOUT_SECONDS,
                 retries=1,
                 retry_throttled_only=True,
@@ -973,6 +977,8 @@ class UrlCache:
         self._lock = threading.Lock()
         self._inflight: dict[tuple[str, str], _InflightResolve] = {}
         self._failures: dict[tuple[str, str], float] = {}
+        self._revalidating: set[str] = set()
+        self._revalidating_lock = threading.Lock()
         self._save_timer: threading.Timer | None = None
         self.hits = 0
         self.misses = 0
@@ -1077,6 +1083,33 @@ class UrlCache:
                 self._entries.popitem(last=False)
         self._mark_dirty()
 
+    def _maybe_revalidate(self, path: str, kind: str, client: OpenListClient) -> None:
+        """Serve stale immediately but renew expiring signed links in the background."""
+        if not self.max_size or len(self._revalidating) >= 512:
+            return
+        with self._lock:
+            entry = self._entries.get(path)
+            if not entry or time.monotonic() - entry[0] < URL_STALE_SECONDS:
+                return
+        with self._revalidating_lock:
+            if path in self._revalidating:
+                return
+            self._revalidating.add(path)
+
+        def worker() -> None:
+            try:
+                if kind == "download":
+                    self.resolve(path, client, refresh=True)
+                else:
+                    self.resolve_preview(path, client, refresh=True)
+            except Exception:
+                pass
+            finally:
+                with self._revalidating_lock:
+                    self._revalidating.discard(path)
+
+        threading.Thread(target=worker, name="openlist-url-revalidate", daemon=True).start()
+
     def _failed_recently_unlocked(self, path: str, kind: str) -> bool:
         if len(self._failures) > 4096:
             now = time.monotonic()
@@ -1094,6 +1127,7 @@ class UrlCache:
         if not refresh:
             cached = self._cached(path)
             if cached is not None and cached[0]:
+                self._maybe_revalidate(path, "download", client)
                 return cached
         key = (path, "download")
         with self._lock:
@@ -1118,8 +1152,12 @@ class UrlCache:
             if inflight.result is None:
                 raise RuntimeError("url resolve produced no result")
             return inflight.result
+        started = time.monotonic()
         try:
-            url, thumb = client.resolve_file(path)
+            url, thumb = client.resolve_file(path, refresh=refresh)
+            elapsed = time.monotonic() - started
+            if elapsed > 5:
+                logging.warning("slow URL resolve for %s in %.1fs", path, elapsed)
             with self._lock:
                 self._failures.pop(key, None)
             if self.max_size:
@@ -1149,6 +1187,7 @@ class UrlCache:
         if not refresh:
             cached = self._cached(path)
             if cached is not None and cached[1]:
+                self._maybe_revalidate(path, "preview", client)
                 return "", cached[1]
         key = (path, "preview")
         with self._lock:
@@ -1173,8 +1212,12 @@ class UrlCache:
             if inflight.result is None:
                 raise RuntimeError("preview resolve produced no result")
             return inflight.result
+        started = time.monotonic()
         try:
-            _url, thumb = client.resolve_preview(path)
+            _url, thumb = client.resolve_preview(path, refresh=refresh)
+            elapsed = time.monotonic() - started
+            if elapsed > 5:
+                logging.warning("slow preview resolve for %s in %.1fs", path, elapsed)
             with self._lock:
                 self._failures.pop(key, None)
             if self.max_size:
@@ -1238,7 +1281,9 @@ class SharedImageChain:
 
     def _new_chain(self, size: int, now: float) -> dict[str, Any]:
         chain_length = min(self.length, size)
-        start = (self._generation * chain_length) % size
+        # Random start per rotation: a fixed sequential walk would replay the
+        # same blocks after every restart and window wrap.
+        start = secrets.randbelow(size)
         window_id = self._window_id()
         self._generation += 1
         return {
@@ -1274,7 +1319,7 @@ class SharedImageChain:
                 payload["previous_id"] = previous["id"]
             return payload
 
-    def slice(self, size: int, generated_at: int, count: int, chain_id: str | None = None, offset: int | None = None) -> tuple[list[int], dict[str, Any]]:
+    def slice(self, size: int, generated_at: int, count: int, chain_id: str | None = None, offset: int | None = None, advance: bool = True) -> tuple[list[int], dict[str, Any]]:
         if size <= 0 or count <= 0:
             return [], {"id": "", "offset": 0, "remaining": 0, "length": 0, "rotated": False}
         now = time.monotonic()
@@ -1305,7 +1350,8 @@ class SharedImageChain:
             take_count = min(count, int(target["length"]) - position)
             start = int(target["start"])
             positions = [self._order[(start + position + index) % size] for index in range(take_count)]
-            target["high_water"] = max(int(target["high_water"]), position + take_count)
+            if advance:
+                target["high_water"] = max(int(target["high_water"]), position + take_count)
             info = {
                 "id": target["id"],
                 "offset": position + take_count,
@@ -1929,7 +1975,7 @@ class Application:
                 generated_at = int(index.get("generated_at") or 0)
                 prefetch_count = min(max(int(count) * 2, 10), 30, remaining)
                 positions, _info = self.shared_chain.slice(
-                    total, generated_at, prefetch_count, chain_id=str(chain_info.get("id") or ""), offset=int(chain_info.get("offset") or 0)
+                    total, generated_at, prefetch_count, chain_id=str(chain_info.get("id") or ""), offset=int(chain_info.get("offset") or 0), advance=False
                 )
                 segment = [images[position] for position in positions if isinstance(position, int) and 0 <= position < total]
                 if segment:
@@ -2044,7 +2090,12 @@ def make_handler(application: Application):
             super().setup()
             self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-        def _send_body(self, status: int, body: bytes, content_type: str, cache_control: str) -> None:
+        def _send_body(self, status: int, body: bytes, content_type: str, cache_control: str, etag: str | None = None) -> None:
+            if etag and self.headers.get("If-None-Match", "").strip() == etag:
+                self.send_response(HTTPStatus.NOT_MODIFIED)
+                self.send_header("ETag", etag)
+                self.end_headers()
+                return
             compressed = "gzip" in self.headers.get("Accept-Encoding", "").lower() and len(body) >= 1024
             if compressed:
                 body = gzip.compress(body, compresslevel=5)
@@ -2053,10 +2104,15 @@ def make_handler(application: Application):
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", cache_control)
             self.send_header("Vary", "Accept-Encoding")
+            if etag:
+                self.send_header("ETag", etag)
             if compressed:
                 self.send_header("Content-Encoding", "gzip")
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                logging.debug("client disconnected mid-response from %s", self.client_address[0])
 
         def _send_json(self, status: int, payload: dict[str, Any]) -> None:
             self._send_body(status, json_bytes(payload), "application/json; charset=utf-8", "no-store")
@@ -2067,6 +2123,7 @@ def make_handler(application: Application):
                 html.encode("utf-8"),
                 "text/html; charset=utf-8",
                 "public, max-age=60, stale-while-revalidate=300",
+                etag='"' + hashlib.md5(html.encode("utf-8")).hexdigest() + '"',
             )
 
         def _send_attachment(self, filename: str, body: bytes) -> None:
@@ -2110,6 +2167,7 @@ def make_handler(application: Application):
             except RuntimeError:
                 allowed = False
             if not allowed:
+                time.sleep(1.0)
                 self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "admin authentication required"})
             return allowed
 
@@ -2138,11 +2196,14 @@ def make_handler(application: Application):
                 if parsed.path == "/admin":
                     return self._send_html(admin_html())
                 if parsed.path == "/manifest.webmanifest":
-                    return self._send_body(HTTPStatus.OK, load_webui("manifest.webmanifest").encode("utf-8"), "application/manifest+json", "no-cache")
+                    body = load_webui("manifest.webmanifest").encode("utf-8")
+                    return self._send_body(HTTPStatus.OK, body, "application/manifest+json", "no-cache", etag='"' + hashlib.md5(body).hexdigest() + '"')
                 if parsed.path == "/sw.js":
-                    return self._send_body(HTTPStatus.OK, load_webui("sw.js").encode("utf-8"), "text/javascript; charset=utf-8", "no-cache")
+                    body = load_webui("sw.js").encode("utf-8")
+                    return self._send_body(HTTPStatus.OK, body, "text/javascript; charset=utf-8", "no-cache", etag='"' + hashlib.md5(body).hexdigest() + '"')
                 if parsed.path == "/icon.svg":
-                    return self._send_body(HTTPStatus.OK, load_webui("icon.svg").encode("utf-8"), "image/svg+xml", "max-age=86400")
+                    body = load_webui("icon.svg").encode("utf-8")
+                    return self._send_body(HTTPStatus.OK, body, "image/svg+xml", "max-age=86400", etag='"' + hashlib.md5(body).hexdigest() + '"')
                 if parsed.path == "/health":
                     return self._send_json(HTTPStatus.OK, {"status": "ok"})
                 if parsed.path == "/api/status":

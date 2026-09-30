@@ -117,6 +117,25 @@ class OpenListClientRetryTests(unittest.TestCase):
             self.assertEqual(resolved[0], "https://example.invalid/gallery/a.jpg")
 
 
+    def test_forced_refresh_asks_openlist_to_bypass_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            token_path = Path(temporary) / "openlist.token"
+            token_path.write_text("test-token", encoding="utf-8")
+            client = OpenListClient({"openlist_api_url": "http://127.0.0.1:5244", "openlist_token_file": str(token_path)})
+            payloads: list[dict[str, object]] = []
+
+            def record_post(endpoint: str, payload: dict[str, object], **kwargs: object) -> dict[str, object]:
+                del endpoint, kwargs
+                payloads.append(payload)
+                return {"raw_url": "https://example.invalid/a.jpg", "thumb": ""}
+
+            with mock.patch.object(client, "_post", side_effect=record_post):
+                client.resolve_file("/gallery/a.jpg", refresh=True)
+                client.resolve_file("/gallery/a.jpg")
+            self.assertTrue(payloads[0]["refresh"])
+            self.assertFalse(payloads[1]["refresh"])
+
+
 class OpenListClientResolveConcurrencyTests(unittest.TestCase):
     def test_fs_get_resolves_are_globally_capped(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -155,7 +174,7 @@ class UrlCacheConcurrencyTests(unittest.TestCase):
                 self.calls = 0
                 self.lock = threading.Lock()
 
-            def resolve_file(self, path: str) -> tuple[str, str]:
+            def resolve_file(self, path: str, refresh: bool = False) -> tuple[str, str]:
                 with self.lock:
                     self.calls += 1
                 time.sleep(0.05)
@@ -174,7 +193,7 @@ class UrlCacheConcurrencyTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.calls = 0
 
-            def resolve_file(self, path: str) -> tuple[str, str]:
+            def resolve_file(self, path: str, refresh: bool = False) -> tuple[str, str]:
                 self.calls += 1
                 return "https://example.invalid" + path, "https://example.invalid/thumb" + path
 
@@ -208,7 +227,7 @@ class UrlCacheConcurrencyTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.preview_calls = 0
 
-            def resolve_preview(self, path: str) -> tuple[str, str]:
+            def resolve_preview(self, path: str, refresh: bool = False) -> tuple[str, str]:
                 self.preview_calls += 1
                 return "", "https://example.invalid/thumb" + path
 
@@ -234,7 +253,7 @@ class UrlCacheConcurrencyTests(unittest.TestCase):
                 self.calls = 0
                 self.lock = threading.Lock()
 
-            def resolve_preview(self, path: str) -> tuple[str, str]:
+            def resolve_preview(self, path: str, refresh: bool = False) -> tuple[str, str]:
                 with self.lock:
                     self.calls += 1
                 time.sleep(0.05)
@@ -253,7 +272,7 @@ class UrlCacheConcurrencyTests(unittest.TestCase):
                 self.calls = 0
                 self.lock = threading.Lock()
 
-            def resolve_file(self, path: str) -> tuple[str, str]:
+            def resolve_file(self, path: str, refresh: bool = False) -> tuple[str, str]:
                 with self.lock:
                     self.calls += 1
                 time.sleep(0.05)
@@ -274,7 +293,7 @@ class UrlCacheConcurrencyTests(unittest.TestCase):
                 self.calls = 0
                 self.lock = threading.Lock()
 
-            def resolve_file(self, path: str) -> tuple[str, str]:
+            def resolve_file(self, path: str, refresh: bool = False) -> tuple[str, str]:
                 with self.lock:
                     self.calls += 1
                 time.sleep(0.05)
@@ -298,7 +317,7 @@ class UrlCacheConcurrencyTests(unittest.TestCase):
                 self.calls = 0
                 self.lock = threading.Lock()
 
-            def resolve_file(self, path: str) -> tuple[str, str]:
+            def resolve_file(self, path: str, refresh: bool = False) -> tuple[str, str]:
                 with self.lock:
                     self.calls += 1
                 started.set()
@@ -859,6 +878,25 @@ class IndexRepositoryTests(unittest.TestCase):
             self.assertEqual(application.status()["last_build_duration_seconds"], 12.5)
 
 
+class UrlCacheStalenessTests(unittest.TestCase):
+    def test_stale_cache_hits_revalidate_in_background(self) -> None:
+        cache = UrlCache(50, 7200)
+        cache._entries["/gallery/old.jpg"] = (time.monotonic() - 4000, "https://old.example/a.jpg", "")
+        client = mock.MagicMock()
+        client.resolve_file.return_value = ("https://new.example/a.jpg", "https://new.example/t.jpg")
+        served = cache.resolve("/gallery/old.jpg", client)
+        self.assertEqual(served, ("https://old.example/a.jpg", ""))
+        for _ in range(50):
+            if client.resolve_file.call_count:
+                break
+            time.sleep(0.02)
+        client.resolve_file.assert_called_once_with("/gallery/old.jpg", refresh=True)
+        with cache._lock:
+            stamp, url, _thumb = cache._entries["/gallery/old.jpg"]
+        self.assertEqual(url, "https://new.example/a.jpg")
+        self.assertLess(time.monotonic() - stamp, 60)
+
+
 class SharedImageChainTests(unittest.TestCase):
     def test_same_offset_is_shared(self) -> None:
         chain = SharedImageChain(length=5, ttl_seconds=60)
@@ -869,6 +907,17 @@ class SharedImageChainTests(unittest.TestCase):
         self.assertEqual(same["offset"], 3)
         self.assertEqual(same["remaining"], 2)
         self.assertEqual(len(set(first)), 3)
+
+    def test_peek_slice_does_not_advance_high_water(self) -> None:
+        chain = SharedImageChain(length=8, ttl_seconds=60)
+        _first, info = chain.slice(12, 5, 4, offset=0)
+        self.assertEqual(chain.status()["offset"], 4)
+        peeked, peek_info = chain.slice(12, 5, 4, chain_id=info["id"], offset=4, advance=False)
+        self.assertEqual(peek_info["offset"], 8)
+        self.assertEqual(chain.status()["offset"], 4)
+        continued, _continued_info = chain.slice(12, 5, 4, chain_id=info["id"], offset=4)
+        self.assertEqual(continued, peeked)
+        self.assertEqual(chain.status()["offset"], 8)
 
     def test_visitors_paginate_independently(self) -> None:
         chain = SharedImageChain(length=6, ttl_seconds=60)
