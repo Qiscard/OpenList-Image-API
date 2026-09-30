@@ -1,0 +1,12 @@
+{
+  "name": "OpenList 图库",
+  "short_name": "图库",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#07080c",
+  "theme_color": "#07080c",
+  "icons": [
+    {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any"}
+  ]
+}

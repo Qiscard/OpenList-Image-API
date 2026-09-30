@@ -3,6 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#07080c">
+<link rel="manifest" href="/manifest.webmanifest">
 <title>图库</title>
 <style>
 :root{
@@ -197,6 +199,11 @@ body:not(.theme-light)::after{content:'';position:fixed;inset:0;z-index:10000;po
 #contact-dialog{width:min(92vw,360px);padding:16px;border-radius:16px}
 #contact-dialog .contact-dialog-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}
 #contact-dialog .contact-dialog-head h2{margin:0;font-size:16px}
+.preview-button{position:relative;display:block}
+.card .card-blur{position:absolute;inset:0;object-fit:cover;filter:blur(18px) saturate(1.15);transform:scale(1.08);opacity:0;transition:opacity .3s ease;pointer-events:none}
+.card .card-blur.is-ready{opacity:1}
+.card .card-image{position:relative;z-index:1;opacity:0;transition:opacity .28s ease}
+.card .card-image.is-loaded{opacity:1}
 @media(max-width:760px){
   header{padding:8px 12px}
   .header-actions{display:none}
@@ -649,7 +656,7 @@ function syncSlideshowOption(){document.querySelector('.slideshow-only').classLi
 function syncWaterfallOption(){document.querySelector('.waterfall-only').classList.toggle('hidden',layoutMode.value!=='waterfall');}
 layoutMode.addEventListener('change',()=>{syncSlideshowOption();syncWaterfallOption();});
 
-function applyGalleryTheme(theme){document.body.classList.toggle('theme-light',theme==='light');document.body.classList.toggle('theme-dark',theme!=='light');if(themeFab)themeFab.textContent=theme==='light'?'☀':'🌙';}
+function applyGalleryTheme(theme){document.body.classList.toggle('theme-light',theme==='light');document.body.classList.toggle('theme-dark',theme!=='light');if(themeFab)themeFab.textContent=theme==='light'?'☀':'🌙';const themeMeta=document.querySelector('meta[name="theme-color"]');if(themeMeta)themeMeta.setAttribute('content',theme==='light'?'#f3f5f8':'#07080c');}
 
 function directoryFor(image){
   if(!settings.directory_display_enabled) return '';
@@ -827,6 +834,7 @@ let zoomScale=1;
 let zoomX=0;
 let zoomY=0;
 let zoomRotation=0;
+let lightboxSwipeStart=null;
 
 function clampZoomPan(){
   const rect=lightboxStage.getBoundingClientRect();
@@ -947,11 +955,12 @@ function createCard(image,eager=false){
   preview.setAttribute('aria-label','查看图片：'+accessibleName);
   preview.onclick=()=>openLightbox(image);
   const picture=document.createElement('img');
+  picture.className='card-image';
   picture.loading=eager?'eager':'lazy';
   picture.decoding='async';
   if(eager) picture.fetchPriority='high';
   picture.alt='';
-  const markCardReady=()=>{card.classList.remove('is-loading');picture.alt=accessibleName;};
+  const markCardReady=()=>{card.classList.remove('is-loading');picture.classList.add('is-loaded');picture.alt=accessibleName;};
   picture.addEventListener('load',markCardReady);
   const showCardError=()=>{
     card.classList.remove('is-loading');
@@ -972,11 +981,25 @@ function createCard(image,eager=false){
     }
   };
   attachImageRecovery(picture,image,showCardError);
+  const ensureBlur=()=>{
+    if(card._blur||!image.thumbnail) return;
+    const blur=document.createElement('img');
+    blur.className='card-blur';
+    blur.alt='';
+    blur.loading='lazy';
+    blur.decoding='async';
+    blur.addEventListener('load',()=>blur.classList.add('is-ready'));
+    blur.addEventListener('error',()=>{blur.remove();});
+    blur.src=sizedThumb(image.thumbnail,176);
+    card._blur=blur;
+    preview.append(blur);
+  };
+  ensureBlur();
   const applySrc=()=>{
     if(picture.dataset.srcApplied==='1') return card._ready||Promise.resolve();
     picture.dataset.srcApplied='1';
     if(needsImageResolve(image,false,true)){
-      card._ready=ensureFreshImage(image,true,eager?0:2).then(()=>{const src=cardSrc(image);if(!src)throw new Error('missing image source');picture.src=src;}).catch(showCardError);
+      card._ready=ensureFreshImage(image,true,eager?0:2).then(()=>{ensureBlur();const src=cardSrc(image);if(!src)throw new Error('missing image source');picture.src=src;}).catch(showCardError);
     }else{
       picture.src=cardSrc(image);
       card._ready=Promise.resolve();
@@ -1982,6 +2005,7 @@ lightboxStage.addEventListener('pointerdown',event=>{
   event.preventDefault();
   lightboxStage.setPointerCapture(event.pointerId);
   activePointers.set(event.pointerId,{id:event.pointerId,x:event.clientX,y:event.clientY});
+  lightboxSwipeStart=zoomScale<=1&&activePointers.size===1?{x:event.clientX,y:event.clientY}:null;
   lightboxStage.classList.add('is-dragging');
   beginPointerGesture();
 });
@@ -2007,7 +2031,13 @@ function finishPointer(event){
   activePointers.delete(event.pointerId);
   if(lightboxStage.hasPointerCapture(event.pointerId)) lightboxStage.releasePointerCapture(event.pointerId);
   if(activePointers.size) beginPointerGesture();
-  else{dragStart=null;pinchStart=null;lightboxStage.classList.remove('is-dragging');applyZoom();}
+  else{
+    if(lightboxSwipeStart&&lightbox.open){
+      const dx=event.clientX-lightboxSwipeStart.x,dy=event.clientY-lightboxSwipeStart.y;
+      if(Math.abs(dx)>56&&Math.abs(dx)>Math.abs(dy)*1.4){lightboxSwipeStart=null;dx>0?previousSlide():nextSlide().catch(showError);}
+    }
+    lightboxSwipeStart=null;dragStart=null;pinchStart=null;lightboxStage.classList.remove('is-dragging');applyZoom();
+  }
 }
 lightboxStage.addEventListener('pointerup',finishPointer);
 lightboxStage.addEventListener('pointercancel',finishPointer);
@@ -2028,6 +2058,7 @@ window.addEventListener('keydown',event=>{
 window.addEventListener('scroll',()=>{
   maybeLoadMoreWaterfall();
 },{passive:true});
+if('serviceWorker' in navigator){window.addEventListener('load',()=>{navigator.serviceWorker.register('/sw.js').catch(()=>{});});}
 window.addEventListener('resize',()=>{
   clearTimeout(resizeTimer);
   resizeTimer=setTimeout(()=>{

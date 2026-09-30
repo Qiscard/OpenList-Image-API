@@ -2137,6 +2137,12 @@ def make_handler(application: Application):
                     return self._send_html(gallery_html())
                 if parsed.path == "/admin":
                     return self._send_html(admin_html())
+                if parsed.path == "/manifest.webmanifest":
+                    return self._send_body(HTTPStatus.OK, load_webui("manifest.webmanifest").encode("utf-8"), "application/manifest+json", "no-cache")
+                if parsed.path == "/sw.js":
+                    return self._send_body(HTTPStatus.OK, load_webui("sw.js").encode("utf-8"), "text/javascript; charset=utf-8", "no-cache")
+                if parsed.path == "/icon.svg":
+                    return self._send_body(HTTPStatus.OK, load_webui("icon.svg").encode("utf-8"), "image/svg+xml", "max-age=86400")
                 if parsed.path == "/health":
                     return self._send_json(HTTPStatus.OK, {"status": "ok"})
                 if parsed.path == "/api/status":

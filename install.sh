@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 GITHUB_REPOSITORY="Qiscard/OpenList-Image-API"
 GITEE_REPOSITORY="qiscard/OpenList-Image-API"
-RELEASE_REF="v1.4.4"
+RELEASE_REF="v1.4.5"
 UPDATE_REF="main"
 APP_DIR="/opt/openlist-image-api"
 CONFIG_DIR="/etc/openlist-image-api"
@@ -336,6 +336,9 @@ install_image_api() {
   download "src/openlist_tui.py" "${temporary}/src/openlist_tui.py"
   download "src/webui/gallery.html" "${temporary}/src/webui/gallery.html"
   download "src/webui/admin.html" "${temporary}/src/webui/admin.html"
+  download "src/webui/manifest.webmanifest" "${temporary}/src/webui/manifest.webmanifest"
+  download "src/webui/sw.js" "${temporary}/src/webui/sw.js"
+  download "src/webui/icon.svg" "${temporary}/src/webui/icon.svg"
   download "VERSION" "${temporary}/VERSION"
   (
     cd "${temporary}"
@@ -357,6 +360,9 @@ install_image_api() {
   install -m 0755 "${temporary}/src/openlist_tui.py" "${APP_DIR}/openlist_tui.py"
   install -m 0644 "${temporary}/src/webui/gallery.html" "${APP_DIR}/webui/gallery.html"
   install -m 0644 "${temporary}/src/webui/admin.html" "${APP_DIR}/webui/admin.html"
+  install -m 0644 "${temporary}/src/webui/manifest.webmanifest" "${APP_DIR}/webui/manifest.webmanifest"
+  install -m 0644 "${temporary}/src/webui/sw.js" "${APP_DIR}/webui/sw.js"
+  install -m 0644 "${temporary}/src/webui/icon.svg" "${APP_DIR}/webui/icon.svg"
   install -m 0644 "${temporary}/VERSION" "${APP_DIR}/VERSION"
   create_default_config
   migrate_listen_host

@@ -347,6 +347,37 @@ class DownloadTests(unittest.TestCase):
             upstream.shutdown()
             upstream.server_close()
 
+    def test_progressive_web_app_assets_are_served(self) -> None:
+        class PwaApplication:
+            config = {"maintenance_enabled": False}
+
+            def is_admin(self, supplied_token: object) -> bool:
+                return True
+
+        page = gallery_html()
+        self.assertIn('rel="manifest"', page)
+        self.assertIn("serviceWorker", page)
+        self.assertIn("card-blur", page)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(PwaApplication()))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with urlopen(f"http://127.0.0.1:{server.server_port}/manifest.webmanifest") as response:
+                self.assertEqual(response.status, 200)
+                self.assertIn("application/manifest+json", response.headers["Content-Type"])
+                self.assertIn("/icon.svg", response.read().decode("utf-8"))
+            with urlopen(f"http://127.0.0.1:{server.server_port}/sw.js") as response:
+                self.assertEqual(response.status, 200)
+                self.assertIn("text/javascript", response.headers["Content-Type"])
+                self.assertIn("caches", response.read().decode("utf-8"))
+            with urlopen(f"http://127.0.0.1:{server.server_port}/icon.svg") as response:
+                self.assertEqual(response.status, 200)
+                self.assertIn("image/svg+xml", response.headers["Content-Type"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_download_url_post_resolves_multiple_paths(self) -> None:
         class FakeApplication:
             config = {"maintenance_enabled": False}
