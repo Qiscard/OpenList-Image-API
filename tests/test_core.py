@@ -174,7 +174,7 @@ class UrlCacheConcurrencyTests(unittest.TestCase):
                 self.calls = 0
                 self.lock = threading.Lock()
 
-            def resolve_file(self, path: str, refresh: bool = False) -> tuple[str, str]:
+            def resolve_file(self, path: str, refresh: bool = False, background: bool = False) -> tuple[str, str]:
                 with self.lock:
                     self.calls += 1
                 time.sleep(0.05)
@@ -193,7 +193,7 @@ class UrlCacheConcurrencyTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.calls = 0
 
-            def resolve_file(self, path: str, refresh: bool = False) -> tuple[str, str]:
+            def resolve_file(self, path: str, refresh: bool = False, background: bool = False) -> tuple[str, str]:
                 self.calls += 1
                 return "https://example.invalid" + path, "https://example.invalid/thumb" + path
 
@@ -227,7 +227,7 @@ class UrlCacheConcurrencyTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.preview_calls = 0
 
-            def resolve_preview(self, path: str, refresh: bool = False) -> tuple[str, str]:
+            def resolve_preview(self, path: str, refresh: bool = False, background: bool = False) -> tuple[str, str]:
                 self.preview_calls += 1
                 return "", "https://example.invalid/thumb" + path
 
@@ -253,7 +253,7 @@ class UrlCacheConcurrencyTests(unittest.TestCase):
                 self.calls = 0
                 self.lock = threading.Lock()
 
-            def resolve_preview(self, path: str, refresh: bool = False) -> tuple[str, str]:
+            def resolve_preview(self, path: str, refresh: bool = False, background: bool = False) -> tuple[str, str]:
                 with self.lock:
                     self.calls += 1
                 time.sleep(0.05)
@@ -272,7 +272,7 @@ class UrlCacheConcurrencyTests(unittest.TestCase):
                 self.calls = 0
                 self.lock = threading.Lock()
 
-            def resolve_file(self, path: str, refresh: bool = False) -> tuple[str, str]:
+            def resolve_file(self, path: str, refresh: bool = False, background: bool = False) -> tuple[str, str]:
                 with self.lock:
                     self.calls += 1
                 time.sleep(0.05)
@@ -293,7 +293,7 @@ class UrlCacheConcurrencyTests(unittest.TestCase):
                 self.calls = 0
                 self.lock = threading.Lock()
 
-            def resolve_file(self, path: str, refresh: bool = False) -> tuple[str, str]:
+            def resolve_file(self, path: str, refresh: bool = False, background: bool = False) -> tuple[str, str]:
                 with self.lock:
                     self.calls += 1
                 time.sleep(0.05)
@@ -317,7 +317,7 @@ class UrlCacheConcurrencyTests(unittest.TestCase):
                 self.calls = 0
                 self.lock = threading.Lock()
 
-            def resolve_file(self, path: str, refresh: bool = False) -> tuple[str, str]:
+            def resolve_file(self, path: str, refresh: bool = False, background: bool = False) -> tuple[str, str]:
                 with self.lock:
                     self.calls += 1
                 started.set()
@@ -890,11 +890,33 @@ class UrlCacheStalenessTests(unittest.TestCase):
             if client.resolve_file.call_count:
                 break
             time.sleep(0.02)
-        client.resolve_file.assert_called_once_with("/gallery/old.jpg", refresh=True)
+        client.resolve_file.assert_called_once_with("/gallery/old.jpg", refresh=True, background=True)
         with cache._lock:
             stamp, url, _thumb = cache._entries["/gallery/old.jpg"]
         self.assertEqual(url, "https://new.example/a.jpg")
         self.assertLess(time.monotonic() - stamp, 60)
+
+    def test_preview_hits_do_not_schedule_background_revalidation(self) -> None:
+        cache = UrlCache(50, 7200)
+        cache._entries["/gallery/old.jpg"] = (time.monotonic() - 4000, "", "https://old.example/t.jpg")
+        client = mock.MagicMock()
+        served = cache.resolve_preview("/gallery/old.jpg", client)
+        self.assertEqual(served, ("", "https://old.example/t.jpg"))
+        time.sleep(0.15)
+        client.resolve_preview.assert_not_called()
+
+    def test_revalidation_is_rate_limited(self) -> None:
+        cache = UrlCache(50, 7200)
+        client = mock.MagicMock()
+        client.resolve_file.return_value = ("https://new.example/a.jpg", "")
+        for index in range(15):
+            cache._entries[f"/gallery/{index}.jpg"] = (time.monotonic() - 4000, f"https://old.example/{index}.jpg", "")
+            cache.resolve(f"/gallery/{index}.jpg", client)
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline and client.resolve_file.call_count < 12:
+            time.sleep(0.02)
+        time.sleep(0.2)
+        self.assertEqual(client.resolve_file.call_count, 12)
 
 
 class SharedImageChainTests(unittest.TestCase):

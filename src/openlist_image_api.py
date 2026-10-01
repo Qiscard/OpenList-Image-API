@@ -84,11 +84,17 @@ URL_NEGATIVE_CACHE_SECONDS = 60
 # background: storage-driver signed links (BaiduPhoto) can expire well before
 # the cache TTL, and visitors must never receive a dead link twice.
 URL_STALE_SECONDS = 2700
+URL_REVALIDATE_PER_MINUTE = 12
 # fs/get is the only call that hits slow storage drivers (BaiduPhoto needs
 # 15-40s when hammered in parallel but ~1s serially); a small global cap keeps
 # concurrent gallery waves from collapsing the upstream into mass timeouts.
 URL_RESOLVE_GLOBAL_CONCURRENCY = 2
 _fs_get_semaphore = threading.BoundedSemaphore(URL_RESOLVE_GLOBAL_CONCURRENCY)
+# Background work (SWR revalidation, prefetch) takes the expensive upstream
+# path and must never occupy the foreground slots: it drips through its own
+# single slot while user-facing resolves keep the full shared quota.
+_BACKGROUND_FS_CONCURRENCY = 1
+_background_fs_semaphore = threading.BoundedSemaphore(_BACKGROUND_FS_CONCURRENCY)
 INDEX_LIST_TIMEOUT_SECONDS = 60
 INDEX_LIST_PAGE_SIZE = 100
 INDEX_LIST_WORKERS = 4
@@ -467,8 +473,9 @@ class OpenListClient:
     def baidu_photo_mounts(self) -> set[str]:
         return {path for path, driver in self.storage_drivers().items() if driver == BAIDU_PHOTO_DRIVER}
 
-    def resolve_file(self, path: str, refresh: bool = False) -> tuple[str, str]:
-        with _fs_get_semaphore:
+    def resolve_file(self, path: str, refresh: bool = False, background: bool = False) -> tuple[str, str]:
+        semaphore = _background_fs_semaphore if background else _fs_get_semaphore
+        with semaphore:
             data = self._post(
                 "/api/fs/get",
                 {"path": path, "password": "", "refresh": bool(refresh)},
@@ -484,8 +491,9 @@ class OpenListClient:
             raise RuntimeError("OpenList returned an invalid file URL")
         return url, self._safe_thumb(data.get("thumb"))
 
-    def resolve_preview(self, path: str, refresh: bool = False) -> tuple[str, str]:
-        with _fs_get_semaphore:
+    def resolve_preview(self, path: str, refresh: bool = False, background: bool = False) -> tuple[str, str]:
+        semaphore = _background_fs_semaphore if background else _fs_get_semaphore
+        with semaphore:
             data = self._post(
                 "/api/fs/get",
                 {"path": path, "password": "", "refresh": bool(refresh)},
@@ -979,6 +987,8 @@ class UrlCache:
         self._failures: dict[tuple[str, str], float] = {}
         self._revalidating: set[str] = set()
         self._revalidating_lock = threading.Lock()
+        self._revalidate_window_start = 0.0
+        self._revalidate_count = 0
         self._save_timer: threading.Timer | None = None
         self.hits = 0
         self.misses = 0
@@ -1083,8 +1093,13 @@ class UrlCache:
                 self._entries.popitem(last=False)
         self._mark_dirty()
 
-    def _maybe_revalidate(self, path: str, kind: str, client: OpenListClient) -> None:
-        """Serve stale immediately but renew expiring signed links in the background."""
+    def _maybe_revalidate(self, path: str, client: OpenListClient) -> None:
+        """Serve stale immediately but renew expiring download links in the background.
+
+        Only download URLs revalidate: thumbnail links are template-style and
+        long-lived, and preview revalidation through the slow upstream path
+        proved to be pure semaphore pressure. Rate limited per minute.
+        """
         if not self.max_size or len(self._revalidating) >= 512:
             return
         with self._lock:
@@ -1092,16 +1107,18 @@ class UrlCache:
             if not entry or time.monotonic() - entry[0] < URL_STALE_SECONDS:
                 return
         with self._revalidating_lock:
-            if path in self._revalidating:
+            now = time.monotonic()
+            if now - self._revalidate_window_start >= 60:
+                self._revalidate_window_start = now
+                self._revalidate_count = 0
+            if self._revalidate_count >= URL_REVALIDATE_PER_MINUTE or path in self._revalidating:
                 return
+            self._revalidate_count += 1
             self._revalidating.add(path)
 
         def worker() -> None:
             try:
-                if kind == "download":
-                    self.resolve(path, client, refresh=True)
-                else:
-                    self.resolve_preview(path, client, refresh=True)
+                self.resolve(path, client, refresh=True, background=True)
             except Exception:
                 pass
             finally:
@@ -1123,11 +1140,11 @@ class UrlCache:
             return False
         return True
 
-    def resolve(self, path: str, client: OpenListClient, refresh: bool = False) -> tuple[str, str]:
+    def resolve(self, path: str, client: OpenListClient, refresh: bool = False, background: bool = False) -> tuple[str, str]:
         if not refresh:
             cached = self._cached(path)
             if cached is not None and cached[0]:
-                self._maybe_revalidate(path, "download", client)
+                self._maybe_revalidate(path, client)
                 return cached
         key = (path, "download")
         with self._lock:
@@ -1154,10 +1171,13 @@ class UrlCache:
             return inflight.result
         started = time.monotonic()
         try:
-            url, thumb = client.resolve_file(path, refresh=refresh)
+            url, thumb = client.resolve_file(path, refresh=refresh, background=background)
             elapsed = time.monotonic() - started
             if elapsed > 5:
-                logging.warning("slow URL resolve for %s in %.1fs", path, elapsed)
+                if background:
+                    logging.debug("slow background resolve for %s in %.1fs", path, elapsed)
+                else:
+                    logging.warning("slow resolve for %s in %.1fs", path, elapsed)
             with self._lock:
                 self._failures.pop(key, None)
             if self.max_size:
@@ -1183,11 +1203,10 @@ class UrlCache:
                     del self._inflight[key]
             inflight.event.set()
 
-    def resolve_preview(self, path: str, client: OpenListClient, refresh: bool = False) -> tuple[str, str]:
+    def resolve_preview(self, path: str, client: OpenListClient, refresh: bool = False, background: bool = False) -> tuple[str, str]:
         if not refresh:
             cached = self._cached(path)
             if cached is not None and cached[1]:
-                self._maybe_revalidate(path, "preview", client)
                 return "", cached[1]
         key = (path, "preview")
         with self._lock:
@@ -1214,10 +1233,13 @@ class UrlCache:
             return inflight.result
         started = time.monotonic()
         try:
-            _url, thumb = client.resolve_preview(path, refresh=refresh)
+            _url, thumb = client.resolve_preview(path, refresh=refresh, background=background)
             elapsed = time.monotonic() - started
             if elapsed > 5:
-                logging.warning("slow preview resolve for %s in %.1fs", path, elapsed)
+                if background:
+                    logging.debug("slow background preview resolve for %s in %.1fs", path, elapsed)
+                else:
+                    logging.warning("slow preview resolve for %s in %.1fs", path, elapsed)
             with self._lock:
                 self._failures.pop(key, None)
             if self.max_size:
@@ -1941,9 +1963,9 @@ class Application:
         def prefetch(path: str) -> None:
             try:
                 if preview:
-                    self.cache.resolve_preview(path, client)
+                    self.cache.resolve_preview(path, client, background=True)
                 else:
-                    self.cache.resolve(path, client)
+                    self.cache.resolve(path, client, background=True)
             except Exception:
                 pass
 
