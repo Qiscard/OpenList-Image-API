@@ -1306,6 +1306,19 @@ function setWaterfallBufferVisible(visible){
   sentinel.setAttribute('aria-hidden',visible?'false':'true');
 }
 
+function deviceKey(){
+  try{
+    let key=localStorage.getItem('openlist-device-key');
+    if(!key){
+      const bytes=new Uint8Array(16);
+      crypto.getRandomValues(bytes);
+      key=[...bytes].map(b=>b.toString(16).padStart(2,'0')).join('');
+      localStorage.setItem('openlist-device-key',key);
+    }
+    return key;
+  }catch(error){return '';}
+}
+
 async function requestImages(count,kind='waterfall'){
   const wanted=Math.max(1,count);
   const collected=[];
@@ -1317,6 +1330,8 @@ async function requestImages(count,kind='waterfall'){
       const chainId=kind==='slide'?slideChainId:waterfallChainId;
       const offset=kind==='slide'?slideChainOffset:waterfallChainOffset;
       if(chainId) url+='&chain='+encodeURIComponent(chainId)+'&offset='+offset;
+      const device=deviceKey();
+      if(device) url+='&device='+encodeURIComponent(device);
     }
     if(activeTagFilters.length){
       activeTagFilters.forEach(t=>{url+='&tag='+encodeURIComponent(t);});

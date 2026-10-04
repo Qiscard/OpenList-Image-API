@@ -109,6 +109,9 @@ DEVICE_PREFERENCE_DEFAULTS: dict[str, Any] = {
 }
 
 
+DEVICE_SEEN_LIMIT = 60000
+
+
 def normalize_directory(value: str) -> str:
     if not isinstance(value, str):
         raise ValueError("directory must be a string")
@@ -1270,6 +1273,11 @@ class UrlCache:
 
 
 class SharedImageChain:
+    def sequence(self, size: int, generated_at: int) -> list[int]:
+        with self._lock:
+            self._ensure_order(size, generated_at)
+            return self._order
+
     def __init__(self, length: int = SHARED_CHAIN_LENGTH, ttl_seconds: int = SHARED_CHAIN_TTL_SECONDS) -> None:
         self.length = max(1, int(length))
         self.ttl_seconds = max(1, int(ttl_seconds))
@@ -1393,6 +1401,11 @@ class Application:
         self.cache = self._make_url_cache()
         self.shared_chain = SharedImageChain()
         self.url_executor = ThreadPoolExecutor(max_workers=URL_RESOLVE_WORKERS, thread_name_prefix="openlist-url")
+        self.device_dir = Path(self.config["state_dir"]) / "devices"
+        self._devices: dict[str, dict[str, Any]] = {}
+        self._devices_lock = threading.Lock()
+        self._device_dirty: set[str] = set()
+        self._device_save_timer: threading.Timer | None = None
         self._prefetch_lock = threading.Lock()
         self._prefetch_busy = False
         self.config_lock = threading.Lock()
@@ -1421,6 +1434,7 @@ class Application:
         self.config = load_config(self.config_path)
         self.repository = IndexRepository(Path(self.config["state_dir"]))
         self.tags = TagRepository(Path(self.config["state_dir"]))
+        self.device_dir = Path(self.config["state_dir"]) / "devices"
         cache_changed = any(
             previous_config[key] != self.config[key]
             for key in ("url_cache_size", "url_cache_ttl_seconds", "openlist_api_url", "openlist_token_file")
@@ -1822,6 +1836,130 @@ class Application:
         if count <= len(images):
             return random.sample(images, count), None
         return [random.choice(images) for _ in range(count)], None
+
+    def valid_device_key(self, value: str | None) -> bool:
+        return bool(value) and bool(re.fullmatch(r"[A-Za-z0-9_-]{8,64}", value))
+
+    def _device_file(self, device_key: str) -> Path:
+        digest = hashlib.sha1(device_key.encode("utf-8")).hexdigest()[:16]
+        return self.device_dir / f"{digest}.json"
+
+    def _device_state(self, device_key: str) -> dict[str, Any]:
+        with self._devices_lock:
+            state = self._devices.get(device_key)
+            if state is None:
+                state = {"cursor": 0, "seen": {}}
+                path = self._device_file(device_key)
+                if path.is_file():
+                    try:
+                        data = json.loads(path.read_text(encoding="utf-8"))
+                        if isinstance(data, dict):
+                            state["cursor"] = max(0, int(data.get("cursor") or 0))
+                            stored = data.get("seen")
+                            if isinstance(stored, list):
+                                state["seen"] = {str(item): None for item in stored if isinstance(item, str) and item}
+                    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+                        pass
+                self._devices[device_key] = state
+            return state
+
+    def _schedule_device_save(self, device_key: str) -> None:
+        with self._devices_lock:
+            self._device_dirty.add(device_key)
+            if self._device_save_timer is not None:
+                return
+            timer = threading.Timer(2.0, self._flush_devices)
+            timer.daemon = True
+            self._device_save_timer = timer
+            timer.start()
+
+    def _flush_devices(self) -> None:
+        with self._devices_lock:
+            dirty = list(self._device_dirty)
+            self._device_dirty.clear()
+            self._device_save_timer = None
+        try:
+            self.device_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+        for key in dirty:
+            with self._devices_lock:
+                state = self._devices.get(key)
+                if state is None:
+                    continue
+                payload = {"cursor": int(state["cursor"]), "seen": list(state["seen"])}
+            atomic_write_json(self._device_file(key), payload, mode=0o600)
+
+    def device_images(self, device_key: str, count: int, folder: str | None = None, min_size: int | None = None, max_size: int | None = None, tags: list[str] | None = None, filter_mode: str = "union", peek: bool = False) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        """Walk the shared shuffled sequence for one device, skipping seen paths.
+
+        Progress (cursor + seen paths) persists server-side, so restarts,
+        window rotations and index rebuilds can never resurface an image the
+        device has already been shown. peek=True reads ahead without mutating
+        device state (used to warm URL caches for the next segment).
+        """
+        index = self.repository.load()
+        images = index.get("images", [])
+        total = len(images)
+        count = max(1, min(count, 50))
+        if not total:
+            return [], None
+        generated_at = int(index.get("generated_at") or 0)
+        order = self.shared_chain.sequence(total, generated_at)
+        prefix = normalize_directory(folder).rstrip("/") + "/" if folder else None
+        allowed: set[str] | None = None
+        if tags:
+            if filter_mode == "intersect":
+                path_sets = [self.tags.paths_for_tag(tag) for tag in tags]
+                allowed = set.intersection(*path_sets) if path_sets else set()
+            else:
+                allowed = set()
+                for tag in tags:
+                    allowed |= self.tags.paths_for_tag(tag)
+        state = self._device_state(device_key)
+        seen = state["seen"]
+
+        def walk(start: int, seen_view: dict[str, None], commit: bool) -> tuple[list[dict[str, Any]], int]:
+            picked: list[dict[str, Any]] = []
+            cursor = start
+            scanned = 0
+            while len(picked) < count and scanned < total:
+                position = order[cursor]
+                cursor = (cursor + 1) % total
+                scanned += 1
+                image = images[position]
+                path = str(image.get("path") or "")
+                if not path or path in seen_view:
+                    continue
+                if prefix and not path.startswith(prefix):
+                    continue
+                if min_size is not None and int(image.get("size") or 0) < min_size:
+                    continue
+                if max_size is not None and int(image.get("size") or 0) > max_size:
+                    continue
+                if allowed is not None and path not in allowed:
+                    continue
+                if commit:
+                    seen_view[path] = None
+                    if len(seen_view) > DEVICE_SEEN_LIMIT:
+                        excess = len(seen_view) - DEVICE_SEEN_LIMIT
+                        for stale in list(seen_view.keys())[:excess]:
+                            seen_view.pop(stale, None)
+                picked.append(image)
+            return picked, cursor
+
+        if peek:
+            picked, _cursor = walk(int(state.get("cursor", 0)) % total, dict(seen), False)
+            return picked, None
+        picked, cursor = walk(int(state.get("cursor", 0)) % total, seen, True)
+        if len(picked) < count:
+            seen.clear()
+            picked, cursor = walk(cursor, seen, True)
+        state["cursor"] = cursor
+        self._schedule_device_save(device_key)
+        digest = hashlib.sha1(device_key.encode("utf-8")).hexdigest()[:12]
+        info = {"id": f"device-{digest}", "offset": cursor, "remaining": max(0, total - len(seen)), "length": total, "rotated": False}
+        return picked, info
 
     def indexed_image(self, path: str) -> dict[str, Any]:
         matches = self.indexed_images([path])
@@ -2242,10 +2380,20 @@ def make_handler(application: Application):
                     chain_id = (params.get("chain", [""])[0] or "").strip() or None
                     tag_filter = params.get("tag", []) or params.get("tags", [])
                     filter_mode = params.get("filter_mode", ["union"])[0]
-                    use_shared_chain = not tag_filter and not params.get("folder", [None])[0] and not params.get("min_size", [None])[0] and not params.get("max_size", [None])[0]
-                    images, chain_info = application.choose_images(
-                        count, params.get("folder", [None])[0], parse_size(params.get("min_size", [None])[0]), parse_size(params.get("max_size", [None])[0]), tags=tag_filter or None, filter_mode=filter_mode, offset=offset, chain_id=chain_id, use_shared_chain=use_shared_chain
-                    )
+                    device_key = (params.get("device", [""])[0] or "").strip()
+                    if application.valid_device_key(device_key):
+                        images, chain_info = application.device_images(
+                            device_key, count,
+                            folder=params.get("folder", [None])[0],
+                            min_size=parse_size(params.get("min_size", [None])[0]),
+                            max_size=parse_size(params.get("max_size", [None])[0]),
+                            tags=tag_filter or None, filter_mode=filter_mode,
+                        )
+                    else:
+                        use_shared_chain = not tag_filter and not params.get("folder", [None])[0] and not params.get("min_size", [None])[0] and not params.get("max_size", [None])[0]
+                        images, chain_info = application.choose_images(
+                            count, params.get("folder", [None])[0], parse_size(params.get("min_size", [None])[0]), parse_size(params.get("max_size", [None])[0]), tags=tag_filter or None, filter_mode=filter_mode, offset=offset, chain_id=chain_id, use_shared_chain=use_shared_chain
+                        )
                     if not images:
                         logging.debug("images/random: count=%d tags=%s mode=%s -> 0 images in %.3fs", count, tag_filter, filter_mode, time.time() - request_start)
                         payload = {"images": []}
@@ -2259,7 +2407,18 @@ def make_handler(application: Application):
                     payload = {"images": result}
                     if chain_info:
                         payload["chain"] = chain_info
-                        application.prefetch_chain_next(chain_info, count)
+                        if application.valid_device_key(device_key):
+                            ahead, _peek_info = application.device_images(
+                                device_key, min(max(count * 2, 10), 30),
+                                folder=params.get("folder", [None])[0],
+                                min_size=parse_size(params.get("min_size", [None])[0]),
+                                max_size=parse_size(params.get("max_size", [None])[0]),
+                                tags=tag_filter or None, filter_mode=filter_mode, peek=True,
+                            )
+                            if ahead:
+                                application.prefetch_urls(ahead, preview=True)
+                        else:
+                            application.prefetch_chain_next(chain_info, count)
                     return self._send_json(HTTPStatus.OK, payload)
                 if parsed.path == "/api/download-url":
                     if self._maintenance_access_required():

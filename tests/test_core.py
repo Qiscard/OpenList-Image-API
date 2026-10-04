@@ -919,6 +919,68 @@ class UrlCacheStalenessTests(unittest.TestCase):
         self.assertEqual(client.resolve_file.call_count, 12)
 
 
+class DeviceWalkTests(unittest.TestCase):
+    def make_application(self, temporary: str, images: list[dict[str, object]]) -> Application:
+        config_path = Path(temporary) / "config.json"
+        config = validate_config({})
+        config["state_dir"] = temporary
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        application = Application(config_path)
+        application.repository.save({
+            "images": images,
+            "directories": ["/gallery"],
+            "directory_count": 1,
+            "generated_at": 42,
+            "errors": [],
+        })
+        return application
+
+    def test_device_walk_never_repeats_within_a_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            images = [{"path": f"/gallery/{index}.jpg", "size": index} for index in range(30)]
+            application = self.make_application(temporary, images)
+            seen: list[str] = []
+            info = None
+            for _ in range(6):
+                batch, info = application.device_images("device-A-aaaa", 5)
+                for image in batch:
+                    self.assertNotIn(image["path"], seen)
+                    seen.append(image["path"])
+            self.assertEqual(len(seen), 30)
+            self.assertTrue(info and info["id"].startswith("device-"))
+
+    def test_device_progress_survives_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            images = [{"path": f"/gallery/{index}.jpg", "size": index} for index in range(30)]
+            application = self.make_application(temporary, images)
+            first_batch, _info = application.device_images("device-B-bbbb", 10)
+            application._flush_devices()
+            restarted = self.make_application(temporary, images)
+            second_batch, _info2 = restarted.device_images("device-B-bbbb", 10)
+            first_paths = {image["path"] for image in first_batch}
+            for image in second_batch:
+                self.assertNotIn(image["path"], first_paths)
+
+    def test_device_walk_honours_folder_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            images = [{"path": f"/gallery/a/{index}.jpg", "size": index} for index in range(10)]
+            images += [{"path": f"/gallery/b/{index}.jpg", "size": index} for index in range(10)]
+            application = self.make_application(temporary, images)
+            batch, _info = application.device_images("device-C-cccc", 8, folder="/gallery/a")
+            for image in batch:
+                self.assertTrue(image["path"].startswith("/gallery/a/"))
+
+    def test_device_peek_does_not_mutate_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            images = [{"path": f"/gallery/{index}.jpg", "size": index} for index in range(30)]
+            application = self.make_application(temporary, images)
+            _first, info = application.device_images("device-D-dddd", 5)
+            cursor_before = info["offset"]
+            application.device_images("device-D-dddd", 10, peek=True)
+            _again, info_after = application.device_images("device-D-dddd", 5)
+            self.assertEqual(info_after["offset"], (cursor_before + 5) % 30)
+
+
 class SharedImageChainTests(unittest.TestCase):
     def test_same_offset_is_shared(self) -> None:
         chain = SharedImageChain(length=5, ttl_seconds=60)
