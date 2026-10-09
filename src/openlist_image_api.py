@@ -1844,22 +1844,57 @@ class Application:
         digest = hashlib.sha1(device_key.encode("utf-8")).hexdigest()[:16]
         return self.device_dir / f"{digest}.json"
 
+    def _load_device_file(self, device_key: str | None = None, path: Path | None = None) -> dict[str, Any] | None:
+        target = path if path is not None else self._device_file(device_key or "")
+        if not target.is_file():
+            return None
+        try:
+            data = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError, TypeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        seen: dict[str, None] = {}
+        stored = data.get("seen")
+        if isinstance(stored, list):
+            seen = {str(item): None for item in stored if isinstance(item, str) and item}
+        return {"cursor": max(0, int(data.get("cursor") or 0)), "seen": seen}
+
+    def _device_frontier(self) -> dict[str, Any]:
+        """Union of every device's seen set, positioned at the deepest cursor.
+
+        A brand-new device key inherits this frontier instead of starting at
+        position 0: the shared chain is a fixed permutation walked by all
+        devices from the head, so a fresh key replaying the head would
+        deterministically repeat exactly what every other context on that
+        physical device already saw. Inheriting keeps new keys (new browser
+        profiles, cleared storage) on the same route with zero repeats, and a
+        genuinely new device sees only images no viewer has been shown yet.
+        """
+        state = {"cursor": 0, "seen": {}}
+        try:
+            paths = sorted(self.device_dir.glob("*.json"))
+        except OSError:
+            return state
+        for path in paths:
+            data = self._load_device_file(device_key=None, path=path)
+            if data is None:
+                continue
+            state["cursor"] = max(state["cursor"], data["cursor"])
+            state["seen"].update(data["seen"])
+        if len(state["seen"]) > DEVICE_SEEN_LIMIT:
+            excess = len(state["seen"]) - DEVICE_SEEN_LIMIT
+            for stale in list(state["seen"].keys())[:excess]:
+                state["seen"].pop(stale, None)
+        return state
+
     def _device_state(self, device_key: str) -> dict[str, Any]:
         with self._devices_lock:
             state = self._devices.get(device_key)
             if state is None:
-                state = {"cursor": 0, "seen": {}}
-                path = self._device_file(device_key)
-                if path.is_file():
-                    try:
-                        data = json.loads(path.read_text(encoding="utf-8"))
-                        if isinstance(data, dict):
-                            state["cursor"] = max(0, int(data.get("cursor") or 0))
-                            stored = data.get("seen")
-                            if isinstance(stored, list):
-                                state["seen"] = {str(item): None for item in stored if isinstance(item, str) and item}
-                    except (OSError, json.JSONDecodeError, ValueError, TypeError):
-                        pass
+                state = self._load_device_file(device_key)
+                if state is None:
+                    state = self._device_frontier()
                 self._devices[device_key] = state
             return state
 

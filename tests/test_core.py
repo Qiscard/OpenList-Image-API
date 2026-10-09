@@ -980,6 +980,39 @@ class DeviceWalkTests(unittest.TestCase):
             _again, info_after = application.device_images("device-D-dddd", 5)
             self.assertEqual(info_after["offset"], (cursor_before + 5) % 30)
 
+    def test_new_device_key_inherits_frontier_and_does_not_repeat(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            images = [{"path": f"/gallery/{index}.jpg", "size": index} for index in range(30)]
+            application = self.make_application(temporary, images)
+            first, _info = application.device_images("device-E-eeee", 5)
+            application._flush_devices()
+            # 模拟同一物理设备丢失 localStorage 后的新钥匙:必须继承前沿,不得重放开头
+            fresh, info = application.device_images("device-F-ffff", 5)
+            first_paths = {image["path"] for image in first}
+            for image in fresh:
+                self.assertNotIn(image["path"], first_paths)
+            self.assertTrue(info and info["offset"] >= 5)
+
+    def test_new_device_key_inherits_frontier_after_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            images = [{"path": f"/gallery/{index}.jpg", "size": index} for index in range(30)]
+            application = self.make_application(temporary, images)
+            for _ in range(3):
+                application.device_images("device-G-gggg", 5)
+            application._flush_devices()
+            restarted = self.make_application(temporary, images)
+            walked, _info = restarted.device_images("device-H-hhhh", 5)
+            state = restarted._device_state("device-H-hhhh")
+            self.assertEqual(state["cursor"], 20)
+            self.assertEqual(len(state["seen"]), 20)
+
+    def test_truly_new_deployment_starts_at_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            images = [{"path": f"/gallery/{index}.jpg", "size": index} for index in range(30)]
+            application = self.make_application(temporary, images)
+            _first, info = application.device_images("device-I-iiii", 5)
+            self.assertEqual(info["offset"], 5)
+
 
 class SharedImageChainTests(unittest.TestCase):
     def test_same_offset_is_shared(self) -> None:
