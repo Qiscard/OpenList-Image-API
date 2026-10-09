@@ -1860,7 +1860,7 @@ class Application:
             seen = {str(item): None for item in stored if isinstance(item, str) and item}
         return {"cursor": max(0, int(data.get("cursor") or 0)), "seen": seen}
 
-    def _device_frontier(self) -> dict[str, Any]:
+    def _device_frontier(self, live: list[tuple[int, dict[str, None]]]) -> dict[str, Any]:
         """Union of every device's seen set, positioned at the deepest cursor.
 
         A brand-new device key inherits this frontier instead of starting at
@@ -1870,12 +1870,20 @@ class Application:
         physical device already saw. Inheriting keeps new keys (new browser
         profiles, cleared storage) on the same route with zero repeats, and a
         genuinely new device sees only images no viewer has been shown yet.
+
+        ``live`` is the in-memory progress snapshot the caller took while
+        holding the device lock: progress may not have hit disk yet (2s save
+        debounce), and a fresh key created inside that window must inherit the
+        live frontier, not a stale on-disk one.
         """
         state = {"cursor": 0, "seen": {}}
+        for cursor, seen in live:
+            state["cursor"] = max(state["cursor"], int(cursor))
+            state["seen"].update(seen)
         try:
             paths = sorted(self.device_dir.glob("*.json"))
         except OSError:
-            return state
+            paths = []
         for path in paths:
             data = self._load_device_file(device_key=None, path=path)
             if data is None:
@@ -1894,7 +1902,8 @@ class Application:
             if state is None:
                 state = self._load_device_file(device_key)
                 if state is None:
-                    state = self._device_frontier()
+                    live = [(int(s["cursor"]), dict(s["seen"])) for s in self._devices.values()]
+                    state = self._device_frontier(live)
                 self._devices[device_key] = state
             return state
 

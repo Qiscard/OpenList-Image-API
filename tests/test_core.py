@@ -1006,6 +1006,17 @@ class DeviceWalkTests(unittest.TestCase):
             self.assertEqual(state["cursor"], 20)
             self.assertEqual(len(state["seen"]), 20)
 
+    def test_new_device_key_inherits_live_in_memory_frontier(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            images = [{"path": f"/gallery/{index}.jpg", "size": index} for index in range(30)]
+            application = self.make_application(temporary, images)
+            first, _info = application.device_images("device-J-jjjj", 5)
+            # 进度仍在内存(2s debounce 未落盘)时,新钥匙也必须继承前沿
+            fresh, _info2 = application.device_images("device-K-kkkk", 5)
+            first_paths = {image["path"] for image in first}
+            for image in fresh:
+                self.assertNotIn(image["path"], first_paths)
+
     def test_truly_new_deployment_starts_at_zero(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             images = [{"path": f"/gallery/{index}.jpg", "size": index} for index in range(30)]
