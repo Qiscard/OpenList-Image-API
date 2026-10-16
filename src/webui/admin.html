@@ -86,6 +86,13 @@ body:not(.theme-light)::after{content:'';position:fixed;inset:0;z-index:10000;po
   <div class="actions"><button id="load" type="button">加载配置</button></div>
   <p class="note hidden" id="admin-status" aria-live="polite"></p>
 </section>
+<section id="token-change" class="hidden">
+  <h2>修改管理令牌</h2>
+  <p class="note" id="token-change-hint">首次部署必须修改初始管理令牌，之后才能使用管理功能。</p>
+  <label>新令牌（至少 8 位）<input id="new-token" type="password" autocomplete="new-password"></label>
+  <label>重复新令牌<input id="new-token-confirm" type="password" autocomplete="new-password"></label>
+  <div class="actions"><button id="change-token" type="button">保存新令牌</button></div>
+</section>
 <section id="protected" class="hidden">
   <div class="tabs-nav" role="tablist" aria-label="管理设置">
     <button id="tab-button-directories" class="tab-button active" data-tab="directories" type="button" role="tab" aria-selected="true" aria-controls="tab-directories" tabindex="0">目录</button>
@@ -172,6 +179,8 @@ body:not(.theme-light)::after{content:'';position:fixed;inset:0;z-index:10000;po
     <label class="check"><input id="maintenance-enabled" type="checkbox">启用维护模式</label>
     <p class="note">开启后主界面只显示“维护中”，管理员可用令牌临时解锁。</p>
     <label>日志级别<select id="log-level"><option value="DEBUG">DEBUG</option><option value="INFO">INFO</option><option value="WARNING">WARNING</option><option value="ERROR">ERROR</option></select></label>
+    <h3>管理令牌</h3>
+    <div class="actions"><button id="manual-change-token" class="secondary" type="button">修改管理令牌</button></div>
     <h3>图片索引</h3>
     <p id="rebuild-status" class="note" aria-live="polite">无数据</p>
     <div class="actions"><button id="rebuild" type="button">后台重建图片索引</button></div>
@@ -198,7 +207,9 @@ function renderMarkdown(value){return escapeHtml(value).replace(/&lt;font\s+colo
 function previewAnnouncement(){document.querySelector('#announcement-preview').innerHTML='<p>'+renderMarkdown(document.querySelector('#announcement-content').value)+'</p>';}
 function showAdmin(){document.querySelector('#default-caption').value=config.caption_mode;document.querySelector('#directory-display-enabled').checked=config.directory_display_enabled;document.querySelector('#directory-display-depth').value=config.directory_display_depth;document.querySelector('#theme').value=config.theme||'dark';document.querySelector('#announcement-enabled').checked=config.announcement_enabled;document.querySelector('#announcement-title').value=config.announcement_title;document.querySelector('#announcement-content').value=config.announcement_content;document.querySelector('#announcement-required-seconds').value=config.announcement_required_seconds;document.querySelector('#contact-enabled').checked=config.contact_enabled||false;document.querySelector('#contact-label').value=config.contact_label||'联系';document.querySelector('#contact-personal-label').value=config.contact_personal_label||'个人';document.querySelector('#contact-personal-url').value=config.contact_personal_url||'';document.querySelector('#contact-personal-image').value=config.contact_personal_image||'';document.querySelector('#contact-group-label').value=config.contact_group_label||'群组';document.querySelector('#contact-group-url').value=config.contact_group_url||'';document.querySelector('#contact-group-image').value=config.contact_group_image||'';document.querySelector('#maintenance-enabled').checked=config.maintenance_enabled;document.querySelector('#tagging-enabled').checked=config.tagging_enabled||false;document.querySelector('#tagging-scope').value=config.tagging_scope||'disabled';document.querySelector('#tagging-categories').value=(config.tagging_categories||[]).join('\n');document.querySelector('#filter-enabled').checked=config.filter_enabled!==false;document.querySelector('#log-level').value=config.log_level||'INFO';document.querySelector('#protected').classList.remove('hidden');showSelected();previewAnnouncement();refreshRebuildStatus().catch(report);}
 async function errorText(response,fallback){try{const data=await response.json();return data.error||fallback;}catch(error){return fallback;}}
-async function load(){const response=await fetch('/api/admin/config',{headers:auth(),cache:'no-store'});if(!response.ok)throw new Error(await errorText(response,'令牌无效或服务不可用'));config=await response.json();showAdmin();setAdminStatus('服务器配置已加载');}
+function showTokenChange(forced){const section=document.querySelector('#token-change');section.classList.toggle('hidden',false);document.querySelector('#token-change-hint').textContent=forced?'首次部署必须修改初始管理令牌，之后才能使用管理功能。':'请输入当前令牌和新令牌。修改后请妥善保存新令牌。';document.querySelector('#new-token').value='';document.querySelector('#new-token-confirm').value='';section.scrollIntoView({behavior:'smooth',block:'center'});document.querySelector('#new-token').focus();}
+async function submitTokenChange(){const next=document.querySelector('#new-token').value;const confirm=document.querySelector('#new-token-confirm').value;if(next!==confirm)throw new Error('两次输入的新令牌不一致');if(next.length<8)throw new Error('新令牌至少 8 位');const response=await fetch('/api/admin/token',{method:'POST',headers:auth(),body:JSON.stringify({new_token:next})});if(!response.ok)throw new Error(await errorText(response,'修改管理令牌失败'));document.querySelector('#token').value=next;document.querySelector('#token-change').classList.add('hidden');setAdminStatus('管理令牌已更新，请妥善保存');await load();}
+async function load(){const response=await fetch('/api/admin/config',{headers:auth(),cache:'no-store'});if(response.status===403){let data=null;try{data=await response.json();}catch(error){}if(data&&data.must_change_token){showTokenChange(true);setAdminStatus('必须修改初始管理令牌后才能继续。');return;}throw new Error((data&&data.error)||'令牌无效或服务不可用');}if(!response.ok)throw new Error(await errorText(response,'令牌无效或服务不可用'));config=await response.json();document.querySelector('#token-change').classList.add('hidden');showAdmin();setAdminStatus('服务器配置已加载');}
 function addDirectory(path){if(!config.directories.includes(path)){config.directories.push(path);showSelected();setAdminStatus('已添加目录：'+path+'，请保存服务器配置');}}
 function removeDirectory(path){config.directories=config.directories.filter(value=>value!==path);showSelected();}
 function buildTreeNode(name,path,isDir,hasChildren){
@@ -343,6 +354,8 @@ document.querySelector('#theme-toggle').onclick=toggleTheme;
 (function(){let saved='dark';try{saved=localStorage.getItem('openlist-admin-theme')||'dark';}catch(e){}applyTheme(saved);})();
 async function runButtonAction(button,action){if(button.disabled)return;button.disabled=true;button.setAttribute('aria-busy','true');try{await action();}catch(error){report(error);}finally{button.disabled=false;button.removeAttribute('aria-busy');}}
 document.querySelector('#load').onclick=event=>runButtonAction(event.currentTarget,load);
+document.querySelector('#change-token').onclick=event=>runButtonAction(event.currentTarget,submitTokenChange);
+document.querySelector('#manual-change-token').onclick=()=>showTokenChange(false);
 document.querySelector('#announcement-preview-button').onclick=previewAnnouncement;
 document.querySelector('#browse').onclick=event=>runButtonAction(event.currentTarget,browse);
 document.querySelector('#save-server').onclick=event=>runButtonAction(event.currentTarget,saveServer);

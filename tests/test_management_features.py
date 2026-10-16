@@ -3,11 +3,13 @@ from __future__ import annotations
 import inspect
 import io
 import json
+import os
 import sys
 import tempfile
 import threading
 import unittest
 import zipfile
+import http.client
 from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -17,7 +19,15 @@ from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from openlist_image_api import TRASH_TAG, Application, admin_html, gallery_html, make_handler  # noqa: E402
+from openlist_image_api import (  # noqa: E402
+    TRASH_TAG,
+    Application,
+    admin_html,
+    command_create_admin_token,
+    gallery_html,
+    make_handler,
+    validate_config,
+)
 import openlist_tui  # noqa: E402
 
 
@@ -108,6 +118,104 @@ class AdminConfigurationTests(unittest.TestCase):
             application.update_admin_config({"caption_mode": "name"})
             self.assertEqual(application.admin_config()["announcement_version"], baseline + 1)
             application.url_executor.shutdown(wait=True)
+
+
+def _temp_admin_application(temporary: str) -> Application:
+    config_path = Path(temporary) / "config.json"
+    config = validate_config({})
+    config["state_dir"] = temporary
+    config["admin_token_file"] = str(Path(temporary) / "admin.token")
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    return Application(config_path)
+
+
+class AdminTokenChangeTests(unittest.TestCase):
+    def test_bootstrap_reads_initial_token_from_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path = Path(temporary) / "config.json"
+            config = validate_config({})
+            config["state_dir"] = temporary
+            config["admin_token_file"] = str(Path(temporary) / "admin.token")
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with patch.dict(os.environ, {"OPENLIST_IMAGE_API_ADMIN_TOKEN": "unit-test-initial-token"}):
+                command_create_admin_token(config_path)
+            token_path = Path(config["admin_token_file"])
+            self.assertEqual(token_path.read_text(encoding="utf-8").strip(), "unit-test-initial-token")
+            self.assertTrue(Path(str(token_path) + ".change-required").exists())
+            application = Application(config_path)
+            self.assertTrue(application.admin_token_must_change())
+            self.assertTrue(application.is_admin("unit-test-initial-token"))
+            application.url_executor.shutdown(wait=True)
+
+    def test_change_admin_token_validates_rotates_and_clears_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path = Path(temporary) / "config.json"
+            config = validate_config({})
+            config["state_dir"] = temporary
+            config["admin_token_file"] = str(Path(temporary) / "admin.token")
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with patch.dict(os.environ, {"OPENLIST_IMAGE_API_ADMIN_TOKEN": "unit-test-initial-token"}):
+                command_create_admin_token(config_path)
+            application = Application(config_path)
+            with self.assertRaises(ValueError):
+                application.change_admin_token("short")
+            with self.assertRaises(ValueError):
+                application.change_admin_token("unit-test-initial-token")
+            application.change_admin_token("unit-test-rotated-token")
+            self.assertFalse(application.admin_token_must_change())
+            self.assertTrue(application.is_admin("unit-test-rotated-token"))
+            self.assertFalse(application.is_admin("unit-test-initial-token"))
+            application.url_executor.shutdown(wait=True)
+
+    def test_admin_endpoints_gated_until_initial_token_is_changed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path = Path(temporary) / "config.json"
+            config = validate_config({})
+            config["state_dir"] = temporary
+            config["admin_token_file"] = str(Path(temporary) / "admin.token")
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with patch.dict(os.environ, {"OPENLIST_IMAGE_API_ADMIN_TOKEN": "unit-test-initial-token"}):
+                command_create_admin_token(config_path)
+            application = Application(config_path)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(application))
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+
+            def call(method: str, path: str, headers: dict[str, str], body: str | None = None) -> tuple[int, dict[str, object]]:
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=10)
+                try:
+                    connection.request(method, path, body=body, headers=headers)
+                    response = connection.getresponse()
+                    payload = response.read()
+                    return response.status, json.loads(payload) if payload else {}
+                finally:
+                    connection.close()
+
+            initial_headers = {"Content-Type": "application/json", "X-OpenList-Admin-Token": "unit-test-initial-token"}
+            rotated_headers = {"Content-Type": "application/json", "X-OpenList-Admin-Token": "unit-test-rotated-token"}
+            try:
+                status, payload = call("GET", "/api/admin/config", initial_headers)
+                self.assertEqual(status, 403)
+                self.assertTrue(payload.get("must_change_token"))
+
+                status, _payload = call("POST", "/api/admin/token", initial_headers, json.dumps({"new_token": "short"}))
+                self.assertEqual(status, 400)
+
+                status, payload = call(
+                    "POST", "/api/admin/token", initial_headers, json.dumps({"new_token": "unit-test-rotated-token"})
+                )
+                self.assertEqual(status, 200)
+                self.assertFalse(payload.get("must_change_token"))
+
+                status, _payload = call("GET", "/api/admin/config", initial_headers)
+                self.assertEqual(status, 401)
+
+                status, _payload = call("GET", "/api/admin/config", rotated_headers)
+                self.assertEqual(status, 200)
+            finally:
+                server.shutdown()
+                server.server_close()
+                application.url_executor.shutdown(wait=True)
 
 
 class WebUiMarkupTests(unittest.TestCase):

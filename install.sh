@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 GITHUB_REPOSITORY="Qiscard/OpenList-Image-API"
 GITEE_REPOSITORY="qiscard/OpenList-Image-API"
-RELEASE_REF="v1.4.10"
+RELEASE_REF="v1.4.11"
 UPDATE_REF="main"
 APP_DIR="/opt/openlist-image-api"
 CONFIG_DIR="/etc/openlist-image-api"
@@ -143,9 +143,21 @@ PY
 create_admin_token() {
   [[ -s "${CONFIG_DIR}/admin.token" ]] && return
   umask 077
-  python3 - <<'PY' > "${CONFIG_DIR}/admin.token"
+  # The initial credential is read from the environment (never from source):
+  # set OPENLIST_IMAGE_API_ADMIN_TOKEN to provision one, otherwise a random
+  # secret is generated. Either way the first WebUI login must rotate it.
+  python3 - "${CONFIG_DIR}/admin.token" "${CONFIG_DIR}/admin.token.change-required" <<'PY'
+import os
 import secrets
-print(secrets.token_urlsafe(32))
+import sys
+from pathlib import Path
+
+token = os.environ.get("OPENLIST_IMAGE_API_ADMIN_TOKEN", "").strip()
+if not token:
+    token = secrets.token_urlsafe(32)
+Path(sys.argv[1]).write_text(token + "\n", encoding="utf-8")
+Path(sys.argv[2]).touch(mode=0o600, exist_ok=True)
+print("[openlist-image-api] initial admin token provisioned; the first admin login will require changing it")
 PY
 }
 

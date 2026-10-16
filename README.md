@@ -11,6 +11,7 @@
 - **幻灯片浏览**：首批加载 6 张并预加载后续 2 张，保留最多 60 条播放历史，支持自动播放、页面两侧切换按钮、暂停按钮和触屏左右滑动。
 - **瀑布流浏览**：每批加载 20 张，宽屏（>900 px）3 列、中等宽度（561–900 px）2 列；移动端（≤560 px）可在设置中选择单列或双列。新卡进入当前最矮列，占位时显示加载动画，接近可视区时才换链，并在滚动到页面 80% 后继续取下一批；预取下一批时底部显示缓冲动画。批量换链在后台进行，不挡住卡片入列。
 - **共享随机链**：未筛选浏览时，所有访客共用当前约 4000 张的热点链，各自按 `chain`/`offset` 分页；链被看完或每 2 小时整点窗口切换到下一条，上一链在过期前仍可继续翻完。当前浏览器会记住已加载图片，刷新/重载跳过这些图；从管理页返回会恢复当前画面。仅改画质时不整页刷新。带标签/目录/大小筛选时仍各自独立随机。
+- **全局不重复浏览**：所有设备密钥共享一份已展示路径池（服务端按路径去重），一张图在整个图库被看完之前只会展示一次——无论是刷新、换浏览器配置、清空站点数据还是旧密钥恢复，都不会重放看过的图片；跑完全部图片后自动开启新一轮。设备进度持久化在 `devices/*.json`，重启、换链和索引重建都不会失效。
 - **批量换链**：浏览页先获取随机图片元数据并立刻入列，再通过 `POST /api/download-url` 的 `preview:true` 在后台批量解析缩略图；已完成的地址会回填到卡片上。批量失败或超时后，视口内图片再按最多 6 路并发单图请求补拉，原图签名 URL 只在灯箱或下载时解析，相同路径的并发请求会合并。
 - **大图预览**：站内灯箱支持滚轮/双指缩放、捏合、拖拽、左右旋转和双击复位；签名 URL 失效时自动刷新。
 - **画质选择**：列表缩略图提供 176/480/800/1280/2560 px 档位，大图提供原图/2560/1280 px 档位。只有 OpenList 返回的缩略图 URL 已包含 `width`/`height` 参数时，程序才会改写尺寸；否则沿用原缩略图 URL。
@@ -28,20 +29,33 @@
 - 端口检查优先使用 `ss`，缺失时回退到 `lsof`。
 - OpenList 必须作为本机 HTTP 服务运行，默认地址为 `http://127.0.0.1:5244`。
 
-生产程序不读取环境变量：配置来自 JSON 文件、`--config` 参数和两个 token 文件。仅手动测试辅助程序 `tests/mock_openlist.py` 支持 `MOCK_STATE_DIR`。
+生产程序从 JSON 文件、`--config` 参数和两个 token 文件读取配置；唯一读取的环境变量是首次部署引导用的 `OPENLIST_IMAGE_API_ADMIN_TOKEN`（见下文"初始管理令牌"），凭据不会以字面量形式出现在源码中。仅手动测试辅助程序 `tests/mock_openlist.py` 支持 `MOCK_STATE_DIR`。
+
+## 初始管理令牌
+
+全新部署会生成一份**初始管理令牌**，并写入与令牌文件同目录的 `.change-required` 标记；**首次进入管理页时会被强制要求修改**，修改前除改密接口外的所有管理操作都会返回 403。
+
+- 若在安装时通过环境变量提供初始令牌，则使用该值（凭据只从环境读取，不会写入源码或示例）：
+
+  ```bash
+  sudo OPENLIST_IMAGE_API_ADMIN_TOKEN='<你的初始令牌>' bash install.sh
+  ```
+
+- 未提供时自动生成随机令牌，可用 TUI 菜单 5 或 `sudo openlist-image-api --print-admin-token` 查看。
+- 两种方式产生的初始令牌都属于"待修改"状态；在管理页修改后标记清除，之后随时可在管理页"修改管理令牌"中更换（新令牌至少 8 位）。
 
 ## 安装
 
 GitHub 固定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Qiscard/OpenList-Image-API/v1.4.0/install.sh | sudo bash -s -- --source github
+curl -fsSL https://raw.githubusercontent.com/Qiscard/OpenList-Image-API/v1.4.11/install.sh | sudo bash -s -- --source github
 ```
 
 Gitee 固定版本：
 
 ```bash
-curl -fsSL https://gitee.com/qiscard/OpenList-Image-API/raw/v1.4.0/install.sh | sudo bash -s -- --source gitee
+curl -fsSL https://gitee.com/qiscard/OpenList-Image-API/raw/v1.4.11/install.sh | sudo bash -s -- --source gitee
 ```
 
 `--source auto` 优先使用 GitHub（连接超时 20 秒、整体超时 20 秒、失败后重试 2 次），失败时回退到 Gitee 并用相同超时与重试策略。固定版本安装器会下载并校验 `install.sh`、两个 Python 文件和 `VERSION` 的 SHA-256，然后创建图片 API 服务与全局管理命令。
@@ -56,7 +70,7 @@ sudo openlist-image-api
 
 1. 在 TUI 安装/部署 OpenList，并完成 OpenList 自身初始化。
 2. 在 TUI 保存 OpenList API token。
-3. 打开 `/admin`，粘贴管理令牌并选择图片目录。
+3. 打开 `/admin`，粘贴管理令牌；若是全新部署，页面会强制要求设置新令牌。
 4. 在管理页启动后台图片索引重建。
 
 TUI 菜单 5 会显示管理令牌，也可直接运行：
@@ -126,7 +140,8 @@ OpenList 镜像测速候选：
 | `GET /api/tagging/stats?paths=…` | 批量读取最多 50 个路径的标签统计。 |
 | `GET /api/tagging/categories` | 获取分类标签计数。 |
 | `POST /api/tagging/vote` | 提交点赞/踩或分类变更；匿名范围按 IP+UA 去重，token 范围要求有效管理令牌。 |
-| `GET/PUT /api/admin/config` | 管理令牌；读取或保存全局配置。 |
+| `GET/PUT /api/admin/config` | 管理令牌；读取或保存全局配置。初始令牌待修改期间返回 403。 |
+| `POST /api/admin/token` | 管理令牌；修改管理令牌（至少 8 位，且与当前不同）。初始令牌待修改期间也可调用，用于完成强制修改。 |
 | `GET /api/admin/directories?path=…` | 管理令牌；实时读取 OpenList 的直接子目录。 |
 | `POST /api/admin/rebuild` | 管理令牌；启动后台图片索引重建。 |
 | `GET/POST /api/admin/backup` | 管理令牌；下载或恢复不含 token 的 ZIP 配置备份。 |

@@ -432,6 +432,9 @@ def show_status_with_admin_token() -> None:
         print(f"无法读取 WebUI 管理令牌: {error}")
         return
     print(f"WebUI 管理令牌: {token}")
+    marker = Path(str(ADMIN_TOKEN_PATH) + ".change-required")
+    if marker.exists():
+        print("提示: 这是初始管理令牌，首次进入管理页时必须修改后才能使用管理功能。")
 
 
 def export_global_migration() -> Path:

@@ -110,6 +110,13 @@ DEVICE_PREFERENCE_DEFAULTS: dict[str, Any] = {
 
 
 DEVICE_SEEN_LIMIT = 60000
+MIN_ADMIN_TOKEN_LENGTH = 8
+ADMIN_TOKEN_CHANGE_SUFFIX = ".change-required"
+
+
+def admin_token_change_marker(config: dict[str, Any]) -> Path:
+    """Marker next to the admin token file: the first WebUI login must rotate it."""
+    return Path(str(config["admin_token_file"]) + ADMIN_TOKEN_CHANGE_SUFFIX)
 
 
 def normalize_directory(value: str) -> str:
@@ -287,28 +294,39 @@ def read_secret(path: Path, name: str) -> str:
     return value
 
 
-_secret_cache: dict[str, tuple[float, str]] = {}
+_secret_cache: dict[str, tuple[tuple[int, int, int], str]] = {}
 _secret_cache_lock = threading.Lock()
 
 
+def _secret_fingerprint(path: Path) -> tuple[int, int, int]:
+    stat = path.stat()
+    return (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
 def read_secret_cached(path: Path, name: str) -> str:
+    """Read a secret file with an inode/mtime fingerprint cache.
+
+    Timestamps alone are not enough: filesystems may grant two writes in the
+    same clock tick an identical mtime, so a freshly rotated token would keep
+    being served from a stale cache entry. The inode changes on every
+    atomic replace, which makes the fingerprint unambiguous.
+    """
     cache_key = str(path)
     with _secret_cache_lock:
         cached = _secret_cache.get(cache_key)
         if cached is not None:
             try:
-                mtime = path.stat().st_mtime
-                if mtime == cached[0]:
+                if _secret_fingerprint(path) == cached[0]:
                     return cached[1]
             except OSError:
                 pass
     value = read_secret(path, name)
     with _secret_cache_lock:
         try:
-            mtime = path.stat().st_mtime
+            fingerprint = _secret_fingerprint(path)
         except OSError:
-            mtime = time.time()
-        _secret_cache[cache_key] = (mtime, value)
+            fingerprint = (-1, -1, int(time.time() * 1e9))
+        _secret_cache[cache_key] = (fingerprint, value)
     return value
 
 
@@ -1406,6 +1424,9 @@ class Application:
         self._devices_lock = threading.Lock()
         self._device_dirty: set[str] = set()
         self._device_save_timer: threading.Timer | None = None
+        self._seen_pool_obj: dict[str, None] | None = None
+        self._seen_pool_lock = threading.Lock()
+        self._frontier_cursor = 0
         self._prefetch_lock = threading.Lock()
         self._prefetch_busy = False
         self.config_lock = threading.Lock()
@@ -1663,6 +1684,25 @@ class Application:
         expected = read_secret_cached(Path(self.config["admin_token_file"]), "admin token")
         return hmac.compare_digest(supplied_token, expected)
 
+    def admin_token_must_change(self) -> bool:
+        return admin_token_change_marker(self.config).exists()
+
+    def change_admin_token(self, new_token: str) -> None:
+        candidate = (new_token or "").strip()
+        if len(candidate) < MIN_ADMIN_TOKEN_LENGTH:
+            raise ValueError(f"new admin token must be at least {MIN_ADMIN_TOKEN_LENGTH} characters")
+        try:
+            current = read_secret_cached(Path(self.config["admin_token_file"]), "admin token")
+        except RuntimeError:
+            current = ""
+        if current and hmac.compare_digest(candidate, current):
+            raise ValueError("new admin token must differ from the current token")
+        write_secret(Path(self.config["admin_token_file"]), candidate)
+        try:
+            admin_token_change_marker(self.config).unlink()
+        except OSError:
+            pass
+
     def _set_index_progress(self, value: dict[str, Any]) -> None:
         with self.index_progress_lock:
             self.index_progress = dict(value)
@@ -1860,26 +1900,18 @@ class Application:
             seen = {str(item): None for item in stored if isinstance(item, str) and item}
         return {"cursor": max(0, int(data.get("cursor") or 0)), "seen": seen}
 
-    def _device_frontier(self, live: list[tuple[int, dict[str, None]]]) -> dict[str, Any]:
-        """Union of every device's seen set, positioned at the deepest cursor.
+    def _load_device_universe(self) -> tuple[dict[str, None], int]:
+        """Rebuild the shared seen pool and the deepest cursor from device files.
 
-        A brand-new device key inherits this frontier instead of starting at
-        position 0: the shared chain is a fixed permutation walked by all
-        devices from the head, so a fresh key replaying the head would
-        deterministically repeat exactly what every other context on that
-        physical device already saw. Inheriting keeps new keys (new browser
-        profiles, cleared storage) on the same route with zero repeats, and a
-        genuinely new device sees only images no viewer has been shown yet.
-
-        ``live`` is the in-memory progress snapshot the caller took while
-        holding the device lock: progress may not have hit disk yet (2s save
-        debounce), and a fresh key created inside that window must inherit the
-        live frontier, not a stale on-disk one.
+        Every device key reads and commits into one shared seen pool, so an
+        image path is served at most once per full cycle to any viewer. That
+        makes same-device repeats structurally impossible no matter how the
+        browser context changes (cleared storage, another profile, PWA vs
+        browser, an old key resuming behind the frontier), while different
+        devices still walk the same route and share URL caches.
         """
-        state = {"cursor": 0, "seen": {}}
-        for cursor, seen in live:
-            state["cursor"] = max(state["cursor"], int(cursor))
-            state["seen"].update(seen)
+        pool: dict[str, None] = {}
+        frontier = 0
         try:
             paths = sorted(self.device_dir.glob("*.json"))
         except OSError:
@@ -1888,22 +1920,29 @@ class Application:
             data = self._load_device_file(device_key=None, path=path)
             if data is None:
                 continue
-            state["cursor"] = max(state["cursor"], data["cursor"])
-            state["seen"].update(data["seen"])
-        if len(state["seen"]) > DEVICE_SEEN_LIMIT:
-            excess = len(state["seen"]) - DEVICE_SEEN_LIMIT
-            for stale in list(state["seen"].keys())[:excess]:
-                state["seen"].pop(stale, None)
-        return state
+            frontier = max(frontier, int(data["cursor"]))
+            pool.update(data["seen"])
+        if len(pool) > DEVICE_SEEN_LIMIT:
+            excess = len(pool) - DEVICE_SEEN_LIMIT
+            for stale in list(pool.keys())[:excess]:
+                pool.pop(stale, None)
+        return pool, frontier
 
     def _device_state(self, device_key: str) -> dict[str, Any]:
         with self._devices_lock:
             state = self._devices.get(device_key)
             if state is None:
-                state = self._load_device_file(device_key)
-                if state is None:
-                    live = [(int(s["cursor"]), dict(s["seen"])) for s in self._devices.values()]
-                    state = self._device_frontier(live)
+                if self._seen_pool_obj is None:
+                    pool, frontier = self._load_device_universe()
+                    self._seen_pool_obj = pool
+                    self._frontier_cursor = frontier
+                loaded = self._load_device_file(device_key)
+                if loaded is not None:
+                    cursor = loaded["cursor"]
+                    self._frontier_cursor = max(self._frontier_cursor, cursor)
+                else:
+                    cursor = self._frontier_cursor
+                state = {"cursor": cursor, "seen": self._seen_pool_obj}
                 self._devices[device_key] = state
             return state
 
@@ -1926,12 +1965,14 @@ class Application:
             self.device_dir.mkdir(parents=True, exist_ok=True)
         except OSError:
             return
+        with self._seen_pool_lock:
+            seen_snapshot = list(self._seen_pool_obj) if self._seen_pool_obj else []
         for key in dirty:
             with self._devices_lock:
                 state = self._devices.get(key)
                 if state is None:
                     continue
-                payload = {"cursor": int(state["cursor"]), "seen": list(state["seen"])}
+                payload = {"cursor": int(state["cursor"]), "seen": seen_snapshot}
             atomic_write_json(self._device_file(key), payload, mode=0o600)
 
     def device_images(self, device_key: str, count: int, folder: str | None = None, min_size: int | None = None, max_size: int | None = None, tags: list[str] | None = None, filter_mode: str = "union", peek: bool = False) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
@@ -1973,7 +2014,7 @@ class Application:
                 scanned += 1
                 image = images[position]
                 path = str(image.get("path") or "")
-                if not path or path in seen_view:
+                if not path:
                     continue
                 if prefix and not path.startswith(prefix):
                     continue
@@ -1984,24 +2025,37 @@ class Application:
                 if allowed is not None and path not in allowed:
                     continue
                 if commit:
-                    seen_view[path] = None
-                    if len(seen_view) > DEVICE_SEEN_LIMIT:
-                        excess = len(seen_view) - DEVICE_SEEN_LIMIT
-                        for stale in list(seen_view.keys())[:excess]:
-                            seen_view.pop(stale, None)
+                    # Claim the path atomically: concurrent walks of any keys
+                    # must never hand out the same image twice.
+                    with self._seen_pool_lock:
+                        if path in seen_view:
+                            continue
+                        seen_view[path] = None
+                        over = len(seen_view) - DEVICE_SEEN_LIMIT
+                        if over > 0:
+                            for stale in list(seen_view.keys())[:over]:
+                                seen_view.pop(stale, None)
+                elif path in seen_view:
+                    continue
                 picked.append(image)
             return picked, cursor
 
         if peek:
-            picked, _cursor = walk(int(state.get("cursor", 0)) % total, dict(seen), False)
+            with self._seen_pool_lock:
+                seen_copy = dict(seen)
+            picked, _cursor = walk(int(state.get("cursor", 0)) % total, seen_copy, False)
             return picked, None
         picked, cursor = walk(int(state.get("cursor", 0)) % total, seen, True)
         if len(picked) < count:
-            seen.clear()
+            # Exhausted the whole cycle: restart the route from a clean pool.
+            with self._seen_pool_lock:
+                seen.clear()
             picked, cursor = walk(cursor, seen, True)
         state["cursor"] = cursor
+        with self._seen_pool_lock:
+            self._frontier_cursor = max(self._frontier_cursor, cursor)
         self._schedule_device_save(device_key)
-        digest = hashlib.sha1(device_key.encode("utf-8")).hexdigest()[:12]
+        digest = hashlib.sha256(device_key.encode("utf-8")).hexdigest()[:12]
         info = {"id": f"device-{digest}", "offset": cursor, "remaining": max(0, total - len(seen)), "length": total, "rotated": False}
         return picked, info
 
@@ -2365,7 +2419,7 @@ def make_handler(application: Application):
                 except (BrokenPipeError, ConnectionResetError):
                     logging.info("Download client disconnected: %s", self.client_address[0])
 
-        def _admin_required(self) -> bool:
+        def _admin_required(self, allow_change_required: bool = False) -> bool:
             try:
                 allowed = application.is_admin(admin_token_from_headers(self.headers))
             except RuntimeError:
@@ -2373,7 +2427,14 @@ def make_handler(application: Application):
             if not allowed:
                 time.sleep(1.0)
                 self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "admin authentication required"})
-            return allowed
+                return False
+            if not allow_change_required and application.admin_token_must_change():
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": "admin token must be changed before other operations", "must_change_token": True},
+                )
+                return False
+            return True
 
         def _maintenance_access_required(self) -> bool:
             if not application.config["maintenance_enabled"]:
@@ -2552,6 +2613,8 @@ def make_handler(application: Application):
                 return self._handle_download_urls()
             if path == "/api/tagging/vote":
                 return self._handle_tag_vote()
+            if path == "/api/admin/token":
+                return self._handle_admin_token_change()
             if not self._admin_required():
                 return
             try:
@@ -2586,6 +2649,28 @@ def make_handler(application: Application):
             except Exception:
                 logging.exception("Unhandled POST error")
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal server error"})
+
+        def _handle_admin_token_change(self) -> None:
+            """Rotate the WebUI admin token.
+
+            Allowed even while a pending initial token exists, so the first
+            login can complete the mandatory change; every other admin
+            operation stays gated until then.
+            """
+            if not self._admin_required(allow_change_required=True):
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= MAX_REQUEST_BODY:
+                    raise ValueError("invalid request body size")
+                payload = json.loads(self.rfile.read(length))
+                if not isinstance(payload, dict):
+                    raise ValueError("request body must be an object")
+                application.change_admin_token(str(payload.get("new_token") or ""))
+                logging.info("Admin token changed from %s", self.client_address[0])
+                return self._send_json(HTTPStatus.OK, {"status": "admin token updated", "must_change_token": False})
+            except (ValueError, RuntimeError, json.JSONDecodeError) as error:
+                return self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
 
         def _handle_download_urls(self) -> None:
             if self._maintenance_access_required():
@@ -2692,7 +2777,41 @@ class ConcurrentHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
 
+def bootstrap_admin_token(config: dict[str, Any]) -> str:
+    """Create the very first admin token for a fresh deployment.
+
+    The value comes from the ``OPENLIST_IMAGE_API_ADMIN_TOKEN`` environment
+    variable when the operator provisions one (credentials are only ever read
+    from the environment, never from source); otherwise a random secret is
+    generated. The change-required marker is always armed so the first WebUI
+    login rotates this initial token to a private one.
+    """
+    token = os.environ.get("OPENLIST_IMAGE_API_ADMIN_TOKEN", "").strip()
+    if not token:
+        token = secrets.token_urlsafe(32)
+    write_secret(Path(config["admin_token_file"]), token)
+    marker = admin_token_change_marker(config)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.touch(mode=0o600, exist_ok=True)
+    return token
+
+
+def command_create_admin_token(config_path: Path) -> None:
+    config = load_config(config_path)
+    token = bootstrap_admin_token(config)
+    print(token)
+
+
+def ensure_admin_token(config_path: Path) -> None:
+    config = load_config(config_path)
+    if Path(config["admin_token_file"]).exists():
+        return
+    bootstrap_admin_token(config)
+    logging.warning("Bootstrapped an initial admin token; change it on the first admin login")
+
+
 def command_serve(config_path: Path) -> None:
+    ensure_admin_token(config_path)
     application = Application(config_path)
     server = ConcurrentHTTPServer((application.config["listen_host"], application.config["listen_port"]), make_handler(application))
     logging.info("Listening on %s:%d", application.config["listen_host"], application.config["listen_port"])
@@ -2710,13 +2829,6 @@ def command_refresh(config_path: Path) -> None:
     if valid_paths:
         migration_stats = application.tags.migrate_paths(valid_paths)
     print(json.dumps({"image_count": index["image_count"], "directory_count": index["directory_count"], "errors": index["errors"], "tag_migration": migration_stats}, ensure_ascii=False))
-
-
-def command_create_admin_token(config_path: Path) -> None:
-    config = load_config(config_path)
-    token = secrets.token_urlsafe(32)
-    write_secret(Path(config["admin_token_file"]), token)
-    print(token)
 
 
 def main() -> None:

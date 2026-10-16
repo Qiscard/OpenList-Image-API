@@ -1024,6 +1024,36 @@ class DeviceWalkTests(unittest.TestCase):
             _first, info = application.device_images("device-I-iiii", 5)
             self.assertEqual(info["offset"], 5)
 
+    def test_keys_share_one_seen_pool_within_a_process(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            images = [{"path": f"/gallery/{index}.jpg", "size": index} for index in range(30)]
+            application = self.make_application(temporary, images)
+            # 两个钥匙在任一请求前都已载入内存:共享同一进度池,不得互相重放
+            application._device_state("device-P-pppp")
+            application._device_state("device-Q-qqqq")
+            first, _info = application.device_images("device-P-pppp", 5)
+            second, _info2 = application.device_images("device-Q-qqqq", 5)
+            first_paths = {image["path"] for image in first}
+            second_paths = {image["path"] for image in second}
+            self.assertFalse(first_paths & second_paths)
+
+    def test_old_key_resume_skips_everything_seen_by_others(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            images = [{"path": f"/gallery/{index}.jpg", "size": index} for index in range(30)]
+            first_generation = self.make_application(temporary, images)
+            old_batch, _info = first_generation.device_images("device-old-1111", 3)
+            first_generation._flush_devices()
+            # 旧钥匙落后于全局前沿时,新会话推进了更多图片
+            second_generation = self.make_application(temporary, images)
+            main_batch, _info2 = second_generation.device_images("device-main-2222", 10)
+            second_generation._flush_devices()
+            # 旧钥匙恢复浏览:必须跳过其他钥匙已经展示过的全部图片
+            third_generation = self.make_application(temporary, images)
+            resumed, _info3 = third_generation.device_images("device-old-1111", 5)
+            seen_before = {image["path"] for image in old_batch} | {image["path"] for image in main_batch}
+            for image in resumed:
+                self.assertNotIn(image["path"], seen_before)
+
 
 class SharedImageChainTests(unittest.TestCase):
     def test_same_offset_is_shared(self) -> None:

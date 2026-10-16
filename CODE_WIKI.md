@@ -174,7 +174,8 @@ TUI 从核心模块复用 `atomic_write_json()`、`load_config()` 和 `write_sec
 | --- | --- | --- |
 | 配置 | `/etc/openlist-image-api/config.json` | JSON，原子写，权限 `0600`。 |
 | OpenList token | `/etc/openlist-image-api/openlist.token` | 纯文本，权限 `0600`。 |
-| 管理令牌 | `/etc/openlist-image-api/admin.token` | `secrets.token_urlsafe(32)`，权限 `0600`。 |
+| 管理令牌 | `/etc/openlist-image-api/admin.token` | `secrets.token_urlsafe(32)` 或部署时由 `OPENLIST_IMAGE_API_ADMIN_TOKEN` 注入，权限 `0600`。 |
+| 令牌修改标记 | `/etc/openlist-image-api/admin.token.change-required` | 存在时管理接口返回 403，只有改密接口可用；首次部署后强制修改，改密后删除。 |
 | 图片索引 | `/var/lib/openlist-image-api/index.json` | 图片路径、大小、统计、耗时和错误；重建成功后原子替换。 |
 | 索引 checkpoint | `/var/lib/openlist-image-api/index.checkpoint.json` | 重建中的队列、已访问目录、图片和失败项；配置指纹不匹配或文件损坏时忽略。 |
 | 标签数据 | `/var/lib/openlist-image-api/tags.json` | schema version 1，原子写。 |
@@ -231,7 +232,7 @@ TUI 从核心模块复用 `atomic_write_json()`、`load_config()` 和 `write_sec
 
 ### 5.5 环境变量
 
-生产程序不读取环境变量。配置来源只有 JSON、`--config` 和 token 文件。`MOCK_STATE_DIR` 仅供 `tests/mock_openlist.py` 使用。
+生产程序不读取环境变量（唯一例外：首次部署引导读取 `OPENLIST_IMAGE_API_ADMIN_TOKEN` 作为初始管理令牌，且仅当令牌文件不存在时）。配置来源只有 JSON、`--config` 和 token 文件。`MOCK_STATE_DIR` 仅供 `tests/mock_openlist.py` 使用。
 
 ## 6. HTTP 路由与数据流
 
@@ -252,7 +253,8 @@ TUI 从核心模块复用 `atomic_write_json()`、`load_config()` 和 `write_sec
 | GET | `/api/tagging/stats` | 公共 | 最多 50 个路径的标签统计。 |
 | GET | `/api/tagging/categories` | 公共 | 分类计数。 |
 | POST | `/api/tagging/vote` | 按标签范围 | 匿名范围按 IP+UA；token 范围校验管理令牌。 |
-| GET/PUT | `/api/admin/config` | 管理令牌 | 读取/保存全局配置。 |
+| GET/PUT | `/api/admin/config` | 管理令牌 | 读取/保存全局配置；初始令牌待修改期间返回 403。 |
+| POST | `/api/admin/token` | 管理令牌 | 修改管理令牌（≥8 位且与当前不同）；待修改期间也可调用。 |
 | GET | `/api/admin/directories` | 管理令牌 | 直接读取 OpenList 子目录。 |
 | POST | `/api/admin/rebuild` | 管理令牌 | 启动后台图片索引重建。 |
 | GET/POST | `/api/admin/backup` | 管理令牌 | 下载/恢复配置 ZIP。 |
